@@ -60,6 +60,20 @@ Start the leader with the plan and profile you generated, for example:
 cargo run -- leader --plan plan.json --profile profile.json --llama-server /path/to/llama-server
 ```
 
+Before anything starts, the leader validates the plan against the profile
+(`planning::validate_output`) and builds the worker bridges from the plan's
+`runtime_devices`. Plans saved before `runtime_devices` existed are rejected;
+regenerate them with `llm-cluster plan`. Useful `leader` flags:
+
+- `--min-peers <N>`: contributors the plan must use (default 2).
+- `--llama-arg <ARG>`: extra llama-server flag, repeatable, appended after the
+  plan's arguments (for example `--llama-arg=--cache-ram --llama-arg=0`).
+- `--evidence-file <PATH>` and `--evidence-wait <DURATION>`: after startup, wait
+  for externally collected `RunEvidence` JSON and check it with
+  `planning::verify_output`. If verification fails, the leader shuts down. The
+  leader never generates evidence itself; without this flag, post-run
+  verification is skipped.
+
 For the test suite, build the fake runtime helper executables before running
 integration tests:
 
