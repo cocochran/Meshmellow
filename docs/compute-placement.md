@@ -28,6 +28,14 @@ Errors exit unsuccessfully without printing a plan. The command neither binds
 network endpoints nor creates a node key, and does not launch inference or
 verify model file contents. Pass argv elements individually when launching.
 
+Set optional `final_peer_id` to the local peer ID to require its ownership of the
+last block group. The synthetic profile includes `"final_peer_id": "leader"`.
+Unknown IDs fail validation; an ineligible or memory-constrained required peer
+produces no feasible placement. Omitting the field preserves unconstrained
+selection. Library callers can use `placement::plan_with_final_peer` for the same
+constraint. This controls the proposed final block group; verify actual final
+and output tensor ownership in runtime logs separately.
+
 Save planning stdout as `plan.json`, then validate caller-collected evidence:
 
 ```sh
