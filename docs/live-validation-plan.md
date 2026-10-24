@@ -4,6 +4,16 @@ Prepared from David's 2026-10-24 final tuning update and Yash's bridge ACK.
 Implementation: `placement::plan`, `rpc_plan::server_args`, and
 `verification::verify_run`; see `compute-placement.md` for API inputs.
 
+Status update, 2026-10-24: David's [two-Mac shard-runner run](../experiments/model-validation/SHARD_RUNNER.md)
+proved a 32B model's exported partitions can execute together over Iroh, with
+source weights larger than either Mac's RAM. That prototype is separate from
+the leader/job API and its measured process footprints do not cover the full
+contribution accounting boundary. M-20's prelaunch plan check and optional
+postrun evidence-file verification have landed, but no trustworthy complete
+`RunEvidence` source or planner-driven hardware acceptance run is published.
+Use the [contributor profiling record](contributor-profiling.md) for the missing
+budget, backend and telemetry facts.
+
 ## First validation run
 
 1. Pin runtime `71255fefc092b0344f2acddb891388814ae961be` on both Macs.
@@ -55,4 +65,6 @@ baseline and candidate runs. Report run count and spread, including failures.
 Keep raw logs with David's `experiments/` harness. A successful response alone
 does not establish two-device execution or a performance improvement.
 
-Live results remain pending; this handoff contains no new hardware measurements.
+This handoff describes the planner-driven acceptance run still needed for M-5;
+it does not reinterpret the separate shard-runner capacity result as a budget
+or hard-cap pass.

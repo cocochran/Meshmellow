@@ -170,6 +170,8 @@ The caller is responsible for collecting trustworthy evidence for the exact run,
 including all relevant memory allocations. This function does not parse logs,
 measure memory, enforce limits, stop processes, or prove future runs will fit.
 On failure the launcher must stop/replan before treating the placement as verified.
+Use the [contributor profiling record](contributor-profiling.md) to capture the
+measurement scope and eligibility data before producing a live profile.
 
 The confirmed initial integration uses remote M1 `RPC0` then local M2 Pro `MTL0`
 with runtime pin `71255fefc092b0344f2acddb891388814ae961be`; discover device
