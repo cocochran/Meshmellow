@@ -27,4 +27,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
-        run: cargo test --all-targets
+        # Tests spawn example binaries (the fake servers). `--all-targets` builds examples as
+        # test harnesses only, so build the real example binaries first.
+        run: |
+          cargo build --examples
+          cargo test --all-targets

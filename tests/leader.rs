@@ -25,6 +25,9 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tracing_subscriber::EnvFilter;
 
+mod common;
+use common::example_bin;
+
 const CLUSTER_ID: &str = "leader-test";
 const LOOPBACK_ANY_PORT: &str = "127.0.0.1:0";
 /// Peer ID of the leader's own device in the test plan; it has no RPC bridge.
@@ -234,15 +237,6 @@ fn init_tracing() {
         .with_env_filter(EnvFilter::from_default_env())
         .with_test_writer()
         .try_init();
-}
-
-/// Test helper binaries are cargo examples, built next to the test binary's `deps` directory.
-fn example_bin(name: &str) -> PathBuf {
-    let test_binary = std::env::current_exe().expect("test binary path");
-    let deps = test_binary.parent().expect("test binary directory");
-    deps.join("..")
-        .join("examples")
-        .join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
 }
 
 fn scratch_dir(name: &str) -> PathBuf {

@@ -2,7 +2,6 @@
 //! process and check readiness, echo, restarts, timeouts and clean shutdown.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use llm_cluster::process::{ChildSpec, Readiness, RestartPolicy, Supervised, spawn_supervised};
@@ -11,20 +10,14 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tracing_subscriber::EnvFilter;
 
+mod common;
+use common::example_bin;
+
 const FAKE_RPC_SERVER: &str = "fake_rpc_server";
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 const ECHO_PAYLOAD: &[u8] = b"ggml rpc hello";
-
-/// Path of an example binary built by `cargo test` next to this test's `deps` directory.
-fn example_bin(name: &str) -> PathBuf {
-    let exe = std::env::current_exe().expect("test executable path");
-    let deps = exe.parent().expect("test executable directory");
-    deps.join("..")
-        .join("examples")
-        .join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
-}
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()

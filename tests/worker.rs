@@ -21,6 +21,9 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tracing_subscriber::EnvFilter;
 
+mod common;
+use common::example_bin;
+
 const CLUSTER_ID: &str = "worker-test";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -36,16 +39,6 @@ fn init_tracing() {
         .with_env_filter(EnvFilter::from_default_env())
         .with_test_writer()
         .try_init();
-}
-
-/// Path of an example binary built alongside this test (`cargo test` builds examples).
-fn example_bin(name: &str) -> PathBuf {
-    let test_exe = std::env::current_exe().expect("test executable path");
-    let deps = test_exe.parent().expect("test executable directory");
-    let profile = deps.parent().expect("target profile directory");
-    profile
-        .join("examples")
-        .join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
 }
 
 /// Binds an endpoint on loopback only, with relays and public address lookup disabled.

@@ -4,7 +4,6 @@
 //! port and serves the API in-process in front of it.
 
 use std::net::{SocketAddr, TcpListener};
-use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -17,19 +16,14 @@ use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+mod common;
+use common::example_bin;
+
 /// Upper bound for anything a test waits on, generous for slow CI machines.
 const WAIT_LIMIT: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// How long the fake server sleeps before answering in the FIFO test.
 const SLOW_REPLY_MS: u64 = 300;
-
-fn example_bin(name: &str) -> PathBuf {
-    let exe = std::env::current_exe().expect("test executable path");
-    let deps = exe.parent().expect("deps dir");
-    deps.join("..")
-        .join("examples")
-        .join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
-}
 
 fn free_loopback_addr() -> SocketAddr {
     TcpListener::bind("127.0.0.1:0")
