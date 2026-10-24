@@ -250,8 +250,12 @@ mod tests {
     fn closing_an_old_connection_in_the_same_millisecond_keeps_the_new_one() {
         let a = node(1);
         let mut table = PeerTable::new();
-        let old_token = table.record_connection_at(a, &hello(a), 1_000).connection_token;
-        let new_token = table.record_connection_at(a, &hello(a), 1_000).connection_token;
+        let old_token = table
+            .record_connection_at(a, &hello(a), 1_000)
+            .connection_token;
+        let new_token = table
+            .record_connection_at(a, &hello(a), 1_000)
+            .connection_token;
 
         assert_ne!(old_token, new_token);
         assert!(!table.remove_connection(&a, old_token));
