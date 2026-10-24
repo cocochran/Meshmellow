@@ -31,5 +31,5 @@ jobs:
         # Integration tests spawn two fake server examples. `--all-targets` builds examples as
         # test harnesses only, so build the standalone helper binaries first.
         run: |
-          cargo build --example fake_llama_server --example fake_rpc_server
+          cargo build --example fake_llama_server --example fake_rpc_server --example fake_shard_runner
           cargo test --all-targets
