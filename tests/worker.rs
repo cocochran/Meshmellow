@@ -216,9 +216,10 @@ async fn kick_after_one_heartbeat(leader: &Endpoint, peers: &SharedPeerTable) ->
         .await
         .expect("worker dials in time")
         .expect("leader endpoint open");
-    let (connection, _) = network::accept_peer(incoming, &hello, peers)
+    let session = network::accept_peer(incoming, &hello, peers)
         .await
         .expect("hello");
+    let connection = session.connection();
     let mut stream = connection.accept_uni().await.expect("heartbeat stream");
     let frame = timeout(TEST_TIMEOUT, protocol::read_frame(&mut stream))
         .await

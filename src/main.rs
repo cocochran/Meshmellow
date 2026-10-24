@@ -367,10 +367,11 @@ async fn connect(key: &Path, cluster: &str, node_id: &str) -> anyhow::Result<()>
     let remote = network::parse_node_id(node_id)?;
     let endpoint = network::bind_endpoint(key, vec![CONTROL_ALPN.to_vec()]).await?;
     let local = network::local_hello(&endpoint, cluster, EMPTY_LOG_INDEX);
-    let (connection, hello) =
-        network::dial_peer(&endpoint, remote, &local, &new_peer_table()).await?;
-    println!("peer hello: {hello:?}");
-    connection.close(CLOSE_CODE_DONE.into(), CLOSE_REASON_DONE);
+    let session = network::dial_peer(&endpoint, remote, &local, &new_peer_table()).await?;
+    println!("peer hello: {:?}", session.hello());
+    session
+        .connection()
+        .close(CLOSE_CODE_DONE.into(), CLOSE_REASON_DONE);
     endpoint.close().await;
     Ok(())
 }

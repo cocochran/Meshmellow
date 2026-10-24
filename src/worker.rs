@@ -218,12 +218,13 @@ impl ControlLink<'_> {
     /// Dials the leader, then sends heartbeats on one stream until the link fails.
     async fn session(&mut self) -> anyhow::Result<Infallible> {
         let dial = network::dial_peer(self.endpoint, self.leader.clone(), &self.local, &self.peers);
-        let (connection, hello) = tokio::time::timeout(LEADER_DIAL_TIMEOUT, dial)
+        let session = tokio::time::timeout(LEADER_DIAL_TIMEOUT, dial)
             .await
             .context("timed out dialling the leader")??;
         self.backoff.reset();
-        info!(leader = %hello.node_id, "control link to leader established");
+        info!(leader = %session.hello().node_id, "control link to leader established");
 
+        let connection = session.connection();
         let mut stream = connection
             .open_uni()
             .await

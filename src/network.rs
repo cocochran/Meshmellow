@@ -73,47 +73,117 @@ pub fn local_hello(endpoint: &Endpoint, cluster_id: &str, last_log_index: u64) -
     }
 }
 
-/// Dials `addr` on [`CONTROL_ALPN`], exchanges hellos, and records the peer in `peers`.
+/// An open control connection to a peer that has completed the hello exchange.
 ///
-/// Returns the open connection and the peer's hello.
+/// The peer stays in the [`PeerTable`] for as long as this connection is its newest one. It is
+/// removed when the connection closes, from either side, or when the session is dropped, which
+/// closes the connection. A newer connection from the same peer is never removed, because cleanup
+/// matches the connection token assigned during this session's handshake.
+pub struct PeerSession {
+    connection: Connection,
+    hello: Hello,
+    node_id: NodeId,
+    connection_token: u64,
+    peers: SharedPeerTable,
+}
+
+impl PeerSession {
+    /// Wraps a handshaken connection and starts watching it, so a close by either side
+    /// removes the peer from `peers`.
+    fn start(
+        connection: Connection,
+        hello: Hello,
+        connection_token: u64,
+        peers: &SharedPeerTable,
+    ) -> Self {
+        let session = Self {
+            node_id: connection.remote_id(),
+            connection,
+            hello,
+            connection_token,
+            peers: Arc::clone(peers),
+        };
+        session.forget_peer_when_closed();
+        session
+    }
+
+    /// The open connection, for opening or accepting streams and closing it with a reason.
+    pub fn connection(&self) -> &Connection {
+        &self.connection
+    }
+
+    /// The hello the peer sent during the handshake.
+    pub fn hello(&self) -> &Hello {
+        &self.hello
+    }
+
+    /// The peer's node ID, as authenticated by the connection.
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    /// The token this connection holds in the [`PeerTable`].
+    pub fn connection_token(&self) -> u64 {
+        self.connection_token
+    }
+
+    /// Spawns a task that removes this connection's entry once the connection closes.
+    ///
+    /// It waits on a weak handle, so the watch does not keep the connection open.
+    fn forget_peer_when_closed(&self) {
+        let closed = self.connection.weak_handle().closed();
+        let peers = Arc::clone(&self.peers);
+        let (node_id, token) = (self.node_id, self.connection_token);
+        tokio::spawn(async move {
+            closed.await;
+            forget_peer(&peers, &node_id, token);
+        });
+    }
+}
+
+impl Drop for PeerSession {
+    /// Removes the entry immediately, so a caller that drops a session never sees a stale peer.
+    fn drop(&mut self) {
+        forget_peer(&self.peers, &self.node_id, self.connection_token);
+    }
+}
+
+impl std::fmt::Debug for PeerSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerSession")
+            .field("node_id", &self.node_id)
+            .field("connection_token", &self.connection_token)
+            .field("hello", &self.hello)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Dials `addr` on [`CONTROL_ALPN`], exchanges hellos, and records the peer in `peers`.
 pub async fn dial_peer(
     endpoint: &Endpoint,
     addr: impl Into<EndpointAddr>,
     local: &Hello,
     peers: &SharedPeerTable,
-) -> anyhow::Result<(Connection, Hello)> {
+) -> anyhow::Result<PeerSession> {
     let connection = endpoint
         .connect(addr, CONTROL_ALPN)
         .await
         .context("failed to connect to peer")?;
     let hello = finish_handshake(&connection, dialer_handshake(&connection, local)).await?;
-    record_peer(peers, connection.remote_id(), &hello)?;
-    Ok((connection, hello))
+    let token = record_peer(peers, connection.remote_id(), &hello)?;
+    Ok(PeerSession::start(connection, hello, token, peers))
 }
 
 /// Completes an incoming control connection: exchanges hellos and records the peer in `peers`.
-///
-/// Returns the open connection and the peer's hello.
 pub async fn accept_peer(
     incoming: Incoming,
     local: &Hello,
     peers: &SharedPeerTable,
-) -> anyhow::Result<(Connection, Hello)> {
-    let (connection, hello, _) = accept_peer_with_token(incoming, local, peers).await?;
-    Ok((connection, hello))
-}
-
-/// Keeps the connection token returned by the handshake so its cleanup cannot
-/// accidentally target a newer connection from the same peer.
-async fn accept_peer_with_token(
-    incoming: Incoming,
-    local: &Hello,
-    peers: &SharedPeerTable,
-) -> anyhow::Result<(Connection, Hello, u64)> {
+) -> anyhow::Result<PeerSession> {
     let connection = incoming.await.context("incoming connection failed")?;
     let (hello, token) =
         finish_handshake(&connection, acceptor_handshake(&connection, local, peers)).await?;
-    Ok((connection, hello, token))
+    Ok(PeerSession::start(connection, hello, token, peers))
 }
 
 /// Accepts control connections on `endpoint` until it is closed, keeping each one open until the peer leaves.
@@ -140,26 +210,22 @@ pub async fn serve_control(
 /// Handles one incoming control connection from hello to disconnect, recording the peer's
 /// heartbeats while it is open and logging the outcome.
 ///
-/// When the connection closes the peer is removed from `peers`, unless it has already
+/// When the connection closes the session removes the peer from `peers`, unless it has already
 /// reconnected on a newer connection.
 async fn run_control_session(incoming: Incoming, local: &Hello, peers: &SharedPeerTable) {
-    match accept_peer_with_token(incoming, local, peers).await {
-        Ok((connection, hello, token)) => {
-            let remote = connection.remote_id();
-            let reason = receive_control_streams(&connection, remote, peers).await;
-            info!(peer = %hello.node_id, %reason, "peer disconnected");
-            forget_peer(peers, &remote, token);
+    match accept_peer(incoming, local, peers).await {
+        Ok(session) => {
+            let reason =
+                receive_control_streams(session.connection(), session.node_id(), peers).await;
+            info!(peer = %session.hello().node_id, %reason, "peer disconnected");
         }
         Err(error) => warn!("rejected incoming connection: {error:#}"),
     }
 }
 
-/// Removes `node_id` from `peers` once its connection with `connection_token`
-/// has closed; a newer connection from the same peer is kept.
-///
-/// [`serve_control`] does this for incoming connections. Code that keeps a connection from
-/// [`dial_peer`] open should call it when that connection closes.
-pub fn forget_peer(peers: &SharedPeerTable, node_id: &NodeId, connection_token: u64) {
+/// Removes `node_id` from `peers` if its entry still belongs to the connection with
+/// `connection_token`; a newer connection from the same peer is kept.
+fn forget_peer(peers: &SharedPeerTable, node_id: &NodeId, connection_token: u64) {
     match peers.lock() {
         Ok(mut table) => {
             if table.remove_connection(node_id, connection_token) {
@@ -293,7 +359,8 @@ async fn acceptor_handshake(
     Ok((hello, token))
 }
 
-/// Cleans up a peer recorded during a handshake if that handshake fails or times out.
+/// Cleans up a peer recorded during a handshake if that handshake fails or times out, before a
+/// [`PeerSession`] exists to do it.
 struct PendingPeerRegistration<'a> {
     peers: &'a SharedPeerTable,
     remote: NodeId,
