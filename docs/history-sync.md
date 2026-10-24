@@ -1,505 +1,373 @@
-# History sync — Design Documentation
+# History sync and storage
 
-Prototype of conversation-history synchronization for MeshThing. This file documents every structure and function in the `history_sync` module of `llm-cluster` (`src/history_sync/`): what it does, **why it's built that way**, and — in each **"As the project evolves"** subsection — what will likely need to change.
+The `history_sync` module (`src/history_sync/`) keeps one conversation's history identical on every node in the mesh and saved on each node's disk. When the main process (the device that took the prompt) disappears, another node can take over from its own copy.
 
-> **Status:** prototype on the `history-sync` branch, merged into the main `llm-cluster` crate as the `history_sync` module (`src/history_sync/`). History lives in memory only; nothing is persisted to disk yet.
+**Status:** works in the in-memory simulator and in tests (24 tests). It is **not yet wired into a running `llm-cluster` node**: nothing reads `History` frames off control connections, so a live node doesn't sync or save history yet. Takeover is a ranking, not consensus, and there is no restore-from-export command yet.
 
 ## Contents
 
-1. [Overview](#1-overview)
-2. [Protocol walkthrough](#2-protocol-walkthrough)
-3. [`history.rs` — core types](#3-historyrs--core-types)
-4. [`message.rs` — wire messages](#4-messagers--wire-messages)
-5. [`leader.rs` — main-process side](#5-leaderrs--main-process-side)
-6. [`replica.rs` — worker side](#6-replicars--worker-side)
-7. [`election.rs` — failover choice](#7-electionrs--failover-choice)
-8. [`node.rs` — role switching](#8-noders--role-switching)
-9. [`store.rs` — durable storage and export](#9-storers--durable-storage-and-export)
-10. [`sim.rs` — in-memory cluster](#10-simrs--in-memory-cluster)
-11. [`examples/history_sync.rs` — demo binary](#11-exampleshistory_syncrs--demo-binary)
-12. [Tests](#12-tests)
-13. [Cross-cutting future work](#13-cross-cutting-future-work)
+1. [Module map](#1-module-map)
+2. [How it works](#2-how-it-works)
+3. [Core ideas: node IDs, epochs, events](#3-core-ideas-node-ids-epochs-events)
+4. [Module reference](#4-module-reference)
+5. [Storage format and crash safety](#5-storage-format-and-crash-safety)
+6. [Using it from a node](#6-using-it-from-a-node)
+7. [CLI and demo](#7-cli-and-demo)
+8. [Tests](#8-tests)
+9. [Limits and next steps](#9-limits-and-next-steps)
 
 ---
 
-## 1. Overview
+## 1. Module map
 
-The README requires that after every completed task the main process sends the conversation history to every worker, so any peer can take over if the prompted device drops out. These modules implement that for **any number of nodes**:
+| File | Lines | Holds |
+|---|---:|---|
+| `src/history_sync.rs` | 16 | Module root; declares the submodules below |
+| `history.rs` | 80 | `Entry` (job events), `History`, the `NodeId` / `Epoch` / `Seq` types |
+| `message.rs` | 53 | `SyncMessage`, the wire messages between main process and workers |
+| `leader.rs` | 217 | `Leader`: the main process's side of sync |
+| `replica.rs` | 139 | `Replica`: a worker's side of sync, and promotion to leader |
+| `node.rs` | 142 | `Node`: one peer's role (leader or replica), step-down, and disk hooks |
+| `election.rs` | 44 | `Candidate`, `Elected`, `elect()`: choosing a new main process |
+| `store.rs` | 558 | `HistoryStore`: saving to disk, loading, and `ConversationExport` |
+| `sim.rs` | 256 | `Cluster`: an in-memory mesh for tests and the demo |
 
-- One **`Leader`** (the main process) owns the authoritative history.
-- Every other peer runs a **`Replica`** holding a copy.
-- Peers that are caught up get a **delta** (`Append`); new, lagging, or confused peers get a full **`Snapshot`**.
-- Every leader has an **epoch** (term number). A newer epoch always wins, so an old main process that comes back can't overwrite the session.
+Outside the module: `tests/history_sync.rs` and `tests/history_store.rs` (tests), `examples/history_sync.rs` (demo), and `llm-cluster history …` in `src/main.rs` (CLI). It also relies on two pieces of the networking layer in `src/node.rs`: `NodeId` and `PeerTable`.
 
-### Design principles
+**Design rules used throughout**
+- **No I/O inside the sync logic.** `Leader`, `Replica` and `Node` take a message and return the messages to send. The caller owns the network, which keeps the logic testable without Iroh.
+- **Messages are safe to repeat.** Any message can be resent or duplicated without harm, so recovering from loss is just calling `sync()` again.
+- **History only grows** (within one epoch). That's why "how many entries do you have" fully describes a worker's progress.
+- **Epochs, not clocks, decide who's in charge** (architecture §9, §12.5).
 
-| Principle | Why |
-|---|---|
-| **Transport-agnostic** | The P2P layer (Iroh, owned by Yash) wasn't built yet. Functions take messages in and return messages out; the caller decides how to send them. This also makes everything testable without a network. |
-| **Pure state machines, no I/O, no threads, no clocks** | Deterministic and easy to test. Timing (retries, heartbeats) belongs to the runtime that drives these objects. |
-| **Idempotent messages** | Networks drop and duplicate packets. Resending any message must be harmless, so recovery is just "call `sync()` again." |
-| **Append-only history** | Conversation turns are never edited, so "how many entries do you have?" fully describes a replica's progress *within one epoch*. |
-| **Epoch fencing** | Required by the architecture doc (§2, §9, §12.5): reject commands from stale leaders, and never rely on wall-clock time for ordering. |
+## 2. How it works
 
-### Module map
+### Normal operation
 
 ```text
-history.rs   Entry (job events), History, NodeId/Epoch/Seq
-message.rs   SyncMessage (wire format), Outgoing
-leader.rs    Leader — main-process sync logic
-replica.rs   Replica — worker sync logic + promote()
-election.rs  Candidate, Elected, elect()
-node.rs      Node — Leader|Replica with automatic step-down
-store.rs     HistoryStore — on-disk log + snapshot, ConversationExport
-sim.rs       Cluster — in-memory network for tests and the demo
-examples/history_sync.rs  Demo binary
-tests/history_sync.rs     Sync integration tests
-tests/history_store.rs    Storage and export tests
+Main process (epoch E)                         Worker
+  start_job / complete_job ─► persist to disk
+  ── Snapshot{E, all entries} ───────────────►  first contact this epoch: replace history,
+                                               save to disk, then
+  ◄────────────────────────── Ack{E, len} ───  reply
+  (next job)
+  ── Append{E, start = len, new entries} ────►  save to disk, then
+  ◄────────────────────────── Ack{E, len'} ──  reply
 ```
 
----
+Workers that are caught up get only new entries (`Append`). New workers, workers with a gap, and workers that just saw a failover get the whole history (`Snapshot`).
 
-## 2. Protocol walkthrough
+### Repairing a gap
 
 ```text
-Leader (epoch E)                         Replica
-     |                                       |
-     |-- Snapshot{E, entries[0..n]} -------->|  first contact in epoch E
-     |<------------------ Ack{E, len=n} -----|
-     |                                       |
-     |   (task completes: 2 new entries)     |
-     |-- Append{E, start=n, entries} ------->|  delta only
-     |<------------------ Ack{E, len=n+2} ---|
-     |                                       |
-     |-- Append{E, start=n+4, ...} --------->|  gap! replica only has n+2
-     |<------------------ Resync{E, len} ----|
-     |-- Snapshot{E, entries[0..]} --------->|
-     |<------------------ Ack{E, len} -------|
-
-Stale leader (epoch E-1) --- Append ---> Replica (epoch E)
-                         <-- Reject{E} --   stale leader steps down
+  ── Append{E, start = 9, …} ────────────────►  "I only have 6": can't apply
+  ◄────────────────────────── Resync{E, 6} ──
+  ── Snapshot{E, all entries} ───────────────►  replace, save, Ack
 ```
 
-**Failover:** survivors build `Candidate`s, `elect()` picks one, and the winner calls `Replica::promote(new_epoch, peers)`. The new leader starts with every peer marked as needing a snapshot, so all replicas converge on *its* history even if theirs had diverged.
+### Failover
 
----
+1. The main process goes away; its peers drop it from their `PeerTable`.
+2. Each surviving worker reports a `Candidate` (epoch, history length, connection time).
+3. `elect()` ranks them: **most complete history, then connected longest, then lowest ID**. It returns the winner and **epoch + 1**.
+4. The winner calls `Replica::promote`. That records an `EpochAdvanced` event and makes every peer start with a `Snapshot`, so all copies converge on the winner's history.
 
-## 3. `history.rs` — core types
+### A stale main process comes back
 
-### Type aliases: `NodeId`, `Epoch`, `Seq`
-
-```rust
-pub use crate::node::NodeId; // = iroh::EndpointId
-pub type Epoch  = u64;
-pub type Seq    = u64;
+```text
+Old main (epoch 1) ── Append{1, …} ──► Worker (epoch 2): 1 < 2 → Reject{2}
+Old main sees Reject{2} → steps down to a worker
+New main adds it back → Snapshot{2} → its unsynced entries are discarded
 ```
 
-- **`NodeId`** identifies a peer.
-- **`Epoch`** is the leadership term, bumped on every failover.
-- **`Seq`** is a history length, which is also the index of the next entry.
+### A node restarts
 
-**Why:** `NodeId` is the Iroh endpoint ID (a 32-byte public key), defined once in `src/node.rs` and shared with the `PeerTable`, so a peer has the same ID in networking and in history sync. It's `Copy`, ordered (needed for deterministic tie-breaking) and serializable. `Epoch` and `Seq` stay `u64` aliases that document intent at every call site. `Seq` doubles as "length" and "next index" because the history is append-only, so one number fully describes a replica's progress.
+`Node::from_store` brings it back as a worker with its saved history and epoch. The main process's next `Append` hits `Resync` (a restarted worker always takes a fresh snapshot first), and it catches up.
 
-#### As the project evolves
-- The wire `Hello.node_id` is still a `String`; peers are recorded under the connection's authenticated ID, not the string.
-- Consider **newtypes** (`struct Epoch(u64)`) once the crate stabilises, so an epoch can't be passed where a length is expected.
-- The architecture doc's event log uses `(term, index)` — that's `(Epoch, Seq)` under different names. Keep them aligned if the shared protocol crate adopts that naming.
+## 3. Core ideas: node IDs, epochs, events
 
-### `enum Entry` — job events
+**`NodeId`** is the Iroh endpoint ID: a 32-byte public key, defined once as `crate::node::NodeId` and shared with the networking layer's `PeerTable`. A peer has the same ID everywhere.
 
-One event in the conversation log (architecture §9), serialized with a `"type"` tag:
+**`Epoch`** is the main process's term number. It starts at 1 and goes up by one at every takeover. Every message carries the sender's epoch, and anything from an older epoch is refused (`Reject`). That's what stops a main process that lost contact, then came back, from overwriting the conversation. A new epoch also tells workers that their history may differ from the new main process's, so they take a full snapshot before accepting partial updates.
 
-| Variant | Records |
+**`Seq`** is a history length, which is also the index of the next entry.
+
+**Events.** History is a log of job events, not chat turns:
+
+| Event | Meaning |
 |---|---|
 | `JobStarted { request_id, prompt }` | A prompt was accepted |
 | `OutputCommitted { request_id, offset, text }` | Part of the response, starting at byte `offset` |
 | `JobCompleted { request_id }` | The response is complete |
 | `EpochAdvanced { epoch, leader }` | A failover made `leader` the main process |
 
-`Entry::request_id()` returns the job an event belongs to.
+A job with `JobStarted` but no `JobCompleted` was **interrupted**. This is how recovery tells finished answers from cut-off ones. The model's KV cache is never copied; a new main process rebuilds it by re-reading (re-prefilling) the text.
 
-**Why events instead of chat turns:** a job with `JobStarted` but no `JobCompleted` was interrupted, which is what recovery (M-16) needs to see. `request_id` is a `String` to match `protocol::Prompt.request_id`. Text, not KV cache, is stored: a new leader re-prefills from it.
+## 4. Module reference
 
-#### As the project evolves
-- Commit output in chunks during generation (`Leader::complete_job` writes one chunk at the end today).
-- Add **`conversation_id`** and more architecture §9 events (`JobQueued`, `PlacementCommitted`) as the job queue and placement land.
-- Store **token IDs** as well as text for exact replay and deduplication.
-- Chat roles (system prompt, tools) would go in the model manifest or new variants.
+### `history.rs`
 
-### `struct History`
+| Item | What it is | Why |
+|---|---|---|
+| `NodeId` | Re-export of `crate::node::NodeId` (`iroh::EndpointId`) | One ID type across networking and sync |
+| `Epoch`, `Seq` | `u64` aliases | Name the meaning at every call site |
+| `enum Entry` | The four events above; JSON-tagged by `"type"` | Interrupted jobs are visible; `request_id: String` matches `protocol::Prompt` |
+| `Entry::request_id()` | The job an event belongs to, if any | Used by export and tests |
+| `struct History` | Append-only `Vec<Entry>` | No remove or insert, so the history can only grow |
+| `History::since(start)` | Entries from `start` on; clamps instead of panicking | A peer's reported length is untrusted |
 
-Append-only list of entries; the LLM context.
+**As the project evolves**
+- Commit output in chunks while generating (today `complete_job` writes it in one go).
+- Add `JobQueued` and placement events (architecture §9) once the job queue exists.
+- Consider storing token IDs for exact replay.
 
-| Function | Purpose / why |
-|---|---|
-| `new()` | Empty history. |
-| `from_entries(Vec<Entry>)` | Used when applying a snapshot. Takes ownership, so no copying. |
-| `len() -> Seq` | Progress marker for acks and appends. |
-| `is_empty()` | Clippy convention alongside `len`. |
-| `entries() -> &[Entry]` | Read-only view; callers can't break append-only by editing. |
-| `since(start) -> &[Entry]` | The delta for an `Append`. **Clamps** `start` to the end instead of panicking, because a peer's reported length is untrusted input. |
-| `extend(entries)` | The only mutation, so the history can only grow. |
-
-**Why a wrapper instead of a bare `Vec<Entry>`:** It enforces append-only at the type level (no `remove`, no `insert`), and gives one place to later add hashing, persistence, or compaction without touching the protocol code.
-
-#### As the project evolves
-- **Persistence** is done by `HistoryStore` (§9), which mirrors a `History` to disk; `History` itself stays a plain in-memory type.
-- **Hash chain:** store a running hash so `Append` can carry `prev_hash` (architecture §14 `STATE_APPEND`) and replicas can detect divergence directly, rather than relying only on epochs.
-- **Size:** full history in memory grows forever (README open question). Options: snapshot + truncate, keep only the last *N* turns in memory, or page from disk.
-- Encryption at rest (architecture §12.3): every node holds the full chat.
-
----
-
-## 4. `message.rs` — wire messages
-
-### `enum SyncMessage`
+### `message.rs`
 
 | Variant | Direction | Meaning |
 |---|---|---|
-| `Snapshot { epoch, leader, entries }` | Leader → replica | Replace your history with this. |
-| `Append { epoch, leader, start, entries }` | Leader → replica | Entries starting at index `start`. |
-| `Ack { epoch, len }` | Replica → leader | I hold the first `len` entries of your history. |
-| `Resync { epoch, len }` | Replica → leader | I can't apply your append; send a snapshot. |
-| `Reject { epoch }` | Anyone → sender | Your epoch is stale; the current one is `epoch`. |
+| `Snapshot { epoch, leader, entries }` | main → worker | Replace your history with this |
+| `Append { epoch, leader, start, entries }` | main → worker | Entries from index `start` |
+| `Ack { epoch, len }` | worker → main | I hold your first `len` entries (on disk, when using `handle_durable`) |
+| `Resync { epoch, len }` | worker → main | I can't apply that; send a snapshot |
+| `Reject { epoch }` | anyone → sender | Your epoch is old; the current one is `epoch` |
 
-**Why these five:**
-- **Snapshot + Append** is the minimum for being both correct and efficient: deltas in the common case, full state whenever there's doubt. Snapshot is the universal repair path, so no complex reconciliation logic is needed.
-- **`Append.start`** makes appends idempotent and lets a replica detect gaps.
-- **`Ack` carries a length, not a message ID**, so later acks supersede earlier ones and the order they arrive in doesn't matter.
-- **`Resync` instead of the leader guessing** — only the replica knows whether it can apply an append.
-- **`Reject`** is the fencing mechanism: it's how a stale leader learns it has been replaced.
-- **Every variant carries `epoch`**, so any message can be checked for staleness before anything else.
-- **`leader` is included** so a replica knows who its current leader is, which is useful for routing and diagnostics.
+`to_bytes()` / `from_bytes()` encode JSON. On the network they ride as the opaque payload of Yash's `protocol::Message::History { conversation_id, payload }`. `type Outgoing = (NodeId, SyncMessage)` is a message plus its destination.
 
-| Function | Purpose / why |
+**As the project evolves**
+- Add `cluster_id` and `prev_hash` (architecture §9, §14).
+- Move to postcard to match the rest of the protocol.
+- Large snapshots may need chunking under the 16 MiB frame limit.
+
+### `leader.rs`: `Leader`
+
+Holds the authoritative history and how far each peer has confirmed (`NeedsSnapshot` or `Acked(len)`, in a `BTreeMap` for deterministic order).
+
+| Function | Purpose |
 |---|---|
-| `epoch()` | Reads the epoch from any variant; used for the stale check that runs before any other handling. |
-| `to_bytes()` | JSON-encodes the message. `expect` is safe because these types always serialize. |
-| `from_bytes(&[u8])` | Decodes; returns `Result` because network bytes are untrusted. |
+| `new(id, epoch, history, peers)` | Fresh session (epoch 1) or a promoted worker |
+| `start_job(request_id, prompt)` | Records `JobStarted`, returns sync messages |
+| `complete_job(request_id, response)` | Records `OutputCommitted` + `JobCompleted`, returns sync messages |
+| `complete_task(request_id, prompt, response)` | Both at once (tests, simulator) |
+| `append(entries)` | Adds entries without sending |
+| `sync()` | What each lagging peer needs; call it again to retransmit |
+| `handle(from, msg)` | Processes `Ack`, `Resync` and `Reject` (see below) |
+| `set_peers(ids)` | Replaces the peer list, e.g. from `PeerTable`; known peers keep their progress |
+| `add_peer` / `remove_peer` / `peers` / `up_to_date_peers` | Membership and status |
+| `deposed_by()` | `Some(epoch)` once a newer main process has replaced this one |
 
-**Why JSON:** Human-readable while debugging the prototype, and `serde` makes switching formats a one-line change.
+`handle` rules:
+- **`Ack`:** only ever raises a peer's count, capped at our own length, because acks can arrive out of order.
+- **`Resync`:** gets an immediate snapshot.
+- **`Reject` with a newer epoch:** marks the leader deposed, and it goes silent.
+- **Unknown peers:** their messages are ignored; membership comes from the peer table.
 
-#### As the project evolves
-- **Switch to postcard.** Yash's P2P control stream uses a u32 big-endian length prefix plus postcard-encoded messages, with a `History { conversation_id, payload: Vec<u8> }` variant whose payload is opaque. For now `to_bytes()` output can go straight into `payload`; later use postcard everywhere for consistency and size.
-- **Add `cluster_id`** to every variant (architecture §9: "include `cluster_id`, `epoch` and `placement_version` in all control messages").
-- **Add `prev_hash` to `Append`** (architecture §14 `STATE_APPEND {term, index, prev_hash, event}`).
-- **Protocol version and size limits:** a huge snapshot shouldn't exceed frame limits. May need chunked snapshots, or a dedicated state stream/ALPN (architecture §6 suggests a separate `state` stream; Yash's bot is open to proposing one).
-- **Authentication:** the message itself doesn't prove who sent it. That must come from the Iroh connection's authenticated peer ID plus the allowlist, not from the `leader` field.
+**As the project evolves**
+- Track which acks came from voters to support majority commit.
+- Drive `set_peers` from heartbeats.
+- Own the job queue's state changes in this same log.
 
-### `type Outgoing = (NodeId, SyncMessage)`
+### `replica.rs`: `Replica`
 
-A message plus the peer it should go to.
+| Function | Purpose |
+|---|---|
+| `new(id)` / `with_history(id, epoch, history)` | Empty worker, or one restored from disk or a stepped-down leader |
+| `handle(msg)` | Applies a main-process message and returns the reply |
+| `candidate(connected_at_unix_ms)` | This worker's election entry |
+| `promote(new_epoch, peers)` | Becomes the main process; refuses an epoch that isn't newer, records `EpochAdvanced` |
 
-**Why:** Lets every state-machine function return "what to send" without owning a network handle (see the "transport-agnostic" principle in §1).
+`handle` rules, in order:
+1. Older epoch → `Reject`.
+2. `Snapshot` → replace the history, adopt the epoch, `Ack`.
+3. `Append` that's from a new epoch, arrives before this epoch's snapshot, or leaves a gap → `Resync`. Otherwise skip the entries we already have and `Ack`.
 
-#### As the project evolves
-May become a struct with a priority or an "expects reply" flag if the runtime needs to schedule retries per message.
+The `in_sync_epoch` flag is what makes rule 3 safe after failover: the new main process's history may differ from ours.
 
----
+**As the project evolves**
+- With `prev_hash`, a worker whose history already matches could accept an append after failover instead of a full snapshot.
+- Check that messages come from the expected leader's authenticated peer ID.
+- `promote` should also trigger layer reassignment and reloading the job queue (architecture §9).
 
-## 5. `leader.rs` — main-process side
+### `node.rs`: `Node`
 
-### `enum PeerState` (private)
+`enum Node { Leader(Leader), Replica(Replica) }` is one peer's current role.
 
-- `NeedsSnapshot` — the peer hasn't confirmed a snapshot in this epoch.
-- `Acked(Seq)` — the peer has confirmed this many entries.
+| Function | Purpose |
+|---|---|
+| `handle(from, msg)` | Routes to the role; a leader that sees a newer epoch steps down first and keeps its history |
+| `handle_durable(from, msg, &mut store)` | Same, but saves to disk **before** returning replies, so an `Ack` only covers saved entries |
+| `persist(&mut store)` | Saves new entries and a newer epoch; the main process calls it before sending |
+| `from_store(id, &store)` | Restores a node after restart, as a worker |
+| `set_peers(&PeerTable)` | On a leader, sync with exactly the table's peers |
+| `id` / `epoch` / `history` / `as_leader_mut` | Accessors |
 
-**Why only two states:** That's all the leader needs to pick the next message: snapshot, append from *n*, or nothing. New peers, peers after failover, and peers that asked to resync all collapse into `NeedsSnapshot`.
+**As the project evolves**
+- This is the natural home for the per-node control loop (§6).
+- A `Node::promote` would make promotion symmetric with step-down (it currently lives on `Replica`).
 
-#### As the project evolves
-Add per-peer `last_sent_at` for retry timers, in-flight tracking so one large snapshot isn't resent every round, and voter eligibility for quorum commit.
+### `election.rs`
 
-### `struct Leader`
+`Candidate { id, epoch, len, connected_at_unix_ms }`. `elect(&[Candidate]) -> Option<Elected { id, epoch }>` ranks by `(epoch, len)`, then the **earliest** `connected_at_unix_ms`, then the lowest `id`. It returns `max epoch + 1`.
 
-Fields: `id`, `epoch`, `history`, `peers: BTreeMap<NodeId, PeerState>`, `deposed_by: Option<Epoch>`.
+**Why this order:** history first, so the winner never has fewer entries than a node that could have won instead. Its snapshot would erase them. Connection time comes second because device clocks can differ, so it only breaks ties. Every node that sees the same candidates picks the same winner.
 
-**Why:**
-- **`BTreeMap`** gives deterministic iteration order, so tests and the demo are reproducible and output is stable. It's also a cheap way to handle any number of peers.
-- **`deposed_by` instead of self-destructing:** A `Leader` can't turn itself into a `Replica` from inside `&mut self`, so it records that it was replaced and goes silent (`sync`/`handle` return nothing). `Node` performs the actual conversion.
+**Limit:** this is a ranking, not a vote. If the network splits, each side could elect its own winner in the same epoch. Safe automatic failover needs a majority of at least 3 voters (architecture §9). Until then, 2-device demos use **manual takeover** (agreed with david-codex).
 
-| Function | Purpose | Why it's implemented this way |
-|---|---|---|
-| `new(id, epoch, history, peers)` | Creates the main process. | Takes an existing `History` so the same constructor serves a fresh session (epoch 1) and a promotion after failover. Peers go through `add_peer`, which filters out self. |
-| `id()`, `epoch()`, `history()` | Accessors. | Fields stay private so invariants can't be broken from outside. |
-| `into_history(self)` | Gives up ownership of the history. | Used by `Node::step_down` to move the history into a `Replica` without cloning. |
-| `deposed_by()` | `Some(epoch)` if replaced. | Lets callers and `Node` detect step-down. |
-| `peers()` | Iterator over peer IDs. | Read-only membership view. |
-| `add_peer(id)` | Starts tracking a peer as `NeedsSnapshot`. | Re-adding resets the peer to a snapshot, which is the safe choice for a rejoining node with unknown state. Ignores its own ID. |
-| `remove_peer(id)` | Stops syncing to a peer. | Called by membership/heartbeat when a node leaves. |
-| `up_to_date_peers()` | Peers holding the full current history. | The basis for a future commit/quorum check and status display. |
-| `append(entries)` | Adds entries without sending. | Separated from sending so several entries can be batched, and so it's testable. |
-| `start_job(request_id, prompt)` | Appends `JobStarted` and returns sync messages. | Syncing the start lets a successor see the job as interrupted if this process dies mid-generation. |
-| `complete_job(request_id, response)` | Appends `OutputCommitted` + `JobCompleted` and returns sync messages. | Implements the README rule "after every completed task, send history to all workers". |
-| `complete_task(request_id, prompt, response)` | Both of the above in one call. | Convenience for tests and the simulator. |
-| `sync()` | Messages that bring every lagging peer up to date. | **The single retransmit mechanism:** it's stateless with respect to what was previously sent, so calling it again after packet loss resends exactly what's missing. Returns nothing once deposed. |
-| `message_for(state)` (private) | Picks snapshot, append from *n*, or nothing. | Keeps the decision in one place. |
-| `snapshot()` (private) | Builds a full-history `Snapshot`. | Shared by `sync` and `Resync` handling. |
-| `handle(from, msg)` | Processes replica replies. | See the rules below. |
+**As the project evolves**
+- Replace with Raft-style voting once 3+ voters exist.
+- Add reliability inputs (always-on desktop over a phone that sleeps; architecture §2).
+- `connected_at_unix_ms` resets on reconnect, so a briefly dropped node loses its seniority.
 
-**`handle` rules and why:**
-- `Reject` with a higher epoch → mark deposed. *We've been replaced; stop issuing commands (fencing).*
-- `Ack` for this epoch → raise that peer's acked length, **never lower it**, and cap it at our own length. *Acks can arrive out of order, and a peer claiming more than we have must not cause out-of-range appends.*
-- `Resync` for this epoch → mark the peer `NeedsSnapshot` and reply with a snapshot immediately. *Fast repair; no extra round trip.*
-- Any other message from a lower epoch → reply `Reject`. *Tells lagging nodes the current epoch.*
-- Messages for other epochs, or from unknown peers → ignore. *Unknown peers must be added through membership, not by sending messages.*
+### `store.rs`: `HistoryStore`
 
-#### As the project evolves
-- **Quorum commit (open decision B):** use the ack table to compute a commit index (the highest `Seq` acked by a majority of voters), and only report a task as durably saved once it's committed. Needed for the "strict no-loss" policy in architecture §9.
-- **Snapshot cost:** after failover, every peer gets a full snapshot. Once `prev_hash` exists, a replica whose prefix matches could get an append instead.
-- **Streaming chunks:** `complete_job` commits the whole response at once. The architecture doc suggests committing response chunks during generation so less is lost on failure.
-- **Membership:** `Leader::set_peers` (or `Node::set_peers(&PeerTable)`) replaces the peer list from the `PeerTable`, keeping existing peers' progress. Incoming connections leave the table when they close; dialed connections must call `network::forget_peer` themselves. Nothing calls `set_peers` on a live node yet, because there's no control loop.
-- **Job queue:** the leader is also meant to own the FIFO job queue (§10); its state changes would ride this same log.
+| Function | Purpose |
+|---|---|
+| `open(data_dir, StoreMeta)` | Opens a conversation, creating it if absent. An existing one must match the cluster ID and model hash (`StoreError::Mismatch`) |
+| `load(data_dir, conversation_id)` | Opens an existing one only (`NotFound` otherwise) |
+| `append(entries)` | Adds entries; on disk when it returns |
+| `replace(history, epoch)` | Swaps in a whole history, e.g. from a snapshot |
+| `set_epoch(epoch)` | Records a newer epoch |
+| `export()` | Returns a `ConversationExport` |
+| `history` / `epoch` / `len` / `meta` / `dir` | Accessors |
 
----
+Supporting types:
+- `StoreMeta`: `format_version`, `conversation_id`, `cluster_id`, `model`, `epoch`.
+- `ModelManifest`: `model_hash`, plus a `generation` settings map.
+- `ConversationExport` and `JobState`: see §5.
+- `job_states(&History)`: rebuilds each job's state from the event log.
+- `StoreError`: what can go wrong (bad I/O or JSON, corruption, unsafe ID, mismatch, not found, unsupported version).
 
-## 6. `replica.rs` — worker side
+Constants: `FORMAT_VERSION = 1`, `SNAPSHOT_EVERY = 100`, `DEFAULT_DATA_DIR = "meshthing-data"`.
 
-### `struct Replica`
+**As the project evolves**
+- Restore: start a main process from an export.
+- Majority commit: carry that boundary in `committed_len`.
+- Postcard instead of JSON, and chunked snapshots, for long conversations.
+- Encryption at rest (architecture §12.3).
 
-Fields: `id`, `epoch`, `leader: Option<NodeId>`, `history`, `in_sync_epoch: bool`.
+### `sim.rs`: `Cluster`
 
-**Why `in_sync_epoch`:** After a failover, the new leader's history may differ from ours (we may hold an entry it never received). Appending its delta onto our copy could silently mix two histories. So a replica refuses appends until it has applied a **snapshot** from the current epoch's leader. This single flag is what makes failover safe without hash chains.
+An in-memory mesh used by the tests and the demo. Every message goes through `to_bytes`/`from_bytes`, so the wire format is exercised. Membership lives in a real `PeerTable`, which drives the leader's peer list and election candidates. `node_id(i)` makes repeatable IDs.
 
-| Function | Purpose | Why it's implemented this way |
-|---|---|---|
-| `new(id)` | Empty replica, epoch 0. | Epoch 0 is below any real leader (leaders start at 1), so the first leader is always accepted. |
-| `with_history(id, epoch, history)` | Replica that keeps existing history. | Used when a deposed leader steps down; its history is kept until a snapshot replaces it, and will also be needed for loading from disk. |
-| `id()`, `epoch()`, `leader()`, `history()`, `len()`, `is_empty()` | Accessors. | `epoch` and `len` feed `Candidate` for elections. |
-| `handle(msg) -> Option<SyncMessage>` | Applies a leader message and returns the reply. | See the rules below. |
-| `ack()` (private) | Builds `Ack{epoch, len}`. | Shared reply after any successful apply. |
-| `promote(self, new_epoch, peers) -> Leader` | Becomes the main process after failover. | **Consumes** the replica so the old role can't still be in use. Asserts that `new_epoch` is newer, because reusing an epoch would break fencing. Appends `EpochAdvanced` so the log records the takeover. |
+Controls:
+- Faults: `drop_next_to`, `disconnect`, `reconnect`.
+- Running jobs: `complete_task`, `resync`, `run`.
+- Recovery: `failover`, `rejoin`.
+- Checking: `converged`, `leader_id`, `node`, `id`, `index`.
 
-**`handle` rules and why:**
-1. **Message from an older epoch → `Reject{our epoch}`.** Checked first, before anything else (fencing). Rejects aren't answered, to avoid reject ping-pong.
-2. **`Snapshot` (same or newer epoch) → replace history, adopt epoch and leader, set `in_sync_epoch`, `Ack`.** The universal repair path.
-3. **`Append`:**
-   - newer epoch, not yet snapshotted this epoch, or `start > len` (a gap) → `Resync`, and adopt the epoch. *Can't apply it safely; ask for the full state.*
-   - otherwise → skip the entries we already have (`len - start`), append the rest, `Ack`. *Makes duplicates and overlapping retransmits harmless.*
-4. **`Reject` with a newer epoch → adopt it and clear `in_sync_epoch`.** We learned the world moved on.
-5. **`Ack` / `Resync` → ignore.** Those are replica-to-leader messages.
+**As the project evolves**
+- Keep it as the test harness after Iroh is wired in; it's faster and deterministic.
+- Add seeded reordering and duplication to stress-test repeated messages.
+- Give each node its own `PeerTable` and `HistoryStore` to test disk-backed failover end to end.
 
-#### As the project evolves
-- **Persistence:** apply each change to disk before sending `Ack`, so an ack means durably stored. Without that, a quorum commit means nothing.
-- **Hash check:** with `prev_hash`, a replica can verify an append matches its prefix and skip unnecessary snapshots after failover.
-- **Leader identity check:** verify that messages actually come from the `leader` field's peer, using the authenticated Iroh peer ID.
-- `promote` currently copies the candidate list as peers; later it should take membership from the shared cluster state, and should also trigger layer reassignment and the job queue reload (architecture §9 failure scenario).
-
----
-
-## 7. `election.rs` — failover choice
-
-### `struct Candidate { id, epoch, len, connected_at_unix_ms }`
-
-What a surviving peer reports when the main process is lost: its epoch, history length, and when it last connected (from `PeerInfo.connected_at_unix_ms` in `src/node.rs`).
-
-**Why these fields:** The replacement should lose as little history as possible, so the highest epoch plus the longest history identifies the most up-to-date copy. Among equally up-to-date peers, the one connected longest is preferred as the likeliest to stay online.
-
-### `struct Elected { id, epoch }`
-
-The winner and the **new** epoch it must lead with.
-
-**Why it returns an epoch:** The election decides the next term (`highest epoch seen + 1`). That's what makes the new leader's messages beat the old leader's.
-
-### `fn elect(candidates) -> Option<Elected>`
-
-Picks the candidate with the highest `(epoch, len)`, then the earliest `connected_at_unix_ms` (connected longest), then the lowest `NodeId`, and returns `epoch = max_epoch + 1`. Returns `None` if there are no candidates.
-
-**Why:**
-- **Deterministic:** every survivor that sees the same candidate list picks the same winner, without another round of messages.
-- **Most-complete history first:** minimizes lost conversation.
-- **Connection time second, not first:** a long-connected peer with a shorter history would overwrite newer entries on every other node. And because it's a wall-clock reading that can differ between devices, it only breaks ties.
-- **Lowest ID last:** an arbitrary but stable rule.
-
-**Known limitation (documented in code):** this is a *preference*, not consensus. If survivors see different candidate lists (a network partition), two winners are possible. The architecture doc (§9) says automatic failover is only safe with a majority vote of at least 3 voting nodes, and that 2-node demos should use **manual takeover**. David's bot confirmed its tests will use manual takeover.
-
-#### As the project evolves
-- **Real connection times:** `Candidate.connected_at_unix_ms` is filled from the simulator's `PeerTable` (a logical clock). A live node uses `Replica::candidate(connected_at)` with the value from its `PeerTable` entry (and its own start time) when building candidates. Note that a reconnect resets it, so a briefly dropped node loses its seniority.
-- **Reliability ranking (architecture §2):** prefer always-on desktops over phones that may sleep. Add device class, power source, or uptime to `Candidate`.
-- **Real consensus:** replace with Raft-style voting (terms, majority votes, explicit voter set) once 3+ voters exist. The `Candidate` fields map onto Raft's "last log term / index" rule for vote eligibility.
-- **Manual takeover mode** for 2 nodes: a function that promotes a user-chosen node, still bumping the epoch.
-
----
-
-## 8. `node.rs` — role switching
-
-### `enum Node { Leader(Leader), Replica(Replica) }`
-
-A peer's current role.
-
-| Function | Purpose | Why it's implemented this way |
-|---|---|---|
-| `id()`, `history()` | Same accessors for either role. | Callers (the simulator, a future runtime) don't need to match on the role. |
-| `as_leader_mut()` | `Some(&mut Leader)` if this node is the leader. | Used to run tasks on the leader. |
-| `handle(from, msg)` | Routes the message to the right role, **switching role first if needed**. | A leader that receives `Reject` with a newer epoch, or a `Snapshot`/`Append` from a newer-epoch leader, steps down and (for snapshots and appends) processes the message as a replica in the same call, so it's in sync straight away. |
-| `from_newer_leader(leader, msg)` (private) | Is this a command from a higher-epoch leader? | Keeps the step-down condition readable. |
-| `step_down()` (private) | Converts a `Leader` into a `Replica`, keeping its history and the epoch that replaced it. | Uses `std::mem::replace` with a temporary placeholder, the standard Rust way to change an enum variant in place through `&mut self`. History is moved, not cloned. |
-
-**Why a separate type:** `Leader` and `Replica` stay simple single-role state machines. The cross-role rule ("a newer leader exists, so step down") lives in one place.
-
-#### As the project evolves
-- This is the natural home for the **node agent** in architecture §2: heartbeats, membership, and job-queue handling would hang off `Node`.
-- A node that's both leader and worker (the prompted device) only needs the leader's history; worker compute is separate from history sync.
-- Promotion (replica → leader) currently happens outside `Node` (in `Cluster::failover`); a `Node::promote` would make the API symmetric.
-
----
-
-## 9. `store.rs` — durable storage and export
-
-### On-disk layout
+## 5. Storage format and crash safety
 
 ```text
 <data-dir>/history/<conversation_id>/
-├── meta.json       StoreMeta: format version, conversation/cluster ID, ModelManifest, epoch
-├── snapshot.json   { generation, entries[] } — the first entries of the history
-└── log.jsonl       { generation, index, entry } per entry after the snapshot
+├── meta.json       StoreMeta (replaced atomically)
+├── snapshot.json   { generation, entries[] }: the first entries (replaced atomically)
+└── log.jsonl       one { generation, index, entry } line per later entry
 ```
 
-**Why:** JSON is readable by people and by David's Python harness. `meta.json` and `snapshot.json` are replaced atomically (write a temporary file, flush, rename). The log is append-only and flushed before `append` returns.
+- **Appends** are one write per call, flushed with `sync_data` before `append` returns.
+- **Atomic replacement:** write a temporary file, flush it, rename it over the old one, then flush the directory (Unix).
+- **Compaction:** every 100 log entries, the log is folded into a new snapshot and truncated.
+- **Conversation IDs** become folder names, so only 1–128 letters, digits, `-`, `_`, `.` are allowed (not `.` or `..`).
 
-**Crash safety:** a crash at any point leaves a loadable prefix of the history.
-- A torn last log line (no newline) is dropped and cut from the file.
-- Log lines the snapshot already covers (`index < snapshot length`) are skipped, so a crash between writing a snapshot and truncating the log can't duplicate entries.
-- `replace` writes the new snapshot under a new `generation` before truncating the log, so leftover lines from the old history are ignored.
+**Crash safety:** whatever moment a crash happens, loading gives back a prefix of the history:
 
-### `struct HistoryStore`
-
-| Function | Purpose |
+| Crash during… | What load does |
 |---|---|
-| `open(data_dir, meta)` | Opens a conversation, creating it if absent. An existing one must have the same cluster ID and model hash, or `StoreError::Mismatch`. |
-| `load(data_dir, conversation_id)` | Opens an existing conversation only (`NotFound` otherwise); used by the CLI. |
-| `append(entries)` | Adds entries; on disk when it returns. Every `SNAPSHOT_EVERY` (100) log entries, the log is folded into the snapshot. |
-| `replace(history, epoch)` | Swaps in a whole new history, e.g. a snapshot from a new leader. |
-| `set_epoch(epoch)` | Records a newer leadership epoch in `meta.json`. |
-| `export()` | Returns a `ConversationExport`. |
-| `history()`, `epoch()`, `len()`, `meta()`, `dir()` | Accessors. |
+| A log write | The last line has no newline: it's dropped and cut from the file |
+| Compaction, after the snapshot but before the log is cut | Log lines with `index` below the snapshot length are skipped |
+| `replace`, before the log is cut | Old lines carry the previous `generation` and are ignored |
 
-Conversation IDs become directory names, so only 1–128 letters, digits, `-`, `_`, `.` are accepted (not `.` or `..`).
+A complete line that isn't valid JSON, or an index that skips ahead, is reported as corruption rather than silently dropped.
 
-### Hooking the store into sync (`node.rs`)
+**`ConversationExport`** (versioned JSON for recovery tools):
+- **Identity:** `format_version`, `conversation_id`, `cluster_id`.
+- **Model:** `model` (`model_hash` + `generation` settings).
+- **State:** `epoch`, and `committed_len`, the log boundary to resume from.
+- **Contents:** `jobs[]` and `entries[]`.
 
-| Function | Use |
-|---|---|
-| `Node::from_store(id, &store)` | After a restart: the node comes back as a replica with its saved history and epoch. |
-| `Node::persist(&mut store)` | On the main process, after `start_job` / `complete_job` / `complete_task` and **before** sending their messages. |
-| `Node::handle_durable(from, msg, &mut store)` | Instead of `handle` on a worker: saves the result before returning replies, so an `Ack` only covers entries already on disk. |
+Each `JobState` has `request_id`, `prompt`, `status` (`completed` / `interrupted`), `committed_output` and `committed_output_offset` (bytes). Output chunks are joined only while they line up end to end, so a repeated chunk or one after a gap is ignored.
 
-### `ConversationExport` and `JobState`
+**"Committed" means saved on this node's disk.** It doesn't yet mean a majority of nodes have it.
 
-Versioned JSON for recovery tools: `format_version`, `conversation_id`, `cluster_id`, `model` (`model_hash` + `generation` settings), `epoch`, `committed_len` (the log boundary), `jobs`, `entries`. Each `JobState` has `request_id`, `prompt`, `status` (`completed` / `interrupted`), `committed_output` and `committed_output_offset` (bytes). Output chunks are only joined when they line up end to end.
+## 6. Using it from a node
 
-"Committed" means on this node's disk. It does not yet mean a majority of nodes.
+Main process:
 
-### CLI
+```rust
+let mut store = HistoryStore::open(&data_dir, StoreMeta::new(conversation, cluster, model))?;
+let mut node = Node::Leader(Leader::new(my_id, 1, store.history().clone(), peers.ids()));
+
+let out = node.as_leader_mut().unwrap().start_job(&request_id, &prompt);
+node.persist(&mut store)?;        // save first…
+send_all(out);                    // …then tell the workers
+// after generation:
+let out = node.as_leader_mut().unwrap().complete_job(&request_id, &response);
+node.persist(&mut store)?;
+send_all(out);
+```
+
+Worker:
+
+```rust
+let mut store = HistoryStore::open(&data_dir, meta)?;
+let mut node = Node::from_store(my_id, &store);
+// for each History frame received from `from`:
+let msg = SyncMessage::from_bytes(&payload)?;
+for (to, reply) in node.handle_durable(from, msg, &mut store)? {
+    send(to, reply);
+}
+```
+
+On peer-table changes, the main process calls `node.set_peers(&peer_table)` and then sends `sync()`.
+
+**Missing pieces:**
+- **No control loop:** nothing yet reads `History` frames from control connections and calls the code above.
+- **HistorySink:** Yash's M-7/M-8 work proposes a `HistorySink { record(CompletedTurn) }` hook. It would sit on `start_job` / `complete_job` + `persist`.
+- **PR #10 conflicts:** it adds heartbeats to `PeerTable` and conflicts with the `NodeId`-keyed table here. Reconciling them is task M-21.
+
+## 7. CLI and demo
 
 ```text
-llm-cluster history export  <conversation> [--data-dir meshthing-data]   # JSON to stdout
-llm-cluster history inspect <conversation> [--data-dir meshthing-data]   # summary, interrupted jobs flagged
+llm-cluster history inspect <conversation> [--data-dir meshthing-data]   # summary; interrupted jobs flagged
+llm-cluster history export  <conversation> [--data-dir meshthing-data]   # ConversationExport as JSON
+cargo run --example history_sync -- 6                                    # simulated 6-node mesh
 ```
 
-#### As the project evolves
-- **Restore:** a command and API that start a leader from an export (manual takeover).
-- **Quorum commit:** mark entries committed only once a majority has acked them; the export format can carry that boundary in `committed_len`.
-- **Size:** postcard instead of JSON, and chunked snapshots for long conversations.
-- **Encryption at rest** (architecture §12.3): every node holds the full chat.
+The demo runs three jobs with one dropped message and a retransmit. Then the main process drops out, a failover happens, one job runs under the new main process, and the old one returns, gets refused and resyncs. It prints each node's history length and whether all nodes match.
 
----
+## 8. Tests
 
-## 10. `sim.rs` — in-memory cluster
+`tests/history_sync.rs` (13): sync, failover and election.
+- **Sync:** any number of nodes from 1 to 50; deltas after the first snapshot; repeated appends are harmless; dropped messages recovered; a gap triggers a snapshot.
+- **Failover:** continues from a worker's history (`EpochAdvanced` recorded); the most complete history wins; a stale main process is refused and resynced.
+- **Peers:** a disconnected peer stops being synced and catches up on rejoin; the leader's peer list follows `PeerTable`.
+- **Election and wire format:** the ranking is deterministic; longest-connected wins among equal histories; messages survive a round trip.
 
-### `struct Envelope` (private)
+`tests/history_store.rs` (11): storage and export.
+- **Reload:** history and epoch survive a restart.
+- **Crashes:** torn last line dropped; corrupt complete line reported; compaction and the crash after it; `replace` and the crash during it.
+- **Refusals:** a different model or cluster; unsafe or missing conversation IDs.
+- **Export:** completed vs interrupted jobs, including chunk joining.
+- **Sync on disk:** a worker acks only what's saved; a restarted worker reloads and catches up; the main process saves before sending.
 
-A message in flight: `from`, `to`, and **encoded bytes**.
+Run them with `cargo test --test history_sync --test history_store`.
 
-**Why bytes and not `SyncMessage`:** Every simulated message goes through `to_bytes`/`from_bytes`, so the wire format is exercised on every test, as it would be over Iroh.
+## 9. Limits and next steps
 
-### `struct Cluster`
+**Known issues** (found in david-codex's review of `6114f93`, not fixed yet):
+- **Epoch saved separately from history.** `HistoryStore::replace` writes the snapshot and then `meta.json`, and `Node::persist` appends and then sets the epoch. A crash between the two writes reloads the new history with the old epoch. Fix: keep the epoch in `snapshot.json` so both are written in one atomic replace.
+- **Connection identity is a millisecond timestamp.** `PeerTable::remove_connection` matches on `connected_at_unix_ms`. Two reconnects in the same millisecond, or a clock going backwards, let an old connection's close remove the new entry. `run_control_session` also reads that timestamp after the handshake, so a concurrent reconnect can replace it first. Fix: a unique connection token returned by `record_connection`, separate from the logged time. Being handled with the PR #10 reconcile (M-21).
+- **Dialed connections need manual cleanup.** Callers of `dial_peer` must call `forget_peer` themselves; a handle that does it on drop would be safer.
 
-Fields: `nodes`, a FIFO `queue`, an `offline` set, `drop_next` counts per node, and public `delivered`/`dropped` counters.
-
-**Why:** It stands in for the P2P layer so the protocol can be tested before Iroh integration. It supports exactly the failures the protocol must survive: dropped messages, offline nodes, failover, and a returning stale leader.
-
-| Function | Purpose | Why it's implemented this way |
-|---|---|---|
-| `new(n)` | `n` nodes; node 0 is the leader in epoch 1. | Matches the README: one prompted device, the rest workers. |
-| `node(id)`, `node_ids()` | Inspection. | For tests and reporting. |
-| `leader_id()` | The online, non-deposed leader. | A deposed or offline leader doesn't count. |
-| `leader_mut(id)` | Mutable access to a leader. | Panics if the node isn't a leader, since that would be a test bug. |
-| `set_offline(id, bool)` | Cuts a node off from all traffic. | Simulates a crash, sleep, or network loss. |
-| `drop_next_to(id, count)` | Drops the next *count* messages to a node. | Deterministic packet loss; random loss would make tests flaky. |
-| `complete_task(...)` | Runs a task on a leader and queues its messages. | Mirrors real usage. |
-| `resync(leader)` | Queues the leader's `sync()` retransmit. | Stands in for a periodic retry timer. |
-| `send(from, out)` | Encodes and queues messages. | The single path into the network. |
-| `run()` | Delivers messages, including replies, until the queue is empty. | FIFO order is deterministic. Messages to or from offline nodes count as dropped. |
-| `take_drop(to)` (private) | Applies the drop counter. | |
-| `failover()` | Online replicas elect a winner, which is promoted and snapshots everyone. | Shows the full README failover flow. Peers are the online candidates. |
-| `rejoin(id)` | A node comes back; the current leader adds it and resyncs. | Models reconnection. A returning stale leader gets a snapshot and steps down. |
-| `converged()` | True if every online node holds the leader's exact history. | The main correctness check in tests. |
-
-#### As the project evolves
-- Keep it as the **test harness** even after Iroh exists; it's much faster and more deterministic than real networking.
-- Add random reordering and duplication (with a fixed seed) to stress-test idempotence.
-- The real runtime replaces `Cluster` with an async loop: read frames from Iroh streams, call `Node::handle`, write the returned `Outgoing` messages, and drive `sync()` from a timer.
-
----
-
-## 11. `examples/history_sync.rs` — demo binary
-
-`cargo run --example history_sync -- <nodes>` (default 5, minimum 2) runs this scenario on a simulated mesh:
-
-1. Three tasks, with one message to the last node dropped.
-2. A retransmit.
-3. The leader goes offline and failover happens.
-4. One task under the new leader.
-5. The old leader returns, tries to run a stale task, gets rejected, and is resynced.
-
-After each step it prints every node's history length and whether the mesh has converged.
-
-| Function | Purpose |
-|---|---|
-| `main()` | Runs the scenario above. |
-| `report(cluster, label)` | Prints entry counts per node plus a converged/not-converged status. |
-
-**Why:** A quick, human-readable demonstration of every protocol path, useful for the presentation and for teammates checking behavior without reading tests.
-
-#### As the project evolves
-Replace or supplement it with a real CLI once Iroh integration lands, e.g. a `mesh-node` subcommand that runs a live node.
-
----
-
-## 12. Tests
-
-`tests/history_sync.rs` — integration tests against the public API:
-
-| Test | What it proves |
-|---|---|
-| `syncs_any_number_of_nodes` | 1, 2, 3, 8 and 50 nodes all converge. |
-| `sends_deltas_after_first_snapshot` | A snapshot is sent first, then only deltas; up-to-date peers get nothing. |
-| `duplicate_appends_are_idempotent` | Applying the same append twice is harmless. |
-| `dropped_messages_are_recovered_by_resync` | Lost messages are recovered by `sync()`. |
-| `gap_triggers_snapshot` | A gap leads to `Resync`, then a snapshot, then convergence. |
-| `failover_continues_session_from_replica_history` | After the leader dies, a replica takes over with the full history and the session continues. |
-| `election_prefers_most_complete_history` | The node holding the latest task wins and the lagging nodes catch up. |
-| `returning_stale_leader_is_rejected_and_resynced` | Fencing: the old leader steps down and its divergent entry is discarded. |
-| `election_is_deterministic` | Tie-breaks and epoch increments behave as specified. |
-| `messages_round_trip_through_wire_format` | Encoding then decoding gives back the original message. |
-
-#### As the project evolves
-- Update `election_is_deterministic` and `election_prefers_most_complete_history` if the election rule changes (e.g. connection time).
-- Add persistence tests: write, "crash", reload, compare.
-- Add property-based tests (random drops, reordering, failovers) checking that the mesh always converges and that no committed entry is ever lost.
-
----
-
-## 13. Cross-cutting future work
-
-Prioritized list of changes not tied to a single item:
-
-1. **Control loop:** read `History` frames off control streams into `Node::handle_durable`, call `Node::persist` after leader actions, and implement Yash's `HistorySink` on top of `Leader::start_job` / `complete_job`.
-2. **Restore from export:** start a new leader from a `ConversationExport` for manual takeover (M-16).
-3. **Iroh integration:** carry `to_bytes()` inside Yash's `History { conversation_id, payload }` message; later move to postcard and possibly a dedicated state stream.
-4. **Protocol fields:** `conversation_id`, `cluster_id`, `prev_hash`, protocol version.
-5. **Output chunks during generation** instead of one chunk at completion.
-6. **Commit policy (open decision B):** best-effort replication (current) or majority commit.
-7. **Election:** manual takeover for 2 nodes (agreed with David's bot); real consensus once there are 3+ voters; connection time and reliability as a preference.
-8. **Membership:** call `Node::set_peers(&PeerTable)` whenever the peer table changes, once a control loop exists; add heartbeat timeouts so a silent peer is removed too.
-9. **Security:** encryption at rest, authenticated sender checks, size limits on snapshots.
+In priority order:
+1. **Control loop:** read `History` frames, `handle_durable` on workers, `persist` before sending on the main process, `set_peers` when the peer table changes.
+2. **Restore from export:** start a main process from a `ConversationExport` for manual takeover (david-codex's M-16 test needs this).
+3. **Reconcile with PR #10 (M-21):** heartbeat fields on the `NodeId`-keyed `PeerTable`; then hook up `HistorySink`.
+4. **Failure detection (M-11):** drop peers that miss heartbeats, not only those that disconnect.
+5. **Majority commit:** report a job as committed only once a majority of voters have acked it. Needs 3+ voters, and is also the path to safe automatic failover.
+6. **Protocol fields:** `cluster_id`, `prev_hash`, and postcard encoding.
+7. **Size and privacy:** output chunks while generating, chunked snapshots, encryption at rest (every node holds the full chat).
