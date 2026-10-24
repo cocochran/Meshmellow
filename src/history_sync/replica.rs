@@ -81,6 +81,16 @@ impl Replica {
                 leader,
                 entries,
             } => {
+                // A retransmitted snapshot can arrive after a later append. In the
+                // same epoch, a snapshot that is already a prefix of our history
+                // must not roll the replica back.
+                if epoch == self.epoch
+                    && self.leader == Some(leader)
+                    && self.in_sync_epoch
+                    && self.history.entries().starts_with(&entries)
+                {
+                    return Some(self.ack());
+                }
                 self.epoch = epoch;
                 self.leader = Some(leader);
                 self.history = History::from_entries(entries);

@@ -137,6 +137,12 @@ pub enum StoreError {
         stored: String,
         expected: String,
     },
+    #[error("{path}: stored generation settings {stored:?} do not match {expected:?}")]
+    GenerationSettingsMismatch {
+        path: PathBuf,
+        stored: BTreeMap<String, String>,
+        expected: BTreeMap<String, String>,
+    },
     #[error("no stored conversation at {0}")]
     NotFound(PathBuf),
     #[error("{path}: format version {found} is not supported (expected {FORMAT_VERSION})")]
@@ -179,6 +185,13 @@ impl HistoryStore {
                 &store.meta.model.model_hash,
                 &meta.model.model_hash,
             )?;
+            if store.meta.model.generation != meta.model.generation {
+                return Err(StoreError::GenerationSettingsMismatch {
+                    path,
+                    stored: store.meta.model.generation.clone(),
+                    expected: meta.model.generation,
+                });
+            }
             return Ok(store);
         }
         fs::create_dir_all(&dir).map_err(io_at(&dir))?;

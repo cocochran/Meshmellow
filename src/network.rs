@@ -99,10 +99,21 @@ pub async fn accept_peer(
     local: &Hello,
     peers: &SharedPeerTable,
 ) -> anyhow::Result<(Connection, Hello)> {
-    let connection = incoming.await.context("incoming connection failed")?;
-    let hello =
-        finish_handshake(&connection, acceptor_handshake(&connection, local, peers)).await?;
+    let (connection, hello, _) = accept_peer_with_token(incoming, local, peers).await?;
     Ok((connection, hello))
+}
+
+/// Keeps the connection token returned by the handshake so its cleanup cannot
+/// accidentally target a newer connection from the same peer.
+async fn accept_peer_with_token(
+    incoming: Incoming,
+    local: &Hello,
+    peers: &SharedPeerTable,
+) -> anyhow::Result<(Connection, Hello, u64)> {
+    let connection = incoming.await.context("incoming connection failed")?;
+    let (hello, token) =
+        finish_handshake(&connection, acceptor_handshake(&connection, local, peers)).await?;
+    Ok((connection, hello, token))
 }
 
 /// Accepts control connections on `endpoint` until it is closed, keeping each one open until the peer leaves.
@@ -132,40 +143,31 @@ pub async fn serve_control(
 /// When the connection closes the peer is removed from `peers`, unless it has already
 /// reconnected on a newer connection.
 async fn run_control_session(incoming: Incoming, local: &Hello, peers: &SharedPeerTable) {
-    match accept_peer(incoming, local, peers).await {
-        Ok((connection, hello)) => {
+    match accept_peer_with_token(incoming, local, peers).await {
+        Ok((connection, hello, token)) => {
             let remote = connection.remote_id();
-            let connected_at = connected_at(peers, &remote);
             let reason = receive_control_streams(&connection, remote, peers).await;
             info!(peer = %hello.node_id, %reason, "peer disconnected");
-            if let Some(connected_at) = connected_at {
-                forget_peer(peers, &remote, connected_at);
-            }
+            forget_peer(peers, &remote, token);
         }
         Err(error) => warn!("rejected incoming connection: {error:#}"),
     }
 }
 
-/// Removes `node_id` from `peers` once its connection that started at `connected_at_unix_ms`
+/// Removes `node_id` from `peers` once its connection with `connection_token`
 /// has closed; a newer connection from the same peer is kept.
 ///
 /// [`serve_control`] does this for incoming connections. Code that keeps a connection from
 /// [`dial_peer`] open should call it when that connection closes.
-pub fn forget_peer(peers: &SharedPeerTable, node_id: &NodeId, connected_at_unix_ms: u64) {
+pub fn forget_peer(peers: &SharedPeerTable, node_id: &NodeId, connection_token: u64) {
     match peers.lock() {
         Ok(mut table) => {
-            if table.remove_connection(node_id, connected_at_unix_ms) {
+            if table.remove_connection(node_id, connection_token) {
                 info!(peer = %node_id, "peer removed from table");
             }
         }
         Err(_) => warn!(peer = %node_id, "peer table lock poisoned; peer not removed"),
     }
-}
-
-/// The recorded connection time for `node_id`, if it is in the table.
-fn connected_at(peers: &SharedPeerTable, node_id: &NodeId) -> Option<u64> {
-    let table = peers.lock().ok()?;
-    table.get(node_id).map(|info| info.connected_at_unix_ms)
 }
 
 /// Reads every unidirectional stream `peer` opens on `connection` until it closes; returns why it closed.
@@ -235,10 +237,10 @@ fn message_kind(message: &Message) -> &'static str {
 
 /// Runs one side of the hello exchange under [`HELLO_TIMEOUT`], closing the connection with
 /// [`HELLO_REJECTED_CODE`] on failure so the peer learns why it was dropped.
-async fn finish_handshake(
+async fn finish_handshake<T>(
     connection: &Connection,
-    handshake: impl Future<Output = anyhow::Result<Hello>>,
-) -> anyhow::Result<Hello> {
+    handshake: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
     let remote = connection.remote_id();
     let outcome = match tokio::time::timeout(HELLO_TIMEOUT, handshake).await {
         Ok(outcome) => outcome,
@@ -271,17 +273,40 @@ async fn acceptor_handshake(
     connection: &Connection,
     local: &Hello,
     peers: &SharedPeerTable,
-) -> anyhow::Result<Hello> {
+) -> anyhow::Result<(Hello, u64)> {
     let (mut send, mut recv) = connection
         .accept_bi()
         .await
         .context("peer never opened the hello stream")?;
     let hello = read_hello(&mut recv).await?;
     validate_hello(&hello, connection.remote_id(), local)?;
-    record_peer(peers, connection.remote_id(), &hello)?;
+    let token = record_peer(peers, connection.remote_id(), &hello)?;
+    let mut pending = PendingPeerRegistration {
+        peers,
+        remote: connection.remote_id(),
+        token,
+        active: true,
+    };
     protocol::write_frame(&mut send, &Message::Hello(local.clone())).await?;
     finish_stream(&mut send)?;
-    Ok(hello)
+    pending.active = false;
+    Ok((hello, token))
+}
+
+/// Cleans up a peer recorded during a handshake if that handshake fails or times out.
+struct PendingPeerRegistration<'a> {
+    peers: &'a SharedPeerTable,
+    remote: NodeId,
+    token: u64,
+    active: bool,
+}
+
+impl Drop for PendingPeerRegistration<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            forget_peer(self.peers, &self.remote, self.token);
+        }
+    }
 }
 
 async fn read_hello(recv: &mut RecvStream) -> anyhow::Result<Hello> {
@@ -316,18 +341,19 @@ fn validate_hello(hello: &Hello, remote: EndpointId, local: &Hello) -> anyhow::R
 }
 
 /// Records the validated peer under its authenticated node ID.
-fn record_peer(peers: &SharedPeerTable, remote: NodeId, hello: &Hello) -> anyhow::Result<()> {
+fn record_peer(peers: &SharedPeerTable, remote: NodeId, hello: &Hello) -> anyhow::Result<u64> {
     let mut table = peers
         .lock()
         .map_err(|_| anyhow!("peer table lock poisoned"))?;
     let info = table.record_connection(remote, hello);
+    let token = info.connection_token;
     info!(
         peer = %info.node_id,
         protocol_version = info.protocol_version,
         connected_at_unix_ms = info.connected_at_unix_ms,
         "peer connected"
     );
-    Ok(())
+    Ok(token)
 }
 
 fn finish_stream(send: &mut SendStream) -> anyhow::Result<()> {

@@ -196,6 +196,16 @@ fn opening_with_another_model_or_cluster_is_refused() {
             ..
         })
     ));
+
+    let mut other_settings = meta();
+    other_settings
+        .model
+        .generation
+        .insert("ctx_size".to_owned(), "4096".to_owned());
+    assert!(matches!(
+        HistoryStore::open(&dir.0, other_settings),
+        Err(StoreError::GenerationSettingsMismatch { .. })
+    ));
 }
 
 #[test]
