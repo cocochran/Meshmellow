@@ -52,6 +52,25 @@ unsuccessfully with no success output. The command validates supplied observatio
 only; it does not gather telemetry, enforce caps, authenticate evidence or stop a
 running process. The launcher must stop/replan on failure.
 
+Launcher integration should call `planning::build_plan` before launch and
+`planning::verify_output` with current profiles and fresh evidence afterward.
+The latter also checks full model coverage, model/runtime/context identity,
+the required final peer, recomputed memory estimates and exact launch argv
+against supplied device mappings. It rejects stale or edited saved plans.
+
+New plan output also includes `runtime_devices`, the selected device mappings in
+assignment order. For each entry with a non-null `rpc_endpoint`, the leader can
+associate `peer_id` with that loopback listener and start its bridge. Entries
+with null endpoints represent local devices. These are caller-supplied mappings;
+the leader must parse/authenticate node IDs and apply enrollment policy itself.
+Never infer remote status from assignment position or parse `server_args` to
+recover endpoint bindings. Legacy JSON loads with an empty device list; a launcher
+requiring structured mappings should reject it and ask for a regenerated plan.
+Verification compares nonempty saved bindings against the current profile.
+Runtime identity must include applied patches/library hashes when the base
+commit alone does not identify the executed runtime. Actual layer/output
+ownership still requires runtime allocation evidence.
+
 ## Inputs and integration
 
 1. Supply `ModelProfile`: exact model hash, pinned runtime ID, context tokens,

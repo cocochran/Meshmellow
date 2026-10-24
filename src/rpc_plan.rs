@@ -1,10 +1,10 @@
 //! Advisory llama.cpp configuration; never starts processes or enforces caps.
 use crate::placement::{Placement, PlanError};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeDevice {
     pub peer_id: String,
