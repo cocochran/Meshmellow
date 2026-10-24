@@ -37,6 +37,8 @@ Tickets: M-<n>, M-<m>
 <attribution trailer your client requires, e.g. a Co-Authored-By line, if any>
 
 ---PR---
+Tickets: M-<n>, M-<m>
+
 ## Summary
 <overview paragraph>
 
@@ -53,6 +55,7 @@ Tickets: M-<n>, M-<m>
 ```
 
 - The part above `---PR---` is the commit message: PR title = its first line, and it's the text to paste as the squash-merge message. The part below is the PR description.
+- The PR description must start with a `Tickets:` line listing every ticket this PR completes, and nothing else: no follow-ups or related tickets (those go under "Known limitations / follow-ups"). The merged-PR automation reads only the title, the branch name and `Tickets:`/`Closes`/`Fixes`/`Resolves` lines, and moves those tickets from `in-review` to `done` when the PR merges. Also end the PR title with the tickets in parentheses, e.g. `feat(leader): ... (M-7, M-8)`.
 - `type` is one of `feat`, `fix`, `refactor`, `test`, `docs`, `chore`. `scope` is the main area (`p2p`, `worker`, `history`).
 - Only claim checks that were actually run and passed on the tip of `RUN`. Write failures as failures.
 - Never put `.agent-work/` content other than this message, secrets, or local paths into the PR.

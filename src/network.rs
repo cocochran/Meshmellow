@@ -4,6 +4,9 @@
 //! opens the stream and sends its [`Hello`], the acceptor validates it, records the peer, and
 //! replies with its own. Both sides reject peers whose hello does not match the authenticated
 //! Iroh identity, protocol version, or cluster.
+//!
+//! After the hello, the dialer may open unidirectional streams of framed messages. The acceptor
+//! records every [`Heartbeat`] on them in its [`PeerTable`] and logs and ignores anything else.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -11,13 +14,13 @@ use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail, ensure};
 use iroh::endpoint::presets::{self, Preset};
-use iroh::endpoint::{Connection, Incoming, RecvStream, SendStream};
+use iroh::endpoint::{Connection, ConnectionError, Incoming, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use tokio::task::JoinSet;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::node::PeerTable;
-use crate::protocol::{self, CONTROL_ALPN, Hello, Message, PROTOCOL_VERSION};
+use crate::protocol::{self, CONTROL_ALPN, Heartbeat, Hello, Message, PROTOCOL_VERSION};
 
 /// Peer table shared between the accept loop and the code that dials out.
 pub type SharedPeerTable = Arc<Mutex<PeerTable>>;
@@ -103,6 +106,8 @@ pub async fn accept_peer(
 }
 
 /// Accepts control connections on `endpoint` until it is closed, keeping each one open until the peer leaves.
+///
+/// While a connection is open, heartbeats the peer sends on unidirectional streams are recorded in `peers`.
 pub async fn serve_control(
     endpoint: Endpoint,
     local: Hello,
@@ -125,10 +130,75 @@ pub async fn serve_control(
 async fn run_control_session(incoming: Incoming, local: &Hello, peers: &SharedPeerTable) {
     match accept_peer(incoming, local, peers).await {
         Ok((connection, hello)) => {
-            let reason = connection.closed().await;
+            let reason = receive_control_streams(&connection, &hello.node_id, peers).await;
             info!(peer = %hello.node_id, %reason, "peer disconnected");
         }
         Err(error) => warn!("rejected incoming connection: {error:#}"),
+    }
+}
+
+/// Reads every unidirectional stream `peer` opens on `connection` until it closes; returns why it closed.
+async fn receive_control_streams(
+    connection: &Connection,
+    peer: &str,
+    peers: &SharedPeerTable,
+) -> ConnectionError {
+    let mut streams = JoinSet::new();
+    loop {
+        tokio::select! {
+            accepted = connection.accept_uni() => match accepted {
+                Ok(recv) => {
+                    streams.spawn(read_control_stream(recv, peer.to_owned(), Arc::clone(peers)));
+                }
+                Err(reason) => return reason,
+            },
+            Some(_) = streams.join_next(), if !streams.is_empty() => {}
+        }
+    }
+}
+
+/// Reads framed messages from one stream until it ends, recording heartbeats and ignoring the rest.
+async fn read_control_stream(mut recv: RecvStream, peer: String, peers: SharedPeerTable) {
+    loop {
+        match protocol::read_frame(&mut recv).await {
+            Ok(Some(Message::Heartbeat(heartbeat))) => record_heartbeat(&peers, &peer, &heartbeat),
+            Ok(Some(other)) => {
+                warn!(%peer, kind = message_kind(&other), "ignoring unexpected control message");
+            }
+            Ok(None) => return,
+            Err(error) => {
+                warn!(%peer, %error, "control stream failed");
+                return;
+            }
+        }
+    }
+}
+
+/// Records a heartbeat from `peer`, dropping it if it names another node or is stale.
+fn record_heartbeat(peers: &SharedPeerTable, peer: &str, heartbeat: &Heartbeat) {
+    if heartbeat.node_id != peer {
+        warn!(%peer, claimed = %heartbeat.node_id, "ignoring heartbeat sent for another node");
+        return;
+    }
+    let Ok(mut table) = peers.lock() else {
+        warn!(%peer, "peer table lock poisoned; dropping heartbeat");
+        return;
+    };
+    if table.record_heartbeat(heartbeat) {
+        debug!(%peer, epoch = heartbeat.epoch, sequence = heartbeat.sequence, "heartbeat");
+    } else {
+        warn!(%peer, sequence = heartbeat.sequence, "ignoring stale heartbeat");
+    }
+}
+
+/// Names a message's variant for logs without dumping its (possibly large) payload.
+fn message_kind(message: &Message) -> &'static str {
+    match message {
+        Message::Hello(_) => "hello",
+        Message::Heartbeat(_) => "heartbeat",
+        Message::Prompt(_) => "prompt",
+        Message::Activations(_) => "activations",
+        Message::History(_) => "history",
     }
 }
 
