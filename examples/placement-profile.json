@@ -75,5 +75,6 @@
       "rpc_endpoint": "127.0.0.1:50053"
     }
   ],
-  "model_path": "/path/to/verified.gguf"
+  "model_path": "/path/to/verified.gguf",
+  "final_peer_id": "leader"
 }

@@ -13,6 +13,9 @@ pub struct PlanningRequest {
     /// One discovered device for every candidate peer; order is immaterial.
     pub devices: Vec<RuntimeDevice>,
     pub model_path: String,
+    /// Require the final block group on this peer (for example, the local device).
+    #[serde(default)]
+    pub final_peer_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -43,7 +46,13 @@ pub fn build_plan(
             "provide one device mapping for every candidate peer".into(),
         ));
     }
-    let placement = placement::plan(&request.model, &request.peers, &request.links, min_peers)?;
+    let placement = placement::plan_with_final_peer(
+        &request.model,
+        &request.peers,
+        &request.links,
+        min_peers,
+        request.final_peer_id.as_deref(),
+    )?;
     let devices = placement
         .assignments
         .iter()

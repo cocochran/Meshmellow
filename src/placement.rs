@@ -88,7 +88,25 @@ pub fn plan(
     links: &[LinkProfile],
     min_peers: usize,
 ) -> Result<Placement, PlanError> {
+    plan_with_final_peer(model, peers, links, min_peers, None)
+}
+
+/// Like `plan`, but optionally require the final block group on a specific peer.
+/// This constrains the advisory placement; runtime output tensor ownership still
+/// requires post-load verification.
+pub fn plan_with_final_peer(
+    model: &ModelProfile,
+    peers: &[PeerProfile],
+    links: &[LinkProfile],
+    min_peers: usize,
+    final_peer_id: Option<&str>,
+) -> Result<Placement, PlanError> {
     let invalid = |s: &str| PlanError::InvalidInput(s.to_owned());
+    if let Some(id) = final_peer_id
+        && !peers.iter().any(|peer| peer.id == id)
+    {
+        return Err(invalid("required final peer must be a known candidate"));
+    }
     let n = model.layers.len();
     if n == 0
         || model.model_hash.is_empty()
@@ -205,7 +223,9 @@ pub fn plan(
     }
     let best = states
         .iter()
-        .filter_map(|s| s[n][min_peers].as_ref())
+        .enumerate()
+        .filter(|(index, _)| final_peer_id.is_none_or(|id| peers[*index].id == id))
+        .filter_map(|(_, s)| s[n][min_peers].as_ref())
         .min_by_key(|c| c.cost)
         .ok_or(PlanError::NoFeasiblePlacement)?;
     Ok(Placement {
