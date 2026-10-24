@@ -8,6 +8,8 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use axum::Router;
+use axum::routing::post;
 use llm_cluster::api::{self, ApiConfig, REQUEST_ID_HEADER};
 use llm_cluster::history::{CompletedTurn, HistorySink};
 use llm_cluster::jobs::{JobQueue, JobStatus};
@@ -354,6 +356,50 @@ async fn upstream_failures_mark_jobs_failed() {
     assert_eq!(jobs[0]["status"], "failed");
     assert!(jobs[0]["error"].as_str().unwrap().contains("upstream"));
     unreachable.stop().await;
+}
+
+async fn upstream_with_success_body(body: &'static str) -> (SocketAddr, JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake upstream");
+    let addr = listener.local_addr().expect("fake upstream address");
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move || async move {
+            (
+                axum::http::StatusCode::OK,
+                [("content-type", "application/json")],
+                body,
+            )
+        }),
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve fake upstream")
+    });
+    (addr, server)
+}
+
+#[tokio::test]
+async fn invalid_success_replies_fail_job_and_are_not_saved_to_history() {
+    for body in ["not json", r#"{"choices":[{"message":{}}]}"#] {
+        let (upstream, server) = upstream_with_success_body(body).await;
+        let api = TestApi::start(upstream).await;
+        let response = api.post_chat(&chat_body("hello")).await;
+
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+        let request_id = request_id_of(&response);
+        let jobs = api.jobs().await;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0]["request_id"], request_id);
+        assert_eq!(jobs[0]["status"], "failed");
+        assert!(jobs[0]["error"].as_str().is_some());
+        assert!(api.sink.turns().is_empty());
+
+        api.stop().await;
+        server.abort();
+    }
 }
 
 #[tokio::test]
