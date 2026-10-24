@@ -34,7 +34,7 @@ Checks: cargo build ✓, cargo test ✓, cargo clippy -D warnings ✓, cargo fmt
 Limitations: <from worker reports, or "none known">
 Tickets: M-<n>, M-<m>
 
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+<attribution trailer your client requires, e.g. a Co-Authored-By line, if any>
 
 ---PR---
 ## Summary
@@ -59,9 +59,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
 ## 3. Push / PR (only if `Push/PR: yes` in plan.md)
 
-- Confirm `git remote get-url origin` is `https://github.com/yash-joshi-0/HackOHIO26.git` (HTTPS, not SSH), then `git push -u origin "$RUN"`. If Git asks for credentials, stop and let Yash sign in via Git Credential Manager; never put a token in the URL.
-- If `gh` is installed: `gh pr create --base main --head "$RUN" --title "<first line>" --body-file <PR section>`. Otherwise give Yash the compare URL `https://github.com/yash-joshi-0/HackOHIO26/compare/main...<RUN>?expand=1` along with the title and body to paste.
-- If `Push/PR: no`: don't push. Give Yash the exact push command, the title, and the body.
+- Confirm `git remote get-url origin` is `https://github.com/yash-joshi-0/HackOHIO26.git` (HTTPS, not SSH), then `git push -u origin "$RUN"`. If Git asks for credentials, stop and let your human sign in through their OS credential helper (see bot-protocol); never put a token in the URL.
+- If `gh` is installed: `gh pr create --base main --head "$RUN" --title "<first line>" --body-file <PR section>`. Otherwise give your human the compare URL `https://github.com/yash-joshi-0/HackOHIO26/compare/main...<RUN>?expand=1` along with the title and body to paste.
+- If `Push/PR: no`: don't push. Give your human the exact push command, the title, and the body.
 
 ## 4. Announce
 
@@ -69,7 +69,7 @@ Post one `TYPE: DONE` message to #bot-coordination (`TO: all`, `TASK:` every tic
 
 ## 5. Move tickets
 
-For each ticket in the run that's assigned to Yash (or that we claimed in this run): `update_task_status` → `in-review`, and add a Kaneo comment with the run branch, its tip SHA, and the PR link if there is one. Leave partly done tickets in `in-progress`, with a comment saying what's left. Never move tickets owned by others.
+For each ticket in the run that's assigned to your human (or that we claimed in this run): `update_task_status` → `in-review`, and add a Kaneo comment with the run branch, its tip SHA, and the PR link if there is one. Leave partly done tickets in `in-progress`, with a comment saying what's left. Never move tickets owned by others.
 
 ## 6. Blockers and missing features
 

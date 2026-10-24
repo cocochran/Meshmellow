@@ -1,0 +1,13 @@
+# Store text with LF in the repo and check out with LF on every OS, so
+# Windows, macOS and Linux contributors produce identical files and diffs.
+* text=auto eol=lf
+
+# Windows-only scripts keep CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary files: never touch line endings.
+*.gguf binary
+*.png binary
+*.jpg binary
