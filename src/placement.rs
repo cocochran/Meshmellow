@@ -47,14 +47,16 @@ pub struct LinkProfile {
     pub transfer_us: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Assignment {
     pub peer_id: String,
     pub layers: Range<usize>,
     pub estimated_bytes: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Placement {
     pub model_hash: String,
     pub runtime_id: String,

@@ -1,9 +1,11 @@
 //! Validate caller-collected evidence from one fresh inference run.
 //! This module neither collects telemetry nor stops the runtime.
 use crate::placement::{PeerProfile, Placement};
+use serde::Deserialize;
 use std::collections::HashSet;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeviceEvidence {
     pub peer_id: String,
     /// Peak total contribution memory, including weights, KV, and scratch.
@@ -12,7 +14,8 @@ pub struct DeviceEvidence {
     pub compute_events: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RunEvidence {
     pub model_hash: String,
     pub runtime_id: String,

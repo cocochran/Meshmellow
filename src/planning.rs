@@ -15,7 +15,8 @@ pub struct PlanningRequest {
     pub model_path: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlanningOutput {
     pub advisory: bool,
     pub placement: Placement,

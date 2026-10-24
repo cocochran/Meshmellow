@@ -28,6 +28,22 @@ Errors exit unsuccessfully without printing a plan. The command neither binds
 network endpoints nor creates a node key, and does not launch inference or
 verify model file contents. Pass argv elements individually when launching.
 
+Save planning stdout as `plan.json`, then validate caller-collected evidence:
+
+```sh
+cargo run -- verify plan.json current-profile.json evidence.json --min-peers 2
+```
+
+`current-profile.json` uses the planning schema with current peer authorization,
+health and budgets. `evidence.json` contains `model_hash`, `runtime_id`,
+`context_tokens`, and a `devices` array. Each device supplies `peer_id`,
+`peak_bytes` (total contribution over load and inference) and `compute_events`
+(fresh inference work). Collect real evidence; do not substitute estimated bytes
+or model-loading events. Success prints `{"verified":true}`; failure exits
+unsuccessfully with no success output. The command validates supplied observations
+only; it does not gather telemetry, enforce caps, authenticate evidence or stop a
+running process. The launcher must stop/replan on failure.
+
 ## Inputs and integration
 
 1. Supply `ModelProfile`: exact model hash, pinned runtime ID, context tokens,

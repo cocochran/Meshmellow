@@ -1,6 +1,55 @@
 use std::process::Command;
 
 #[test]
+fn verifies_collected_evidence_and_rejects_budget_overrun() {
+    let directory = std::env::temp_dir().join(format!("mesh-verify-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let plan_path = directory.join("plan.json");
+    let evidence_path = directory.join("evidence.json");
+    let plan = Command::new(env!("CARGO_BIN_EXE_llm-cluster"))
+        .args(["plan", "examples/placement-profile.json"])
+        .output()
+        .unwrap();
+    assert!(plan.status.success());
+    std::fs::write(&plan_path, plan.stdout).unwrap();
+    let mut evidence = serde_json::json!({
+        "model_hash": "synthetic-model",
+        "runtime_id": "synthetic-runtime",
+        "context_tokens": 8192,
+        "devices": [
+            {"peer_id": "worker", "peak_bytes": 280000000, "compute_events": 10},
+            {"peer_id": "leader", "peak_bytes": 280000000, "compute_events": 10}
+        ]
+    });
+    for valid in [true, false] {
+        if !valid {
+            evidence["devices"][0]["peak_bytes"] = 300000001u64.into();
+        }
+        std::fs::write(&evidence_path, serde_json::to_vec(&evidence).unwrap()).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_llm-cluster"))
+            .arg("verify")
+            .arg(&plan_path)
+            .arg("examples/placement-profile.json")
+            .arg(&evidence_path)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.success(), valid);
+        if valid {
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+                serde_json::json!({"verified": true})
+            );
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("BudgetExceeded"));
+        }
+    }
+    std::fs::remove_file(plan_path).unwrap();
+    std::fs::remove_file(evidence_path).unwrap();
+    std::fs::remove_dir(directory).unwrap();
+}
+
+#[test]
 fn plans_from_json_and_reorders_device_mappings() {
     let output = Command::new(env!("CARGO_BIN_EXE_llm-cluster"))
         .args(["plan", "examples/placement-profile.json"])
