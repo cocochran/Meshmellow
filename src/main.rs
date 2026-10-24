@@ -8,6 +8,8 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use iroh::Endpoint;
+use llm_cluster::evidence::EvidenceConfig;
+use llm_cluster::launch;
 use llm_cluster::leader::{self, LeaderConfig};
 use llm_cluster::network::{self, SharedPeerTable};
 use llm_cluster::node::PeerTable;
@@ -36,6 +38,9 @@ const DEFAULT_WORKER_WAIT_ARG: &str = "60s";
 
 /// `--llama-ready-timeout` default; matches [`leader::DEFAULT_LLAMA_READY_TIMEOUT`].
 const DEFAULT_LLAMA_READY_TIMEOUT_ARG: &str = "300s";
+
+/// `--evidence-wait` default; matches [`llm_cluster::evidence::DEFAULT_EVIDENCE_WAIT`].
+const DEFAULT_EVIDENCE_WAIT_ARG: &str = "120s";
 
 const SECONDS_PER_MINUTE: u64 = 60;
 
@@ -130,12 +135,32 @@ enum Command {
         /// JSON produced by the plan command.
         #[arg(long)]
         plan: PathBuf,
-        /// Planning profile JSON the plan was built from (maps peers to bridge ports).
+        /// Planning profile JSON the plan was built from; the plan is validated against it before
+        /// anything launches.
         #[arg(long)]
         profile: PathBuf,
+        /// Require at least this many contributors, as for the plan command.
+        #[arg(long, default_value_t = launch::DEFAULT_MIN_PEERS)]
+        min_peers: usize,
+        /// RunEvidence JSON an external harness writes after a fresh inference run; when given,
+        /// the leader verifies it against the plan and shuts down if verification fails.
+        #[arg(long)]
+        evidence_file: Option<PathBuf>,
+        /// How long to wait for --evidence-file to appear and parse, e.g. `120s` or `2m`.
+        #[arg(
+            long,
+            default_value = DEFAULT_EVIDENCE_WAIT_ARG,
+            value_parser = parse_duration,
+            requires = "evidence_file"
+        )]
+        evidence_wait: Duration,
         /// The llama-server binary.
         #[arg(long)]
         llama_server: PathBuf,
+        /// Extra argument for llama-server, after the plan's arguments (e.g. `--llama-arg
+        /// --cache-ram --llama-arg 0`); repeatable. The leader's own --host/--port always win.
+        #[arg(long = "llama-arg", allow_hyphen_values = true)]
+        llama_args: Vec<String>,
         /// Internal loopback port for llama-server.
         #[arg(long, default_value_t = leader::DEFAULT_LLAMA_PORT)]
         llama_port: u16,
@@ -221,7 +246,11 @@ async fn main() -> anyhow::Result<()> {
         Command::Leader {
             plan,
             profile,
+            min_peers,
+            evidence_file,
+            evidence_wait,
             llama_server,
+            llama_args,
             llama_port,
             api,
             worker_wait,
@@ -233,7 +262,13 @@ async fn main() -> anyhow::Result<()> {
                 cluster_id: cli.cluster,
                 plan_path: plan,
                 profile_path: profile,
+                min_peers,
+                evidence: evidence_file.map(|path| EvidenceConfig {
+                    path,
+                    wait: evidence_wait,
+                }),
                 llama_server,
+                extra_llama_args: llama_args,
                 llama_port,
                 api_addr: api,
                 worker_wait,
@@ -352,6 +387,7 @@ fn parse_duration(text: &str) -> Result<Duration, String> {
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory;
+    use llm_cluster::evidence;
 
     use super::*;
 
@@ -383,6 +419,10 @@ mod tests {
         assert_eq!(
             parse_duration(DEFAULT_LLAMA_READY_TIMEOUT_ARG),
             Ok(leader::DEFAULT_LLAMA_READY_TIMEOUT)
+        );
+        assert_eq!(
+            parse_duration(DEFAULT_EVIDENCE_WAIT_ARG),
+            Ok(evidence::DEFAULT_EVIDENCE_WAIT)
         );
     }
 
@@ -480,5 +520,80 @@ mod tests {
         };
         assert_eq!(api, leader::DEFAULT_API_ADDR);
         assert_eq!(text, "hello there");
+    }
+
+    /// `leader` with its required flags plus `extra`.
+    fn parse_leader(extra: &[&str]) -> Result<Command, clap::Error> {
+        let required = [
+            "meshthing",
+            "leader",
+            "--plan",
+            "plan.json",
+            "--profile",
+            "profile.json",
+            "--llama-server",
+            "llama-server",
+        ];
+        Cli::try_parse_from(required.iter().chain(extra)).map(|cli| cli.command)
+    }
+
+    #[test]
+    fn leader_verification_defaults_off_with_default_min_peers() {
+        let command = parse_leader(&[]).expect("leader args");
+
+        let Command::Leader {
+            min_peers,
+            evidence_file,
+            evidence_wait,
+            llama_args,
+            ..
+        } = command
+        else {
+            panic!("expected leader, got {command:?}");
+        };
+        assert_eq!(min_peers, launch::DEFAULT_MIN_PEERS);
+        assert_eq!(evidence_file, None);
+        assert_eq!(evidence_wait, evidence::DEFAULT_EVIDENCE_WAIT);
+        assert!(llama_args.is_empty());
+    }
+
+    #[test]
+    fn leader_parses_verification_and_llama_args() {
+        let command = parse_leader(&[
+            "--min-peers",
+            "3",
+            "--evidence-file",
+            "evidence.json",
+            "--evidence-wait",
+            "2m",
+            "--llama-arg",
+            "--cache-ram",
+            "--llama-arg",
+            "0",
+        ])
+        .expect("leader args");
+
+        let Command::Leader {
+            min_peers,
+            evidence_file,
+            evidence_wait,
+            llama_args,
+            ..
+        } = command
+        else {
+            panic!("expected leader, got {command:?}");
+        };
+        assert_eq!(min_peers, 3);
+        assert_eq!(evidence_file, Some(PathBuf::from("evidence.json")));
+        assert_eq!(evidence_wait, Duration::from_secs(120));
+        assert_eq!(llama_args, ["--cache-ram", "0"]);
+    }
+
+    #[test]
+    fn evidence_wait_requires_an_evidence_file() {
+        assert!(
+            parse_leader(&["--evidence-wait", "5s"]).is_err(),
+            "--evidence-wait without --evidence-file must be refused"
+        );
     }
 }
