@@ -1,1 +1,14 @@
-target/
+# Rust build output (OS-specific; never commit)
+/target
+
+# Iroh node identities (secret keys created by `llm-cluster --key`, default meshthing.key)
+*.key
+
+# Agent run state (plan, coordination log, change log, outbox)
+.agent-work/
+
+# Per-person bot identity for the agent skills (copy .claude/bot-identity.example.json)
+.claude/bot-identity.json
+
+# Claude Code agent worktrees
+.claude/worktrees/
