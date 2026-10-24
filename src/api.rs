@@ -4,7 +4,9 @@
 //! address. Every request takes a [`JobPermit`] first, so llama-server only ever sees one
 //! generation at a time and the rest wait in FIFO order. Streamed replies (`"stream": true`)
 //! are relayed chunk by chunk as they arrive; the assistant text is assembled on the side for
-//! the [`HistorySink`]. `GET /jobs` lists job states.
+//! the [`HistorySink`]. A streamed reply completes only after a valid `[DONE]` terminator;
+//! truncated, malformed or error-bearing SSE fails the job without committing history.
+//! `GET /jobs` lists job states.
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -345,7 +347,7 @@ struct StreamRelay {
 }
 
 impl StreamRelay {
-    async fn next_chunk(mut self) -> Option<(reqwest::Result<Bytes>, Self)> {
+    async fn next_chunk(mut self) -> Option<(std::io::Result<Bytes>, Self)> {
         let finish = self.finish.take()?;
         match self.chunks.next().await {
             Some(Ok(chunk)) => {
@@ -357,12 +359,25 @@ impl StreamRelay {
                 let reason = format!("upstream stream failed: {err}");
                 warn!(request_id = finish.permit.request_id(), %reason, "job failed");
                 finish.permit.fail(reason);
-                Some((Err(err), self))
+                Some((Err(std::io::Error::other(err)), self))
             }
-            None => {
-                finish.complete(self.assembler.into_text());
-                None
-            }
+            None => match std::mem::take(&mut self.assembler).finish() {
+                Ok(text) => {
+                    finish.complete(text);
+                    None
+                }
+                Err(reason) => {
+                    warn!(request_id = finish.permit.request_id(), %reason, "job failed");
+                    finish.permit.fail(reason.to_owned());
+                    Some((
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            reason,
+                        )),
+                        self,
+                    ))
+                }
+            },
         }
     }
 }
@@ -374,6 +389,8 @@ struct SseTextAssembler {
     /// Bytes after the last complete line.
     partial_line: Vec<u8>,
     text: String,
+    done: bool,
+    invalid: bool,
 }
 
 impl SseTextAssembler {
@@ -387,6 +404,7 @@ impl SseTextAssembler {
 
     fn absorb_line(&mut self, line: &[u8]) {
         let Ok(line) = std::str::from_utf8(line) else {
+            self.invalid = true;
             return;
         };
         let Some(data) = line.trim_end().strip_prefix(SSE_DATA_PREFIX) else {
@@ -394,27 +412,131 @@ impl SseTextAssembler {
         };
         let data = data.trim_start();
         if data == SSE_DONE {
+            self.done = true;
+            return;
+        }
+        if self.done {
+            self.invalid = true;
             return;
         }
         let Ok(chunk) = serde_json::from_str::<Value>(data) else {
+            self.invalid = true;
             return;
         };
+        if chunk.get("error").is_some() {
+            self.invalid = true;
+            return;
+        }
         if let Some(fragment) = chunk.pointer(DELTA_CONTENT_POINTER).and_then(Value::as_str) {
             self.text.push_str(fragment);
         }
     }
 
-    /// The assembled text, including a final line that had no trailing newline.
-    fn into_text(mut self) -> String {
+    /// A complete response must end with [DONE], including without a final newline.
+    fn finish(mut self) -> Result<String, &'static str> {
         let rest = std::mem::take(&mut self.partial_line);
         self.absorb_line(&rest);
-        self.text
+        if self.invalid {
+            return Err("upstream SSE contained invalid or error data");
+        }
+        if !self.done {
+            return Err("upstream SSE ended before [DONE]");
+        }
+        Ok(self.text)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jobs::JobStatus;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingSink(Mutex<Vec<CompletedTurn>>);
+
+    impl HistorySink for RecordingSink {
+        fn record(&self, turn: CompletedTurn) {
+            self.0.lock().unwrap().push(turn);
+        }
+    }
+
+    async fn check_stream(events: &str, succeeds: bool) {
+        let queue = Arc::new(JobQueue::new());
+        let sink = Arc::new(RecordingSink::default());
+        let permit = queue.acquire(None).await;
+        let request_id = permit.request_id().to_owned();
+        let chunks = events
+            .as_bytes()
+            .chunks(3)
+            .map(|chunk| Ok::<_, reqwest::Error>(Bytes::copy_from_slice(chunk)))
+            .collect::<Vec<_>>();
+        let relay = StreamRelay {
+            chunks: Box::pin(stream::iter(chunks)),
+            assembler: SseTextAssembler::default(),
+            finish: Some(JobFinish {
+                permit,
+                turn: PendingTurn {
+                    request_id,
+                    conversation_id: None,
+                    request: json!({}),
+                },
+                sink: sink.clone(),
+            }),
+        };
+        let mut remaining = Some(relay);
+        let mut failed = false;
+        while let Some(relay) = remaining.take() {
+            if let Some((chunk, next)) = relay.next_chunk().await {
+                failed |= chunk.is_err();
+                remaining = Some(next);
+            }
+        }
+        assert_eq!(failed, !succeeds);
+        assert_eq!(
+            queue.jobs()[0].status,
+            if succeeds {
+                JobStatus::Completed
+            } else {
+                JobStatus::Failed
+            }
+        );
+        {
+            let turns = sink.0.lock().unwrap();
+            assert_eq!(turns.len(), usize::from(succeeds));
+            if succeeds {
+                assert_eq!(turns[0].response_text, "Hello");
+            }
+        }
+        let next = tokio::time::timeout(Duration::from_secs(1), queue.acquire(None))
+            .await
+            .expect("stream outcome must release the running slot");
+        next.complete();
+    }
+
+    #[tokio::test]
+    async fn clean_http_eof_without_done_fails_without_committing_history() {
+        check_stream(&delta_event("Hello"), false).await;
+    }
+
+    #[tokio::test]
+    async fn complete_stream_commits_history_once_and_releases_queue() {
+        check_stream(&format!("{}data: [DONE]\n\n", delta_event("Hello")), true).await;
+    }
+
+    #[tokio::test]
+    async fn error_or_malformed_events_do_not_commit_history_even_with_done() {
+        for event in [
+            "data: {\"error\":{\"message\":\"worker lost\"}}\n\n",
+            "data: {broken\n\n",
+        ] {
+            check_stream(
+                &format!("{}{event}data: [DONE]\n\n", delta_event("Hello")),
+                false,
+            )
+            .await;
+        }
+    }
 
     fn delta_event(fragment: &str) -> String {
         let chunk = json!({"choices": [{"index": 0, "delta": {"content": fragment}}]});
@@ -456,15 +578,16 @@ mod tests {
         for piece in events.as_bytes().chunks(7) {
             assembler.push(piece);
         }
-        assert_eq!(assembler.into_text(), "Hello, wörld");
+        assert_eq!(assembler.finish().unwrap(), "Hello, wörld");
     }
 
     #[test]
     fn assembler_handles_crlf_and_a_final_line_without_newline() {
         let mut assembler = SseTextAssembler::default();
         assembler.push(delta_event("a").replace('\n', "\r\n").as_bytes());
-        assembler.push(delta_event("b").trim_end().as_bytes());
-        assert_eq!(assembler.into_text(), "ab");
+        assembler.push(delta_event("b").as_bytes());
+        assembler.push(b"data: [DONE]");
+        assert_eq!(assembler.finish().unwrap(), "ab");
     }
 
     #[test]
