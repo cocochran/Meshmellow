@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use iroh::Endpoint;
+use llm_cluster::evidence::EvidenceConfig;
 use llm_cluster::history_sync::store::{self, HistoryStore, JobStatus};
+use llm_cluster::launch;
 use llm_cluster::leader::{self, LeaderConfig};
 use llm_cluster::network::{self, SharedPeerTable};
 use llm_cluster::node::PeerTable;
