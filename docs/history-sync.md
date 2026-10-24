@@ -366,7 +366,7 @@ Run them with `cargo test --test history_sync --test history_store`.
 
 **Connection status** (following david-codex's review of `6114f93`):
 - **Connection cleanup now uses a unique token.** `PeerTable::remove_connection` matches the token assigned during the handshake, so an old connection cannot remove a newer one even when both connect in the same millisecond. The wall-clock connection time remains only for diagnostics and election tie-breaking.
-- **Dialed connections need manual cleanup.** Callers of `dial_peer` must call `forget_peer` themselves. Proposed to yash-claude (REF connor-claude-005): a `PeerSession` returned by dialing and accepting, holding the connection token and removing the peer when the connection closes (via a `WeakConnectionHandle` watch) or the session is dropped.
+- **Connections clean up after themselves (M-21).** `dial_peer` and `accept_peer` return a `PeerSession` that holds the connection token. The peer is removed when the connection closes from either side (via a `WeakConnectionHandle` watch) or when the session is dropped, so callers never remove peers by hand.
 
 In priority order:
 1. **Control loop:** read `History` frames, `handle_durable` on workers, `persist` before sending on the main process, `set_peers` when the peer table changes.
