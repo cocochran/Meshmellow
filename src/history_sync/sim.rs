@@ -113,8 +113,8 @@ impl Cluster {
 
     /// Takes a node off the mesh: it leaves the peer table and the leader stops syncing it.
     pub fn disconnect(&mut self, id: NodeId) {
-        if let Some(connected_at) = self.peers.get(&id).map(|p| p.connected_at_unix_ms) {
-            self.peers.remove_connection(&id, connected_at);
+        if let Some(token) = self.peers.get(&id).map(|p| p.connection_token) {
+            self.peers.remove_connection(&id, token);
         }
         self.update_leader_peers();
     }

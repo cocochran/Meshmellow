@@ -364,8 +364,8 @@ Run them with `cargo test --test history_sync --test history_store`.
 
 ## 9. Limits and next steps
 
-**Known issues** (from david-codex's review of `6114f93`; the first, epoch saved separately from history, is fixed):
-- **Connection identity is a millisecond timestamp.** `PeerTable::remove_connection` matches on `connected_at_unix_ms`. Two reconnects in the same millisecond, or a clock going backwards, let an old connection's close remove the new entry. `run_control_session` also reads that timestamp after the handshake, so a concurrent reconnect can replace it first. Fix: a unique connection token returned by `record_connection`, separate from the logged time. Being handled with the PR #10 reconcile (M-21).
+**Connection status** (following david-codex's review of `6114f93`):
+- **Connection cleanup now uses a unique token.** `PeerTable::remove_connection` matches the token assigned during the handshake, so an old connection cannot remove a newer one even when both connect in the same millisecond. The wall-clock connection time remains only for diagnostics and election tie-breaking.
 - **Dialed connections need manual cleanup.** Callers of `dial_peer` must call `forget_peer` themselves. Proposed to yash-claude (REF connor-claude-005): a `PeerSession` returned by dialing and accepting, holding the connection token and removing the peer when the connection closes (via a `WeakConnectionHandle` watch) or the session is dropped.
 
 In priority order:

@@ -78,6 +78,32 @@ fn duplicate_appends_are_idempotent() {
 }
 
 #[test]
+fn delayed_snapshot_does_not_undo_a_later_append() {
+    let mut leader = Leader::new(id(0), 1, Default::default(), [id(1)]);
+    let mut replica = Replica::new(id(1));
+    let stale_snapshot = leader.sync().remove(0).1;
+    // Two copies can be in flight before the leader receives the first Ack.
+    let first_ack = replica.handle(stale_snapshot.clone()).unwrap();
+    leader.handle(id(1), first_ack);
+
+    let append = leader.complete_task("job-0", "a", "b").remove(0).1;
+    let latest_ack = replica.handle(append).unwrap();
+    leader.handle(id(1), latest_ack);
+    let delayed_ack = replica.handle(stale_snapshot).unwrap();
+    leader.handle(id(1), delayed_ack.clone());
+
+    assert_eq!(replica.history(), leader.history());
+    assert_eq!(
+        delayed_ack,
+        SyncMessage::Ack {
+            epoch: 1,
+            len: leader.history().len(),
+        }
+    );
+    assert_eq!(leader.up_to_date_peers(), vec![id(1)]);
+}
+
+#[test]
 fn dropped_messages_are_recovered_by_resync() {
     let mut cluster = Cluster::new(4);
     run_tasks(&mut cluster, id(0), 0..2);
@@ -232,7 +258,8 @@ fn leader_peer_list_follows_the_peer_table() {
     let mut replica = Replica::new(a);
     leader.handle(a, replica.handle(snapshot).unwrap());
 
-    table.remove_connection(&b, 3);
+    let token = table.get(&b).unwrap().connection_token;
+    table.remove_connection(&b, token);
     table.record_connection_at(c, &hello(c), 4);
     node.set_peers(&table);
     let leader = node.as_leader_mut().unwrap();
