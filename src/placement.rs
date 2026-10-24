@@ -1,9 +1,11 @@
 //! Plan contiguous layers across an explicitly ordered set of trusted devices.
 //! All costs must come from measurements for the same model/runtime/context.
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::ops::Range;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelProfile {
     pub model_hash: String,
     pub runtime_id: String,
@@ -11,13 +13,15 @@ pub struct ModelProfile {
     pub layers: Vec<LayerMemory>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LayerMemory {
     pub weight_bytes: u64,
     pub kv_bytes_per_token: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PeerProfile {
     pub id: String,
     pub model_hash: String,
@@ -33,7 +37,8 @@ pub struct PeerProfile {
     pub decode_us_per_layer: Vec<u64>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LinkProfile {
     pub from: String,
     pub to: String,
@@ -42,14 +47,16 @@ pub struct LinkProfile {
     pub transfer_us: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Assignment {
     pub peer_id: String,
     pub layers: Range<usize>,
     pub estimated_bytes: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Placement {
     pub model_hash: String,
     pub runtime_id: String,
