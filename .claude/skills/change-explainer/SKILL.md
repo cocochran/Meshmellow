@@ -34,7 +34,7 @@ Write exactly one line with a single append so parallel agents don't interleave:
 
 ```bash
 mkdir -p "$MAIN/.agent-work"
-printf '%s\n' "- **M-4** · \`p2p-endpoint\` · \`yash-claude/run-20261024-1530\` @ \`abc1234\` — <your 1-2 sentences>" >> "$MAIN/.agent-work/changes.md"
+printf '%s\n' "- **M-4** · \`p2p-endpoint\` · \`<bot-id>/run-20261024-1530\` @ \`abc1234\` — <your 1-2 sentences>" >> "$MAIN/.agent-work/changes.md"
 ```
 
 If the file is new, first append the header `# Change log for this run` (check with `test -s`). Never rewrite or reorder existing lines. Make sure `.agent-work/` is listed in `$MAIN/.gitignore` — if not, report that instead of adding the file to git.

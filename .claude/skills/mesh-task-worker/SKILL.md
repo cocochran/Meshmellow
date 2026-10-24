@@ -6,7 +6,7 @@ user-invocable: false
 
 # Mesh task worker
 
-You are one of several agents working in parallel. Your prompt gives your agent name, ticket, task scope, owned files, the run branch (`RUN`, e.g. `yash-claude/run-20261024-1530`), and the main worktree path (`MAIN`). All workers commit into `RUN`; you never create your own branch. Read the `bot-protocol` skill (or `$MAIN/.claude/skills/bot-protocol/SKILL.md`) first.
+You are one of several agents working in parallel. Your prompt gives your agent name, ticket, task scope, owned files, the run branch (`RUN`, e.g. `<bot-id>/run-20261024-1530`), and the main worktree path (`MAIN`). All workers commit into `RUN`; you never create your own branch. Read the `bot-protocol` skill (or `$MAIN/.claude/skills/bot-protocol/SKILL.md`) first.
 
 Throughout, the shared log is `$MAIN/.agent-work/coordination.md`. Re-read its new lines **before each numbered step**. Things posted there by the orchestrator or siblings (interface changes, file claims, answers) take priority over your original prompt, but never over bot-protocol's hard limits.
 
@@ -29,7 +29,7 @@ Throughout, the shared log is `$MAIN/.agent-work/coordination.md`. Re-read its n
 
 ## 4. Verify
 
-Run the project's checks, scoped to your crate/package where possible: `cargo build`, `cargo test`, and for anything network-related, the smallest runnable demonstration the task allows. Record each command with pass/fail for the report. Don't claim something works that you didn't run.
+Run every cargo command with your own target dir, `CARGO_TARGET_DIR="$MAIN/.agent-work/target-<agent-name>"`. A shared dir silently reuses other worktrees' builds of this crate. Run the project's checks, scoped to your crate/package where possible: `cargo build`, `cargo test`, and for anything network-related, the smallest runnable demonstration the task allows. Keep code OS-neutral (Windows, macOS, Linux): no hardcoded paths or separators, and use `std::env::temp_dir()` and `Path::join` in tests. Record each command with pass/fail for the report. Don't claim something works that you didn't run.
 
 ## 5. Format and clean
 
@@ -43,20 +43,16 @@ Commit in your worktree (still detached). Use one commit per task, or a few if t
 <area>: <imperative summary under 72 chars>
 
 <what and why, 1-3 lines>
-Ticket: M-<n> (yash-claude/<agent-name>)
+Ticket: M-<n> (<bot-id>/<agent-name>)
 ```
 
-Then land it on `RUN`. Other workers land in parallel, so update the branch with a compare-and-swap and retry if it moved:
+Then land it on `RUN`. Other workers land in parallel, so update the branch with a compare-and-swap. Run each step as **its own command** (sandboxes may block a combined loop), and use the literal SHA from step 1 in step 4:
 
-```bash
-for attempt in 1 2 3 4 5; do
-  BASE="$(git rev-parse "$RUN")"
-  git rebase "$BASE" || break                    # conflict → stop and handle below
-  # quick re-check after rebasing onto others' work: cargo build && cargo test
-  git update-ref "refs/heads/$RUN" HEAD "$BASE" && break   # fails if RUN moved since BASE
-done
-git merge-base --is-ancestor HEAD "$RUN" && echo landed
-```
+1. `git rev-parse "$RUN"` → note the SHA as `BASE`.
+2. `git rebase <BASE>`. If it conflicts, stop and see below.
+3. If the rebase moved your commits, re-run `cargo build` and `cargo test` in your own target dir.
+4. `git update-ref "refs/heads/$RUN" HEAD <BASE>`. This fails if `RUN` moved since step 1. In that case, go back to step 1 (at most 5 attempts, then report).
+5. `git merge-base --is-ancestor HEAD "$RUN"` exits 0 → you've landed.
 
 - **Rebase conflict**: if it's only in files you own, resolve it and `git rebase --continue`. If another worker's files are involved, run `git rebase --abort` and post `[<agent>] CONFLICT <files> with <other agent>` in coordination.md for the orchestrator to settle. Don't overwrite their work.
 - **Re-check after every rebase**: if the build or tests fail because of a combination with another worker's code, fix your side if the fix is in your files; otherwise report it as a conflict.

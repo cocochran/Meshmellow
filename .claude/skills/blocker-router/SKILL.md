@@ -29,15 +29,15 @@ Read `$MAIN/.agent-work/outbox.md` and the last ~30 messages in #bot-coordinatio
 
 | Situation | Where it goes |
 |---|---|
-| Ticket assigned to **Yash** (ours) | Not external. Append to `coordination.md` for the orchestrator to pick up as a new or follow-up task, and stop. |
+| Ticket assigned to **your human** (ours) | Not external. Append to `coordination.md` for the orchestrator to pick up as a new or follow-up task, and stop. |
 | Ticket assigned to **someone else**, and their bot is in #bot-directory (match the directory's `HUMAN:` field to the Kaneo assignee) | `TYPE: BLOCKER` (or `REQUEST` for a missing feature) to **that bot's inbox**, `TO: <their bot-id>`, `TASK: M-<n>` of **their** ticket. |
 | Ticket assigned to someone else, but **no bot** registered for that person | #bot-coordination, `TO: all`, naming the human and their ticket so they or any bot can pick it up. |
-| **No matching ticket**, or the ticket is **unassigned** | #bot-coordination, `TO: all`. Propose the missing work as a new or unassigned task; don't create Kaneo tickets yourself unless Yash asked for that. |
+| **No matching ticket**, or the ticket is **unassigned** | #bot-coordination, `TO: all`. Propose the missing work as a new or unassigned task; don't create Kaneo tickets yourself unless your human asked for that. |
 
-Message body, inside the protocol header (`REF: yash-claude-<agent>-<nn>`, `REPLY-TO: #bot-inbox-yash-claude`):
+Message body, inside the protocol header (`REF: <bot-id>-<agent>-<nn>`, `REPLY-TO: #bot-inbox-<bot-id>`):
 
 ```text
-Blocked: M-<ours> <title> (yash-claude/<agent>)
+Blocked: M-<ours> <title> (<bot-id>/<agent>)
 Need: <concrete deliverable>
 Why: <one line>
 Meanwhile: <what we're doing instead, or "paused">
