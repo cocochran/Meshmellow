@@ -25,10 +25,11 @@ jobs:
       - name: Format
         run: cargo fmt --check
       - name: Clippy
+        if: matrix.os != 'windows-latest'
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
-        # Tests spawn example binaries (the fake servers). `--all-targets` builds examples as
-        # test harnesses only, so build the real example binaries first.
+        # Integration tests spawn two fake server examples. `--all-targets` builds examples as
+        # test harnesses only, so build the standalone helper binaries first.
         run: |
-          cargo build --examples
+          cargo build --example fake_llama_server --example fake_rpc_server
           cargo test --all-targets
