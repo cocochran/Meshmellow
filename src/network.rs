@@ -168,6 +168,7 @@ pub fn forget_peer(peers: &SharedPeerTable, node_id: &NodeId, connected_at_unix_
 fn connected_at(peers: &SharedPeerTable, node_id: &NodeId) -> Option<u64> {
     let table = peers.lock().ok()?;
     table.get(node_id).map(|info| info.connected_at_unix_ms)
+}
 /// Reads every unidirectional stream `peer` opens on `connection` until it closes; returns why it closed.
 async fn receive_control_streams(
     connection: &Connection,
