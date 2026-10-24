@@ -19,13 +19,13 @@
 #include <mach/task_info.h>
 #endif
 
-static void read_exact(void * dst, size_t size) {
-    if (fread(dst, 1, size, stdin) != size) throw std::runtime_error("truncated request");
+static void read_exact(FILE * input, void * dst, size_t size) {
+    if (fread(dst, 1, size, input) != size) throw std::runtime_error("truncated request");
 }
 
-static uint32_t read_be32() {
+static uint32_t read_be32(FILE * input) {
     unsigned char data[4];
-    read_exact(data, 4);
+    read_exact(input, data, 4);
     return (uint32_t(data[0]) << 24) | (uint32_t(data[1]) << 16) |
            (uint32_t(data[2]) << 8) | uint32_t(data[3]);
 }
@@ -61,7 +61,7 @@ static std::string vm_metrics() {
 #endif
 }
 
-int main(int argc, char ** argv) {
+int mesh_shard_run_stream(int argc, char ** argv, FILE * input, FILE * output) {
     llama_model * model = nullptr;
     llama_context * ctx = nullptr;
     try {
@@ -95,7 +95,6 @@ int main(int argc, char ** argv) {
         const auto * vocab = llama_model_get_vocab(model);
         const int n_vocab = llama_vocab_n_tokens(vocab);
         const bool prefix = end < layers;
-        if (begin != 0 && prefix) throw std::runtime_error("prototype supports prefix/suffix only");
         if (embd <= 0 || embd > 32768) throw std::runtime_error("unsupported hidden size");
         char source_hash[65] = {};
         const int source_len = llama_model_meta_val_str(model, "meshthing.source_sha256", source_hash, sizeof(source_hash));
@@ -116,17 +115,17 @@ int main(int argc, char ** argv) {
         const int nt = llama_tokenize(vocab, argv[7], strlen(argv[7]), prompt.data(), prompt.size(), true, true);
         if (nt <= 0) throw std::runtime_error("tokenize failed");
         prompt.resize(nt);
-        printf("{\"protocol\":1,\"begin\":%d,\"end\":%d,\"layers\":%d,\"embd\":%d,\"vocab\":%d,\"allocated_bytes\":%llu,\"max_rss_bytes\":%llu,\"vm\":%s,\"source_sha256\":\"%s\",\"tokens\":[",
+        fprintf(output, "{\"protocol\":1,\"begin\":%d,\"end\":%d,\"layers\":%d,\"embd\":%d,\"vocab\":%d,\"allocated_bytes\":%llu,\"max_rss_bytes\":%llu,\"vm\":%s,\"source_sha256\":\"%s\",\"tokens\":[",
                begin, end, layers, embd, n_vocab, (unsigned long long)peak_allocated, (unsigned long long)max_rss_bytes(), vm_metrics().c_str(), source_len >= 0 ? source_hash : "");
-        for (int i = 0; i < nt; ++i) printf("%s%d", i ? "," : "", prompt[i]);
-        printf("]}\n"); fflush(stdout);
+        for (int i = 0; i < nt; ++i) fprintf(output, "%s%d", i ? "," : "", prompt[i]);
+        fprintf(output, "]}\n"); fflush(output);
         uint32_t expected_step = 0, expected_pos = 0;
         for (;;) {
-            int c = fgetc(stdin);
+            int c = fgetc(input);
             if (c == EOF) break;
-            ungetc(c, stdin);
-            const uint32_t magic = read_be32(), op = read_be32(), step = read_be32();
-            const uint32_t pos = read_be32(), n = read_be32();
+            ungetc(c, input);
+            const uint32_t magic = read_be32(input), op = read_be32(input), step = read_be32(input);
+            const uint32_t pos = read_be32(input), n = read_be32(input);
             if (magic != 0x4d534831 || step != expected_step || pos != expected_pos ||
                     n == 0 || n > 128 || pos + n > uint32_t(context) || op != (begin == 0 ? 1u : 2u)) {
                 throw std::runtime_error("invalid/out-of-order execution request; session closed");
@@ -135,21 +134,32 @@ int main(int argc, char ** argv) {
             std::vector<float> hidden;
             auto batch = llama_batch_init(n, begin == 0 ? 0 : embd, 1);
             batch.n_tokens = n;
+            const auto rope = llama_model_rope_type(model);
+            const bool mrope = begin > 0 && (rope == LLAMA_ROPE_TYPE_MROPE || rope == LLAMA_ROPE_TYPE_IMROPE);
+            if (mrope) {
+                auto * positions = static_cast<llama_pos *>(realloc(batch.pos, 4 * n * sizeof(llama_pos)));
+                if (!positions) { llama_batch_free(batch); throw std::runtime_error("position allocation failed"); }
+                batch.pos = positions;
+            }
             if (begin == 0) {
                 tokens.resize(n);
                 for (uint32_t i = 0; i < n; ++i) {
-                    tokens[i] = read_be32();
+                    tokens[i] = read_be32(input);
                     if (tokens[i] < 0 || tokens[i] >= n_vocab) throw std::runtime_error("invalid token");
                     batch.token[i] = tokens[i];
                 }
             } else {
                 hidden.resize(size_t(n)*embd);
-                read_exact(hidden.data(), hidden.size()*sizeof(float));
+                read_exact(input, hidden.data(), hidden.size()*sizeof(float));
                 for (float value : hidden) if (!std::isfinite(value)) throw std::runtime_error("nonfinite activation");
                 memcpy(batch.embd, hidden.data(), hidden.size()*sizeof(float));
             }
             for (uint32_t i = 0; i < n; ++i) {
                 batch.pos[i] = pos + i;
+                if (mrope) {
+                    batch.pos[n + i] = batch.pos[2*n + i] = pos + i;
+                    batch.pos[3*n + i] = 0;
+                }
                 batch.n_seq_id[i] = 1;
                 batch.seq_id[i][0] = 0;
                 batch.logits[i] = prefix || i == n - 1;
@@ -178,11 +188,11 @@ int main(int argc, char ** argv) {
                 const char * hex = "0123456789abcdef";
                 for (int i = 0; i < len; ++i) { unsigned char b = bytes[i]; piece += hex[b >> 4]; piece += hex[b & 15]; }
             }
-            printf("{\"step\":%u,\"n_floats\":%zu,\"token\":%d,\"eog\":%s,\"piece_hex\":\"%s\",\"compute_ms\":%.6f,\"observed_peak_buffer_bytes\":%llu,\"max_rss_bytes\":%llu,\"vm\":%s}\n",
+            fprintf(output, "{\"step\":%u,\"n_floats\":%zu,\"token\":%d,\"eog\":%s,\"piece_hex\":\"%s\",\"compute_ms\":%.6f,\"observed_peak_buffer_bytes\":%llu,\"max_rss_bytes\":%llu,\"vm\":%s}\n",
                    step, values, token, eog ? "true" : "false", piece.c_str(), compute_ms,
                    (unsigned long long)peak_allocated, (unsigned long long)max_rss_bytes(), vm_metrics().c_str());
-            if (values && fwrite(result, sizeof(float), values, stdout) != values) throw std::runtime_error("response write failed");
-            if (fflush(stdout) != 0) throw std::runtime_error("response flush failed");
+            if (values && fwrite(result, sizeof(float), values, output) != values) throw std::runtime_error("response write failed");
+            if (fflush(output) != 0) throw std::runtime_error("response flush failed");
             expected_step++; expected_pos += n;
         }
         llama_free(ctx); llama_model_free(model); llama_backend_free();
@@ -193,4 +203,8 @@ int main(int argc, char ** argv) {
         if (model) llama_model_free(model);
         return 1;
     }
+}
+
+int main(int argc, char ** argv) {
+    return mesh_shard_run_stream(argc, argv, stdin, stdout);
 }

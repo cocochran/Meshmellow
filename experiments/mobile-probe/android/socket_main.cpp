@@ -6,7 +6,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-int mesh_shard_main(int argc, char ** argv);
+int mesh_shard_run_stream(int argc, char ** argv, FILE * input, FILE * output);
 
 // One session, loopback only. The Iroh bridge owns peer authorization.
 int main(int argc, char ** argv) {
@@ -32,6 +32,10 @@ int main(int argc, char ** argv) {
     const int connection = accept(listener, nullptr, nullptr);
     close(listener);
     if (connection < 0) return 1;
+#ifdef SO_NOSIGPIPE
+    int no_sigpipe = 1;
+    setsockopt(connection, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe));
+#endif
     timeval timeout{30, 0};
     setsockopt(connection, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     char preface[5];
@@ -46,9 +50,17 @@ int main(int argc, char ** argv) {
     timeout.tv_sec = 120;
     setsockopt(connection, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     setsockopt(connection, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-    if (dup2(connection, STDIN_FILENO) < 0 || dup2(connection, STDOUT_FILENO) < 0) {
-        close(connection); return 1;
+    const int input_fd = dup(connection);
+    if (input_fd < 0) { close(connection); return 1; }
+    FILE * input = fdopen(input_fd, "rb");
+    FILE * output = fdopen(connection, "wb");
+    if (!input || !output) {
+        if (input) fclose(input); else close(input_fd);
+        if (output) fclose(output); else close(connection);
+        return 1;
     }
-    close(connection);
-    return mesh_shard_main(argc - 1, argv + 1);
+    const int result = mesh_shard_run_stream(argc - 1, argv + 1, input, output);
+    fclose(input);
+    fclose(output);
+    return result;
 }

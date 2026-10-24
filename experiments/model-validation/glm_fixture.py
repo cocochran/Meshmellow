@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a two-layer numerical fixture from downloaded GLM tensor bytes."""
+"""Build a truncated numerical fixture from downloaded GLM tensor bytes."""
 
 import argparse
 import hashlib
@@ -14,7 +14,10 @@ def main() -> None:
     parser.add_argument("--gguf-python", type=Path, required=True)
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--layers", type=int, default=2)
     args = parser.parse_args()
+    if args.layers < 1:
+        parser.error("--layers must be positive")
     if args.output.exists():
         raise FileExistsError(args.output)
     sys.path.insert(0, str(args.gguf_python))
@@ -27,23 +30,27 @@ def main() -> None:
             for field in fields:
                 name = bytes(field.parts[1]).decode()
                 block = re.match(r"blk\.(\d+)\.", name)
-                if (block and int(block[1]) < 2) or not block:
+                if (block and int(block[1]) < args.layers) or not block:
                     selected.append(field)
             return end, selected
 
     reader = FixtureReader(args.source)
     architecture = reader.fields["general.architecture"].contents()
-    if architecture != "deepseek2":
-        raise ValueError("expected GLM's deepseek2 architecture")
+    if architecture not in {"deepseek2", "qwen35"}:
+        raise ValueError("expected deepseek2 or qwen35 architecture")
+    if args.layers > reader.fields[f"{architecture}.block_count"].contents():
+        raise ValueError("fixture exceeds source layer count")
     writer = gguf.GGUFWriter(args.output, architecture, endianess=reader.endianess)
     for field in reader.fields.values():
         if field.name == "general.architecture" or field.name.startswith("GGUF."):
             continue
         value = field.contents()
         if field.name == f"{architecture}.block_count":
-            value = 2
+            value = args.layers
         if "nextn_predict_layers" in field.name:
             value = 0
+        if field.name == f"{architecture}.attention.recurrent_layers":
+            value = value[:args.layers]
         writer.add_key_value(field.name, value, field.types[0],
                              sub_type=field.types[-1] if field.types[0] == gguf.GGUFValueType.ARRAY else None)
     for tensor in reader.tensors:
@@ -59,8 +66,8 @@ def main() -> None:
     with args.output.open("rb") as source:
         for chunk in iter(lambda: source.read(8 * 1024 * 1024), b""):
             digest.update(chunk)
-    report = {"purpose": "truncated numerical fixture, not a usable GLM model",
-              "layers": 2, "bytes": args.output.stat().st_size,
+    report = {"purpose": "truncated numerical fixture, not a usable full model",
+              "layers": args.layers, "bytes": args.output.stat().st_size,
               "sha256": digest.hexdigest(), "source": str(args.source)}
     args.output.with_suffix(".json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report))

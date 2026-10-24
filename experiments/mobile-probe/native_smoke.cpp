@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <fstream>
 #include <stdexcept>
 #include <string>
@@ -61,9 +62,20 @@ public:
         }
         auto batch = llama_batch_init(n, hidden ? dim : 0, 1);
         batch.n_tokens = n;
+        const auto rope = llama_model_rope_type(model);
+        const bool mrope = hidden && (rope == LLAMA_ROPE_TYPE_MROPE || rope == LLAMA_ROPE_TYPE_IMROPE);
+        if (mrope) {
+            auto * positions = static_cast<llama_pos *>(realloc(batch.pos, 4 * n * sizeof(llama_pos)));
+            if (!positions) { llama_batch_free(batch); throw std::runtime_error("position allocation failed"); }
+            batch.pos = positions;
+        }
         for (int i = 0; i < n; ++i) {
             if (!hidden) batch.token[i] = tokens[i];
             batch.pos[i] = position + i;
+            if (mrope) {
+                batch.pos[n + i] = batch.pos[2*n + i] = position + i;
+                batch.pos[3*n + i] = 0;
+            }
             batch.n_seq_id[i] = 1;
             batch.seq_id[i][0] = 0;
             batch.logits[i] = prefix || i == n - 1;
@@ -110,9 +122,12 @@ extern "C" int meshthing_native_smoke(const char * model_path, const char * repo
     try {
         ggml_backend_load_all();
         llama_backend_init();
-        Shard reference(model_path, 0, 2, false);
-        Shard prefix(model_path, 0, 1, true);
-        Shard suffix(model_path, 1, 2, false);
+        Shard reference(model_path, 0, -1, false);
+        const int layers = llama_model_n_layer(reference.model);
+        if (layers < 2) throw std::runtime_error("fixture needs at least two layers");
+        const int cut = layers / 2;
+        Shard prefix(model_path, 0, cut, true);
+        Shard suffix(model_path, cut, layers, false);
         const char * prompt = "Hello from the iPad";
         std::vector<llama_token> initial(32);
         const int n = llama_tokenize(llama_model_get_vocab(reference.model), prompt, strlen(prompt), initial.data(), initial.size(), true, true);
@@ -139,7 +154,8 @@ extern "C" int meshthing_native_smoke(const char * model_path, const char * repo
                << ",\"prefix_buffer_bytes\":" << prefix.buffer_bytes()
                << ",\"suffix_buffer_bytes\":" << suffix.buffer_bytes()
                << ",\"reference_buffer_bytes\":" << reference.buffer_bytes()
-               << ",\"configuration\":\"per-model C API; no environment mutation\",\"scope\":\"GLM two-layer numerical fixture, no Iroh\"}\n";
+               << ",\"layers\":" << layers
+               << ",\"configuration\":\"per-model C API; no environment mutation\",\"scope\":\"truncated numerical fixture, no Iroh\"}\n";
         if (!report) throw std::runtime_error("report write failed");
         return 0;
     } catch (const std::exception & error) {

@@ -1,0 +1,7 @@
+{
+  "purpose": "truncated numerical fixture, not a usable full model",
+  "layers": 4,
+  "bytes": 2847853216,
+  "sha256": "9b3b65d464e9111949597da118e2618986645b1d016435a3093aaf649c6db0e6",
+  "source": "/Users/stephenson.439/llama-rpc-demo/models/Qwen3.8-27B-UD-Q5_K_M.gguf"
+}

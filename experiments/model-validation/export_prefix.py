@@ -35,8 +35,10 @@ def main() -> None:
         raise ValueError("source checksum mismatch")
     reader = gguf.GGUFReader(args.model)
     architecture = reader.fields["general.architecture"].contents()
-    layers = reader.fields[f"{architecture}.block_count"].contents()
-    if architecture not in {"llama", "qwen2", "deepseek2"} or not 0 <= args.begin < args.cut <= layers:
+    stored_layers = reader.fields[f"{architecture}.block_count"].contents()
+    nextn = reader.fields.get(f"{architecture}.nextn_predict_layers")
+    layers = stored_layers - (nextn.contents() if nextn else 0)
+    if architecture not in {"llama", "qwen2", "deepseek2", "qwen35"} or not 0 <= args.begin < args.cut <= layers:
         raise ValueError("invalid/unsupported partition")
     writer = gguf.GGUFWriter(args.output, architecture, endianess=reader.endianess)
     for field in reader.fields.values():
