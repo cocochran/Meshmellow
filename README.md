@@ -47,6 +47,33 @@ Because history is synced after each task, at most the in-progress task is lost 
  
 Early development.
 
+## Browser client
+
+When the leader is running, open `http://127.0.0.1:8080` for the built-in chat
+client. It streams replies from the leader and shows recent queued, running,
+completed, failed, and canceled jobs. The client is served by the leader itself;
+there is no separate frontend server or dependency install.
+
+Start the leader with the plan and profile you generated, for example:
+
+```sh
+cargo run -- leader --plan plan.json --profile profile.json --llama-server /path/to/llama-server
+```
+
+Before anything starts, the leader validates the plan against the profile
+(`planning::validate_output`) and builds the worker bridges from the plan's
+`runtime_devices`. Plans saved before `runtime_devices` existed are rejected;
+regenerate them with `llm-cluster plan`. Useful `leader` flags:
+
+- `--min-peers <N>`: contributors the plan must use (default 2).
+- `--llama-arg <ARG>`: extra llama-server flag, repeatable, appended after the
+  plan's arguments (for example `--llama-arg=--cache-ram --llama-arg=0`).
+- `--evidence-file <PATH>` and `--evidence-wait <DURATION>`: after startup, wait
+  for externally collected `RunEvidence` JSON and check it with
+  `planning::verify_output`. If verification fails, the leader shuts down. The
+  leader never generates evidence itself; without this flag, post-run
+  verification is skipped.
+
 For the test suite, build the fake runtime helper executables before running
 integration tests:
 

@@ -1,0 +1,653 @@
+{
+  "model_sha256": "6f85a640a97cf2bf5b8e764087b1e83da0fdb51d7c9fab7d0fece9385611df83",
+  "model_bytes": 807694464,
+  "runner_sha256": "bc8363fcb9f91dd8ba83accb4b3f2705f2e90cfddee1bd0419b1a1f3682f0e46",
+  "cut": 8,
+  "layers": 16,
+  "context": 512,
+  "gpu_layers": 0,
+  "worker": null,
+  "prompt": "The capital of France is",
+  "steps": [
+    {
+      "prefix": {
+        "step": 0,
+        "n_floats": 12288,
+        "token": -1,
+        "eog": false,
+        "piece_hex": "",
+        "compute_ms": 94.062125,
+        "observed_peak_buffer_bytes": 534666880,
+        "max_rss_bytes": 411172864,
+        "wall_ms": 94.21949999523349,
+        "request_bytes": 44,
+        "response_tensor_bytes": 49152
+      },
+      "suffix": {
+        "step": 0,
+        "n_floats": 128256,
+        "token": 12366,
+        "eog": false,
+        "piece_hex": "205061726973",
+        "compute_ms": 189.329416,
+        "observed_peak_buffer_bytes": 582774912,
+        "max_rss_bytes": 628113408,
+        "wall_ms": 189.91858400113415,
+        "request_bytes": 49172,
+        "response_tensor_bytes": 513024
+      },
+      "wall_ms": 284.1647500026738,
+      "phase": "prefill",
+      "comparison": {
+        "max_abs_error": 0.0,
+        "rmse": 0.0,
+        "identical_bytes": true,
+        "same_greedy_token": true
+      }
+    },
+    {
+      "prefix": {
+        "step": 1,
+        "n_floats": 2048,
+        "token": -1,
+        "eog": false,
+        "piece_hex": "",
+        "compute_ms": 5.814875,
+        "observed_peak_buffer_bytes": 534666880,
+        "max_rss_bytes": 411336704,
+        "wall_ms": 5.948499994701706,
+        "request_bytes": 24,
+        "response_tensor_bytes": 8192
+      },
+      "suffix": {
+        "step": 1,
+        "n_floats": 128256,
+        "token": 13,
+        "eog": false,
+        "piece_hex": "2e",
+        "compute_ms": 7.313166,
+        "observed_peak_buffer_bytes": 582774912,
+        "max_rss_bytes": 628342784,
+        "wall_ms": 7.848167006159201,
+        "request_bytes": 8212,
+        "response_tensor_bytes": 513024
+      },
+      "wall_ms": 13.810292002744973,
+      "phase": "decode",
+      "comparison": {
+        "max_abs_error": 0.0,
+        "rmse": 0.0,
+        "identical_bytes": true,
+        "same_greedy_token": true
+      }
+    },
+    {
+      "prefix": {
+        "step": 2,
+        "n_floats": 2048,
+        "token": -1,
+        "eog": false,
+        "piece_hex": "",
+        "compute_ms": 5.335041,
+        "observed_peak_buffer_bytes": 534666880,
+        "max_rss_bytes": 411353088,
+        "wall_ms": 5.44816700858064,
+        "request_bytes": 24,
+        "response_tensor_bytes": 8192
+      },
+      "suffix": {
+        "step": 2,
+        "n_floats": 128256,
+        "token": 578,
+        "eog": false,
+        "piece_hex": "20546865",
+        "compute_ms": 7.611208,
+        "observed_peak_buffer_bytes": 582774912,
+        "max_rss_bytes": 628375552,
+        "wall_ms": 8.035042003029957,
+        "request_bytes": 8212,
+        "response_tensor_bytes": 513024
+      },
+      "wall_ms": 13.496707993908785,
+      "phase": "decode",
+      "comparison": {
+        "max_abs_error": 0.0,
+        "rmse": 0.0,
+        "identical_bytes": true,
+        "same_greedy_token": true
+      }
+    },
+    {
+      "prefix": {
+        "step": 3,
+        "n_floats": 2048,
+        "token": -1,
+        "eog": false,
+        "piece_hex": "",
+        "compute_ms": 5.178208,
+        "observed_peak_buffer_bytes": 534666880,
+        "max_rss_bytes": 411369472,
+        "wall_ms": 5.275541989249177,
+        "request_bytes": 24,
+        "response_tensor_bytes": 8192
+      },
+      "suffix": {
+        "step": 3,
+        "n_floats": 128256,
+        "token": 469,
+        "eog": false,
+        "piece_hex": "2045",
+        "compute_ms": 7.047708,
+        "observed_peak_buffer_bytes": 582774912,
+        "max_rss_bytes": 628375552,
+        "wall_ms": 7.455166007275693,
+        "request_bytes": 8212,
+        "response_tensor_bytes": 513024
+      },
+      "wall_ms": 12.744416002533399,
+      "phase": "decode",
+      "comparison": {
+        "max_abs_error": 0.0,
+        "rmse": 0.0,
+        "identical_bytes": true,
+        "same_greedy_token": true
+      }
+    },
+    {
+      "prefix": {
+        "step": 4,
+        "n_floats": 2048,
+        "token": -1,
+        "eog": false,
+        "piece_hex": "",
+        "compute_ms": 4.446833,
+        "observed_peak_buffer_bytes": 534666880,
+        "max_rss_bytes": 411385856,
+        "wall_ms": 4.541542002698407,
+        "request_bytes": 24,
+        "response_tensor_bytes": 8192
+      },
+      "suffix": {
+        "step": 4,
+        "n_floats": 128256,
+        "token": 3168,
+        "eog": false,
+        "piece_hex": "696666",
+        "compute_ms": 7.059709,
+        "observed_peak_buffer_bytes": 582774912,
+        "max_rss_bytes": 628375552,
+        "wall_ms": 7.606375002069399,
+        "request_bytes": 8212,
+        "response_tensor_bytes": 513024
+      },
+      "wall_ms": 12.161124992417172,
+      "phase": "decode",
+      "comparison": {
+        "max_abs_error": 0.0,
+        "rmse": 0.0,
+        "identical_bytes": true,
+        "same_greedy_token": true
+      }
+    },
+    {
+      "prefix": {
+        "step": 5,
+        "n_floats": 2048,
+        "token": -1,
+        "eog": false,
+        "piece_hex": "",
+        "compute_ms": 4.306583,
+        "observed_peak_buffer_bytes": 534666880,
+        "max_rss_bytes": 411402240,
+        "wall_ms": 4.393542010802776,
+        "request_bytes": 24,
+        "response_tensor_bytes": 8192
+      },
+      "suffix": {
+        "step": 5,
+        "n_floats": 128256,
+        "token": 301,
+        "eog": false,
+        "piece_hex": "656c",
+        "compute_ms": 6.923541,
+        "observed_peak_buffer_bytes": 582774912,
+        "max_rss_bytes": 628391936,
+        "wall_ms": 7.326582999667153,
+        "request_bytes": 8212,
+        "response_tensor_bytes": 513024
+      },
+      "wall_ms": 11.733749997802079,
+      "phase": "decode",
+      "comparison": {
+        "max_abs_error": 0.0,
+        "rmse": 0.0,
+        "identical_bytes": true,
+        "same_greedy_token": true
+      }
+    },
+    {
+      "prefix": {
+        "step": 6,
+        "n_floats": 2048,
+        "token": -1,
+        "eog": false,
+        "piece_hex": "",
+        "compute_ms": 4.500417,
+        "observed_peak_buffer_bytes": 534666880,
+        "max_rss_bytes": 411418624,
+        "wall_ms": 4.584499998600222,
+        "request_bytes": 24,
+        "response_tensor_bytes": 8192
+      },
+      "suffix": {
+        "step": 6,
+        "n_floats": 128256,
+        "token": 22703,
+        "eog": false,
+        "piece_hex": "20546f776572",
+        "compute_ms": 6.925875,
+        "observed_peak_buffer_bytes": 582774912,
+        "max_rss_bytes": 628391936,
+        "wall_ms": 7.408249992295168,
+        "request_bytes": 8212,
+        "response_tensor_bytes": 513024
+      },
+      "wall_ms": 12.00358300411608,
+      "phase": "decode",
+      "comparison": {
+        "max_abs_error": 0.0,
+        "rmse": 0.0,
+        "identical_bytes": true,
+        "same_greedy_token": true
+      }
+    },
+    {
+      "prefix": {
+        "step": 7,
+        "n_floats": 2048,
+        "token": -1,
+        "eog": false,
+        "piece_hex": "",
+        "compute_ms": 4.488333,
+        "observed_peak_buffer_bytes": 534666880,
+        "max_rss_bytes": 411451392,
+        "wall_ms": 4.591208009514958,
+        "request_bytes": 24,
+        "response_tensor_bytes": 8192
+      },
+      "suffix": {
+        "step": 7,
+        "n_floats": 128256,
+        "token": 374,
+        "eog": false,
+        "piece_hex": "206973",
+        "compute_ms": 7.247084,
+        "observed_peak_buffer_bytes": 582774912,
+        "max_rss_bytes": 628408320,
+        "wall_ms": 7.726167008513585,
+        "request_bytes": 8212,
+        "response_tensor_bytes": 513024
+      },
+      "wall_ms": 12.328166005318053,
+      "phase": "decode",
+      "comparison": {
+        "max_abs_error": 0.0,
+        "rmse": 0.0,
+        "identical_bytes": true,
+        "same_greedy_token": true
+      }
+    },
+    {
+      "prefix": {
+        "step": 8,
+        "n_floats": 2048,
+        "token": -1,
+        "eog": false,
+        "piece_hex": "",
+        "compute_ms": 4.249709,
+        "observed_peak_buffer_bytes": 534666880,
+        "max_rss_bytes": 411451392,
+        "wall_ms": 4.34270899859257,
+        "request_bytes": 24,
+        "response_tensor_bytes": 8192
+      },
+      "suffix": {
+        "step": 8,
+        "n_floats": 128256,
+        "token": 264,
+        "eog": false,
+        "piece_hex": "2061",
+        "compute_ms": 7.091375,
+        "observed_peak_buffer_bytes": 582774912,
+        "max_rss_bytes": 628408320,
+        "wall_ms": 7.54183299432043,
+        "request_bytes": 8212,
+        "response_tensor_bytes": 513024
+      },
+      "wall_ms": 11.895290997927077,
+      "phase": "decode",
+      "comparison": {
+        "max_abs_error": 0.0,
+        "rmse": 0.0,
+        "identical_bytes": true,
+        "same_greedy_token": true
+      }
+    },
+    {
+      "prefix": {
+        "step": 9,
+        "n_floats": 2048,
+        "token": -1,
+        "eog": false,
+        "piece_hex": "",
+        "compute_ms": 4.4425,
+        "observed_peak_buffer_bytes": 534666880,
+        "max_rss_bytes": 411467776,
+        "wall_ms": 4.537792003247887,
+        "request_bytes": 24,
+        "response_tensor_bytes": 8192
+      },
+      "suffix": {
+        "step": 9,
+        "n_floats": 128256,
+        "token": 11495,
+        "eog": false,
+        "piece_hex": "2066616d6f7573",
+        "compute_ms": 6.864959,
+        "observed_peak_buffer_bytes": 582774912,
+        "max_rss_bytes": 628408320,
+        "wall_ms": 7.291499990969896,
+        "request_bytes": 8212,
+        "response_tensor_bytes": 513024
+      },
+      "wall_ms": 11.838249993161298,
+      "phase": "decode",
+      "comparison": {
+        "max_abs_error": 0.0,
+        "rmse": 0.0,
+        "identical_bytes": true,
+        "same_greedy_token": true
+      }
+    },
+    {
+      "prefix": {
+        "step": 10,
+        "n_floats": 2048,
+        "token": -1,
+        "eog": false,
+        "piece_hex": "",
+        "compute_ms": 4.463792,
+        "observed_peak_buffer_bytes": 534666880,
+        "max_rss_bytes": 411484160,
+        "wall_ms": 4.544999988866039,
+        "request_bytes": 24,
+        "response_tensor_bytes": 8192
+      },
+      "suffix": {
+        "step": 10,
+        "n_floats": 128256,
+        "token": 38350,
+        "eog": false,
+        "piece_hex": "206c616e646d61726b",
+        "compute_ms": 7.291209,
+        "observed_peak_buffer_bytes": 582774912,
+        "max_rss_bytes": 628424704,
+        "wall_ms": 7.721041998593137,
+        "request_bytes": 8212,
+        "response_tensor_bytes": 513024
+      },
+      "wall_ms": 12.276165987714194,
+      "phase": "decode",
+      "comparison": {
+        "max_abs_error": 0.0,
+        "rmse": 0.0,
+        "identical_bytes": true,
+        "same_greedy_token": true
+      }
+    },
+    {
+      "prefix": {
+        "step": 11,
+        "n_floats": 2048,
+        "token": -1,
+        "eog": false,
+        "piece_hex": "",
+        "compute_ms": 4.572334,
+        "observed_peak_buffer_bytes": 534666880,
+        "max_rss_bytes": 411500544,
+        "wall_ms": 4.657582991058007,
+        "request_bytes": 24,
+        "response_tensor_bytes": 8192
+      },
+      "suffix": {
+        "step": 11,
+        "n_floats": 128256,
+        "token": 304,
+        "eog": false,
+        "piece_hex": "20696e",
+        "compute_ms": 7.205792,
+        "observed_peak_buffer_bytes": 582774912,
+        "max_rss_bytes": 628441088,
+        "wall_ms": 7.630209001945332,
+        "request_bytes": 8212,
+        "response_tensor_bytes": 513024
+      },
+      "wall_ms": 12.299416004680097,
+      "phase": "decode",
+      "comparison": {
+        "max_abs_error": 0.0,
+        "rmse": 0.0,
+        "identical_bytes": true,
+        "same_greedy_token": true
+      }
+    },
+    {
+      "prefix": {
+        "step": 12,
+        "n_floats": 2048,
+        "token": -1,
+        "eog": false,
+        "piece_hex": "",
+        "compute_ms": 4.494375,
+        "observed_peak_buffer_bytes": 534666880,
+        "max_rss_bytes": 411516928,
+        "wall_ms": 4.587457995512523,
+        "request_bytes": 24,
+        "response_tensor_bytes": 8192
+      },
+      "suffix": {
+        "step": 12,
+        "n_floats": 128256,
+        "token": 12366,
+        "eog": false,
+        "piece_hex": "205061726973",
+        "compute_ms": 6.9255,
+        "observed_peak_buffer_bytes": 582774912,
+        "max_rss_bytes": 628441088,
+        "wall_ms": 7.608792002429254,
+        "request_bytes": 8212,
+        "response_tensor_bytes": 513024
+      },
+      "wall_ms": 12.214500005939044,
+      "phase": "decode",
+      "comparison": {
+        "max_abs_error": 0.0,
+        "rmse": 0.0,
+        "identical_bytes": true,
+        "same_greedy_token": true
+      }
+    },
+    {
+      "prefix": {
+        "step": 13,
+        "n_floats": 2048,
+        "token": -1,
+        "eog": false,
+        "piece_hex": "",
+        "compute_ms": 4.534209,
+        "observed_peak_buffer_bytes": 534666880,
+        "max_rss_bytes": 411516928,
+        "wall_ms": 4.619457991793752,
+        "request_bytes": 24,
+        "response_tensor_bytes": 8192
+      },
+      "suffix": {
+        "step": 13,
+        "n_floats": 128256,
+        "token": 13,
+        "eog": false,
+        "piece_hex": "2e",
+        "compute_ms": 7.197458,
+        "observed_peak_buffer_bytes": 582774912,
+        "max_rss_bytes": 628457472,
+        "wall_ms": 7.6590410026255995,
+        "request_bytes": 8212,
+        "response_tensor_bytes": 513024
+      },
+      "wall_ms": 12.288708006963134,
+      "phase": "decode",
+      "comparison": {
+        "max_abs_error": 0.0,
+        "rmse": 0.0,
+        "identical_bytes": true,
+        "same_greedy_token": true
+      }
+    },
+    {
+      "prefix": {
+        "step": 14,
+        "n_floats": 2048,
+        "token": -1,
+        "eog": false,
+        "piece_hex": "",
+        "compute_ms": 4.492792,
+        "observed_peak_buffer_bytes": 534666880,
+        "max_rss_bytes": 411516928,
+        "wall_ms": 4.578792009851895,
+        "request_bytes": 24,
+        "response_tensor_bytes": 8192
+      },
+      "suffix": {
+        "step": 14,
+        "n_floats": 128256,
+        "token": 578,
+        "eog": false,
+        "piece_hex": "20546865",
+        "compute_ms": 6.936708,
+        "observed_peak_buffer_bytes": 582774912,
+        "max_rss_bytes": 628457472,
+        "wall_ms": 7.348166996962391,
+        "request_bytes": 8212,
+        "response_tensor_bytes": 513024
+      },
+      "wall_ms": 11.936333001358435,
+      "phase": "decode",
+      "comparison": {
+        "max_abs_error": 0.0,
+        "rmse": 0.0,
+        "identical_bytes": true,
+        "same_greedy_token": true
+      }
+    },
+    {
+      "prefix": {
+        "step": 15,
+        "n_floats": 2048,
+        "token": -1,
+        "eog": false,
+        "piece_hex": "",
+        "compute_ms": 4.362666,
+        "observed_peak_buffer_bytes": 534666880,
+        "max_rss_bytes": 411516928,
+        "wall_ms": 4.440208009327762,
+        "request_bytes": 24,
+        "response_tensor_bytes": 8192
+      },
+      "suffix": {
+        "step": 15,
+        "n_floats": 128256,
+        "token": 469,
+        "eog": false,
+        "piece_hex": "2045",
+        "compute_ms": 7.479417,
+        "observed_peak_buffer_bytes": 582774912,
+        "max_rss_bytes": 628457472,
+        "wall_ms": 7.985832999111153,
+        "request_bytes": 8212,
+        "response_tensor_bytes": 513024
+      },
+      "wall_ms": 12.437209006748162,
+      "phase": "decode",
+      "comparison": {
+        "max_abs_error": 0.0,
+        "rmse": 0.0,
+        "identical_bytes": true,
+        "same_greedy_token": true
+      }
+    }
+  ],
+  "transport": "local pipes or SSH",
+  "memory_note": "Observed GGML buffers at init/step boundaries, not a total allocation peak or hard memory cap. RSS includes process overhead; unified-memory categories may overlap.",
+  "status": "passed",
+  "initialization": [
+    {
+      "protocol": 1,
+      "begin": 0,
+      "end": 8,
+      "layers": 16,
+      "embd": 2048,
+      "vocab": 128256,
+      "allocated_bytes": 534666880,
+      "max_rss_bytes": 292339712,
+      "source_sha256": "6f85a640a97cf2bf5b8e764087b1e83da0fdb51d7c9fab7d0fece9385611df83",
+      "tokens": [
+        128000,
+        791,
+        6864,
+        315,
+        9822,
+        374
+      ]
+    },
+    {
+      "protocol": 1,
+      "begin": 8,
+      "end": 16,
+      "layers": 16,
+      "embd": 2048,
+      "vocab": 128256,
+      "allocated_bytes": 582774912,
+      "max_rss_bytes": 598294528,
+      "source_sha256": "",
+      "tokens": [
+        128000,
+        791,
+        6864,
+        315,
+        9822,
+        374
+      ]
+    },
+    {
+      "protocol": 1,
+      "begin": 0,
+      "end": 16,
+      "layers": 16,
+      "embd": 2048,
+      "vocab": 128256,
+      "allocated_bytes": 1103810688,
+      "max_rss_bytes": 582287360,
+      "source_sha256": "",
+      "tokens": [
+        128000,
+        791,
+        6864,
+        315,
+        9822,
+        374
+      ]
+    }
+  ],
+  "text": " Paris. The Eiffel Tower is a famous landmark in Paris. The E",
+  "decode_tokens_per_second": 80.87826767534294
+}

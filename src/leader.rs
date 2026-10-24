@@ -2,24 +2,27 @@
 //!
 //! [`run_leader_process`] turns a saved placement plan into a running distributed `llama-server`:
 //!
-//! 1. Load the plan (`llm-cluster plan` output) and the planning profile it came from, and work
-//!    out which planned peers are remote workers and which leader-local port bridges to each.
+//! 1. Load the plan (`llm-cluster plan` output) and the planning profile it came from, and
+//!    validate the plan against the profile ([`LaunchPlan::load`]). An invalid or legacy plan
+//!    fails here, before any port is bound or process started. The plan's `runtime_devices` say
+//!    which planned peers are remote workers and which leader-local port bridges to each.
 //! 2. Accept control connections and wait until every remote worker has said hello.
 //! 3. Run one RPC bridge per remote worker, all sharing the leader's endpoint.
 //! 4. Launch `llama-server` with the plan's `server_args`, wait for `/health`, then send one real
 //!    one-token generation: a stale RPC backend can report healthy and still abort on the first
 //!    request, so `/health` alone does not prove the cluster works.
-//! 5. Serve the job API until shutdown, then stop the API, `llama-server`, the bridges and the
-//!    endpoint, in that order.
+//! 5. Serve the job API. With an evidence file configured, verify the externally collected run
+//!    evidence against the plan while serving; a failed verification stops the leader.
+//! 6. On shutdown or failure, stop the API, `llama-server`, the bridges and the endpoint, in that
+//!    order.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail, ensure};
 use iroh::{Endpoint, EndpointId};
-use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
@@ -28,11 +31,12 @@ use tokio::time::Instant;
 use tracing::{info, warn};
 
 use crate::api::{self, ApiConfig};
+use crate::evidence::{self, EvidenceConfig};
 use crate::history::LoggingHistorySink;
 use crate::jobs::JobQueue;
+use crate::launch::{LaunchPlan, RemoteWorker};
 use crate::network::{self, SharedPeerTable};
 use crate::node::PeerTable;
-use crate::planning::{PlanningOutput, PlanningRequest};
 use crate::process::{self, ChildSpec, Readiness, RestartPolicy, Supervised};
 use crate::protocol::CONTROL_ALPN;
 use crate::rpc_bridge;
@@ -94,11 +98,18 @@ pub struct LeaderConfig {
     pub cluster_id: String,
     /// `planning::PlanningOutput` JSON written by `llm-cluster plan`.
     pub plan_path: PathBuf,
-    /// `planning::PlanningRequest` JSON the plan was built from; its `devices[].rpc_endpoint`
-    /// gives the leader-local bridge port for each remote peer.
+    /// `planning::PlanningRequest` JSON the plan was built from; the plan is validated against
+    /// it before launch and, with `evidence`, the run evidence after.
     pub profile_path: PathBuf,
+    /// Minimum number of contributing peers the plan must use.
+    pub min_peers: usize,
+    /// Where an external harness writes the run evidence; `None` skips post-run verification.
+    pub evidence: Option<EvidenceConfig>,
     /// `llama-server` binary.
     pub llama_server: PathBuf,
+    /// Extra `llama-server` arguments, passed after the plan's `server_args` (e.g.
+    /// `--cache-ram 0`). The leader's own `--host` and `--port` always come last.
+    pub extra_llama_args: Vec<String>,
     /// Internal loopback port for `llama-server`.
     pub llama_port: u16,
     /// Loopback address the job API listens on.
@@ -121,6 +132,7 @@ pub async fn run_leader_process(config: LeaderConfig) -> anyhow::Result<()> {
 /// Runs the leader on `endpoint` until `shutdown` resolves or a component fails, then stops the
 /// API, `llama-server`, the bridges and finally closes `endpoint`.
 ///
+/// The plan is loaded and validated first; if it is invalid, nothing is served or launched.
 /// `endpoint` must accept [`CONTROL_ALPN`] and be able to dial workers by node ID.
 /// `config.key_path` is ignored; the endpoint already carries the identity.
 pub async fn run_leader_on(
@@ -128,7 +140,10 @@ pub async fn run_leader_on(
     config: &LeaderConfig,
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<()> {
-    let result = lead(&endpoint, config, shutdown).await;
+    let result = match LaunchPlan::load(&config.plan_path, &config.profile_path, config.min_peers) {
+        Ok(launch) => lead(&endpoint, config, &launch, shutdown).await,
+        Err(error) => Err(error),
+    };
     endpoint.close().await;
     result
 }
@@ -141,13 +156,13 @@ async fn ctrl_c() {
     }
 }
 
-/// Body of [`run_leader_on`]; the caller closes the endpoint afterwards.
+/// Body of [`run_leader_on`] once the plan is valid; the caller closes the endpoint afterwards.
 async fn lead(
     endpoint: &Endpoint,
     config: &LeaderConfig,
+    launch: &LaunchPlan,
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<()> {
-    let launch = LaunchPlan::load(&config.plan_path, &config.profile_path)?;
     let peers: SharedPeerTable = Arc::new(Mutex::new(PeerTable::new()));
     let local = network::local_hello(endpoint, &config.cluster_id, EMPTY_LOG_INDEX);
     // Dropping the set aborts the accept loop, so it never outlives this function.
@@ -160,90 +175,34 @@ async fn lead(
 
     tokio::pin!(shutdown);
     let running = tokio::select! {
-        started = start(endpoint, config, &launch, &peers) => started?,
+        started = start(endpoint, config, launch, &peers) => started?,
         () = &mut shutdown => {
             info!("shutdown requested during startup");
             return Ok(());
         }
     };
-    running.serve_until(shutdown).await
+    let failed_verification = verify_while_serving(launch, config.evidence.as_ref());
+    running.serve_until(shutdown, failed_verification).await
 }
 
-/// What the leader launches, derived from the plan and profile files.
-#[derive(Debug)]
-struct LaunchPlan {
-    server_args: Vec<String>,
-    workers: Vec<RemoteWorker>,
-}
-
-/// A planned peer that runs on another machine and is reached through an RPC bridge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RemoteWorker {
-    /// The worker's Iroh node ID, which is its `peer_id` in the plan.
-    id: EndpointId,
-    /// Leader-local loopback port `llama-server` reaches the worker's RPC server on.
-    rpc_endpoint: SocketAddr,
-}
-
-impl LaunchPlan {
-    fn load(plan_path: &Path, profile_path: &Path) -> anyhow::Result<Self> {
-        let plan: PlanningOutput = read_json(plan_path, "plan")?;
-        let profile: PlanningRequest = read_json(profile_path, "profile")?;
-        ensure!(
-            !plan.server_args.is_empty(),
-            "plan {} has no server_args",
-            plan_path.display()
-        );
-        let workers = bridge_targets(&plan, &profile)?;
-        Ok(Self {
-            server_args: plan.server_args,
-            workers,
-        })
-    }
-}
-
-fn read_json<T: DeserializeOwned>(path: &Path, what: &str) -> anyhow::Result<T> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read {what} {}", path.display()))?;
-    serde_json::from_str(&text)
-        .with_context(|| format!("invalid {what} JSON in {}", path.display()))
-}
-
-/// Maps every planned remote peer to the leader-local port its RPC bridge listens on.
+/// Runs post-run verification, if configured, and resolves only if it fails.
 ///
-/// A planned peer is remote when its profile device has an `rpc_endpoint`; peers without one run
-/// on the leader itself. The whole mapping lives here so plans that carry their own runtime
-/// devices (aarush-codex PR #8) can replace the profile lookup in one place.
-fn bridge_targets(
-    plan: &PlanningOutput,
-    profile: &PlanningRequest,
-) -> anyhow::Result<Vec<RemoteWorker>> {
-    let mut workers = Vec::new();
-    let mut unknown = Vec::new();
-    for assignment in &plan.placement.assignments {
-        let peer_id = assignment.peer_id.as_str();
-        let device = profile
-            .devices
-            .iter()
-            .find(|device| device.peer_id == peer_id);
-        match device {
-            None => unknown.push(peer_id),
-            Some(device) => {
-                if let Some(rpc_endpoint) = device.rpc_endpoint {
-                    let id = network::parse_node_id(peer_id).with_context(|| {
-                        format!("remote peer {peer_id:?} must be the worker's node ID")
-                    })?;
-                    workers.push(RemoteWorker { id, rpc_endpoint });
-                }
+/// Without an evidence file there is nothing to verify: the leader never fabricates evidence.
+async fn verify_while_serving(
+    launch: &LaunchPlan,
+    evidence: Option<&EvidenceConfig>,
+) -> anyhow::Error {
+    match evidence {
+        None => info!("post-run verification not configured"),
+        Some(config) => {
+            info!(evidence = %config.path.display(), "waiting for run evidence");
+            match evidence::verify_run_evidence(launch, config).await {
+                Ok(()) => info!("post-run verification passed"),
+                Err(error) => return error,
             }
         }
     }
-    ensure!(
-        unknown.is_empty(),
-        "plan assigns layers to peers missing from the profile's devices: {}",
-        unknown.join(", ")
-    );
-    Ok(workers)
+    std::future::pending().await
 }
 
 /// The leader once every component is up.
@@ -263,7 +222,7 @@ async fn start(
 ) -> anyhow::Result<Running> {
     wait_for_workers(peers, &launch.workers, config.worker_wait).await?;
     let bridges = start_bridges(endpoint, &launch.workers).await?;
-    let llama = process::spawn_supervised(llama_server_spec(config, &launch.server_args)).await?;
+    let llama = process::spawn_supervised(llama_server_spec(config, launch.server_args())).await?;
     if let Err(error) = probe_generation(llama_addr(config.llama_port)).await {
         if let Err(stop_error) = llama.shutdown().await {
             warn!("failed to stop llama-server: {stop_error:#}");
@@ -280,12 +239,21 @@ async fn start(
 }
 
 impl Running {
-    /// Serves until `shutdown` resolves or a component stops, then stops everything in order.
-    async fn serve_until(mut self, shutdown: impl Future<Output = ()>) -> anyhow::Result<()> {
+    /// Serves until `shutdown` resolves, `failed_verification` reports an error or a component
+    /// stops, then stops everything in order.
+    async fn serve_until(
+        mut self,
+        shutdown: impl Future<Output = ()>,
+        failed_verification: impl Future<Output = anyhow::Error>,
+    ) -> anyhow::Result<()> {
         let outcome = tokio::select! {
             () = shutdown => {
                 info!("shutting down leader");
                 Ok(())
+            }
+            error = failed_verification => {
+                warn!("post-run verification failed; shutting down the leader, replan before restarting: {error:#}");
+                Err(error)
             }
             exited = self.llama.wait() => Err(match exited {
                 Ok(()) => anyhow!("llama-server exited"),
@@ -426,9 +394,10 @@ fn llama_addr(port: u16) -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, port))
 }
 
-/// `llama-server` argv: the plan's `server_args` unchanged, then the loopback host and port.
-fn llama_server_args(server_args: &[String], port: u16) -> Vec<String> {
-    let mut args = server_args.to_vec();
+/// `llama-server` argv: the plan's `server_args` unchanged, then the operator's extra arguments,
+/// then the loopback host and port last so the leader's binding always wins.
+fn llama_server_args(server_args: &[String], extra_args: &[String], port: u16) -> Vec<String> {
+    let mut args = [server_args, extra_args].concat();
     args.extend([
         "--host".to_owned(),
         Ipv4Addr::LOCALHOST.to_string(),
@@ -442,7 +411,7 @@ fn llama_server_spec(config: &LeaderConfig, server_args: &[String]) -> ChildSpec
     ChildSpec {
         name: LLAMA_SERVER_NAME.to_owned(),
         program: config.llama_server.clone(),
-        args: llama_server_args(server_args, config.llama_port),
+        args: llama_server_args(server_args, &config.extra_llama_args, config.llama_port),
         readiness: Readiness::HttpOk {
             addr: llama_addr(config.llama_port),
             path: HEALTH_PATH.to_owned(),
@@ -520,47 +489,19 @@ mod tests {
     use iroh::SecretKey;
 
     use super::*;
+    use crate::launch::DEFAULT_MIN_PEERS;
     use crate::protocol::{Hello, PROTOCOL_VERSION};
 
-    fn profile(devices: Value) -> PlanningRequest {
-        serde_json::from_value(json!({
-            "model": {"model_hash": "m", "runtime_id": "r", "context_tokens": 8, "layers": []},
-            "peers": [],
-            "links": [],
-            "devices": devices,
-            "model_path": "model.gguf",
-        }))
-        .expect("valid profile")
-    }
+    /// How long a future that must never resolve is watched.
+    const UNRESOLVED_CHECK_WINDOW: Duration = Duration::from_millis(50);
 
-    fn plan(peer_ids: &[&str]) -> PlanningOutput {
-        let assignments = peer_ids
-            .iter()
-            .enumerate()
-            .map(|(index, peer_id)| {
-                json!({
-                    "peer_id": peer_id,
-                    "layers": {"start": index, "end": index + 1},
-                    "estimated_bytes": 1,
-                })
-            })
-            .collect::<Vec<_>>();
-        serde_json::from_value(json!({
-            "advisory": true,
-            "placement": {
-                "model_hash": "m",
-                "runtime_id": "r",
-                "context_tokens": 8,
-                "assignments": assignments,
-                "predicted_decode_us": 1,
-            },
-            "server_args": ["--model", "model.gguf"],
-        }))
-        .expect("valid plan")
-    }
-
-    fn device(peer_id: &str, rpc_endpoint: Option<&str>) -> Value {
-        json!({"peer_id": peer_id, "device_name": peer_id, "rpc_endpoint": rpc_endpoint})
+    /// The checked-in launcher fixtures, which pass pre-launch validation.
+    fn fixture_launch() -> LaunchPlan {
+        let plan = serde_json::from_str(include_str!("../examples/launcher-plan.json"))
+            .expect("fixture plan");
+        let profile = serde_json::from_str(include_str!("../examples/launcher-profile.json"))
+            .expect("fixture profile");
+        LaunchPlan::from_parts(plan, profile, DEFAULT_MIN_PEERS).expect("fixture plan is valid")
     }
 
     fn table_with(ids: &[EndpointId]) -> SharedPeerTable {
@@ -587,52 +528,19 @@ mod tests {
     }
 
     #[test]
-    fn remote_workers_are_planned_peers_with_a_bridge_port() {
-        let remote = SecretKey::generate().public();
-        let unplanned = SecretKey::generate().public();
-        let devices = json!([
-            device("leader", None),
-            device(&remote.to_string(), Some("127.0.0.1:50053")),
-            device(&unplanned.to_string(), Some("127.0.0.1:50054")),
-        ]);
-
-        let workers =
-            bridge_targets(&plan(&["leader", &remote.to_string()]), &profile(devices)).unwrap();
-
-        assert_eq!(workers, vec![worker(remote)]);
-    }
-
-    #[test]
-    fn planned_peer_missing_from_profile_is_named() {
-        let error = bridge_targets(
-            &plan(&["leader", "ghost"]),
-            &profile(json!([device("leader", None)])),
-        )
-        .unwrap_err();
-
-        assert!(error.to_string().contains("ghost"), "{error}");
-    }
-
-    #[test]
-    fn remote_peer_id_must_be_a_node_id() {
-        let devices = json!([device("not-a-node-id", Some("127.0.0.1:50053"))]);
-
-        let error = bridge_targets(&plan(&["not-a-node-id"]), &profile(devices)).unwrap_err();
-
-        assert!(error.to_string().contains("not-a-node-id"), "{error}");
-    }
-
-    #[test]
-    fn llama_server_args_append_loopback_host_and_port() {
+    fn llama_server_args_put_extras_after_the_plan_and_host_and_port_last() {
         let plan_args = vec!["--rpc".to_owned(), "127.0.0.1:50053".to_owned()];
+        let extra_args = vec!["--cache-ram".to_owned(), "0".to_owned()];
 
-        let args = llama_server_args(&plan_args, 8081);
+        let args = llama_server_args(&plan_args, &extra_args, 8081);
 
         assert_eq!(
             args,
             [
                 "--rpc",
                 "127.0.0.1:50053",
+                "--cache-ram",
+                "0",
                 "--host",
                 "127.0.0.1",
                 "--port",
@@ -663,5 +571,30 @@ mod tests {
         wait_for_workers(&table_with(&[id]), &[worker(id)], Duration::ZERO)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn verification_without_evidence_never_fails() {
+        let launch = fixture_launch();
+
+        let outcome =
+            tokio::time::timeout(UNRESOLVED_CHECK_WINDOW, verify_while_serving(&launch, None))
+                .await;
+
+        assert!(outcome.is_err(), "unconfigured verification must not fail");
+    }
+
+    #[tokio::test]
+    async fn missing_evidence_fails_verification() {
+        let launch = fixture_launch();
+        let config = EvidenceConfig {
+            path: std::env::temp_dir()
+                .join(format!("meshthing-no-evidence-{}", uuid::Uuid::new_v4())),
+            wait: Duration::ZERO,
+        };
+
+        let error = verify_while_serving(&launch, Some(&config)).await;
+
+        assert!(error.to_string().contains("no run evidence"), "{error:#}");
     }
 }

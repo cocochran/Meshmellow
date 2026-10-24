@@ -83,6 +83,7 @@ fn worker_config(rpc_server: PathBuf, rpc_port: u16, leader: EndpointId) -> Work
         rpc_port,
         rpc_args: Vec::new(),
         leader: Some(leader),
+        allowed_peers: Vec::new(),
         heartbeat_interval: HEARTBEAT_INTERVAL,
     }
 }
@@ -289,12 +290,36 @@ async fn worker_fails_when_the_rpc_server_cannot_start() {
     let worker = bind_endpoint(worker_alpns(), None).await;
     let rpc_addr = free_loopback_port().await;
     let missing = std::env::temp_dir().join("meshthing-no-such-rpc-server");
-    let config = worker_config(missing, rpc_addr.port(), leader_id);
+    let mut config = worker_config(missing, rpc_addr.port(), leader_id);
+    // Approve a peer explicitly: without one the worker would fail on its allowlist instead.
+    config.allowed_peers = vec![leader_id];
 
     let outcome = timeout(TEST_TIMEOUT, run_worker_on(worker.clone(), None, &config))
         .await
         .expect("worker gives up in time");
 
     assert!(outcome.is_err());
+    assert!(worker.is_closed(), "endpoint closed on return");
+}
+
+#[tokio::test]
+async fn worker_without_leader_or_allowed_peers_refuses_to_start() {
+    init_tracing();
+    let leader_id = iroh::SecretKey::generate().public();
+    let worker = bind_endpoint(worker_alpns(), None).await;
+    let rpc_addr = free_loopback_port().await;
+    let config = worker_config(example_bin("fake_rpc_server"), rpc_addr.port(), leader_id);
+
+    // No leader is passed (config.leader is ignored by run_worker_on) and no extra peers are allowed.
+    let outcome = timeout(TEST_TIMEOUT, run_worker_on(worker.clone(), None, &config))
+        .await
+        .expect("worker gives up in time");
+
+    let error = outcome.expect_err("a worker nobody may use must not start");
+    assert!(format!("{error:#}").contains("--allow-peer"), "{error:#}");
+    assert!(
+        TcpStream::connect(rpc_addr).await.is_err(),
+        "the rpc server must not have been started"
+    );
     assert!(worker.is_closed(), "endpoint closed on return");
 }

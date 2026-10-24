@@ -64,6 +64,8 @@ pub struct WorkerConfig {
     pub rpc_args: Vec<String>,
     /// Leader to keep a control link to; `None` runs the bridge only.
     pub leader: Option<EndpointId>,
+    /// Peers besides the leader allowed to use this worker's RPC bridge (`--allow-peer`).
+    pub allowed_peers: Vec<EndpointId>,
     /// Time between heartbeats on the control link.
     pub heartbeat_interval: Duration,
 }
@@ -84,8 +86,9 @@ pub async fn run_worker(config: WorkerConfig) -> anyhow::Result<()> {
 /// `config.key_path` and `config.leader` are ignored: the endpoint carries the identity, and
 /// `leader` may carry direct addresses (as tests on isolated endpoints need). Supervises the RPC
 /// server on `127.0.0.1:<rpc_port>`, bridges [`RPC_BRIDGE_ALPN`] streams to it, and, if `leader`
-/// is set, sends heartbeats. Returns an error once the RPC server's restarts are exhausted.
-/// Dropping the future kills the RPC server and closes the endpoint.
+/// is set, sends heartbeats. Only `leader` and `config.allowed_peers` may use the bridge; with
+/// neither, this fails before starting anything. Returns an error once the RPC server's restarts
+/// are exhausted. Dropping the future kills the RPC server and closes the endpoint.
 pub async fn run_worker_on(
     endpoint: Endpoint,
     leader: Option<EndpointAddr>,
@@ -108,6 +111,8 @@ async fn serve(
     leader: Option<EndpointAddr>,
     config: &WorkerConfig,
 ) -> anyhow::Result<()> {
+    let leader_id = leader.as_ref().map(|addr| addr.id);
+    let allowed = bridge_allowlist(config, leader_id)?;
     let rpc_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, config.rpc_port));
     let mut rpc_server = process::spawn_supervised(rpc_server_spec(config, rpc_addr))
         .await
@@ -119,13 +124,23 @@ async fn serve(
             Ok(()) => Err(anyhow!("{RPC_SERVER_NAME} stopped")),
             Err(error) => Err(error.context(format!("{RPC_SERVER_NAME} exhausted its restarts"))),
         },
-        served = rpc_bridge::serve_worker(endpoint.clone(), rpc_addr) => served,
+        served = rpc_bridge::serve_worker(endpoint.clone(), rpc_addr, allowed) => served,
         () = keep_control_link(endpoint, leader, config.heartbeat_interval, &config.cluster_id) => Ok(()),
     };
     if let Err(error) = rpc_server.shutdown().await {
         warn!(error = %format!("{error:#}"), "failed to stop {RPC_SERVER_NAME} cleanly");
     }
     outcome
+}
+
+/// Peers allowed to use the RPC bridge: the configured extras plus the leader this worker serves.
+fn bridge_allowlist(
+    config: &WorkerConfig,
+    leader: Option<EndpointId>,
+) -> anyhow::Result<rpc_bridge::PeerAllowlist> {
+    let peers = config.allowed_peers.iter().copied().chain(leader);
+    rpc_bridge::PeerAllowlist::new(peers)
+        .context("worker has no approved peers: pass --leader or --allow-peer")
 }
 
 /// Command line and supervision policy for the RPC server; it never listens beyond loopback.
@@ -305,8 +320,30 @@ mod tests {
             rpc_port: rpc_bridge::DEFAULT_RPC_PORT,
             rpc_args: vec!["--threads".to_owned(), "4".to_owned()],
             leader: None,
+            allowed_peers: Vec::new(),
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
         }
+    }
+
+    #[test]
+    fn bridge_allowlist_approves_the_leader_and_extra_peers() {
+        let leader = SecretKey::generate().public();
+        let extra = SecretKey::generate().public();
+        let stranger = SecretKey::generate().public();
+        let mut config = config();
+        config.allowed_peers = vec![extra];
+
+        let allowed = bridge_allowlist(&config, Some(leader)).expect("allowlist");
+
+        assert!(allowed.contains(&leader));
+        assert!(allowed.contains(&extra));
+        assert!(!allowed.contains(&stranger));
+    }
+
+    #[test]
+    fn bridge_allowlist_fails_closed_without_leader_or_peers() {
+        let error = bridge_allowlist(&config(), None).expect_err("no approved peers");
+        assert!(format!("{error:#}").contains("--allow-peer"), "{error:#}");
     }
 
     #[test]

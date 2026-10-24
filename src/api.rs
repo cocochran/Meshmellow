@@ -19,7 +19,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderName, HeaderValue, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::{Stream, StreamExt, stream};
@@ -35,6 +35,9 @@ pub const CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
 
 /// Lists every tracked job as JSON.
 pub const JOBS_PATH: &str = "/jobs";
+
+/// Browser client served by the leader at the root path.
+pub const WEB_CLIENT_PATH: &str = "/";
 
 /// Optional top-level request field naming the conversation; never forwarded upstream.
 pub const CONVERSATION_ID_FIELD: &str = "conversation_id";
@@ -103,6 +106,7 @@ pub async fn serve_api(
         upstream_url: format!("http://{}{CHAT_COMPLETIONS_PATH}", config.upstream),
     });
     let router = Router::new()
+        .route(WEB_CLIENT_PATH, get(web_client))
         .route(CHAT_COMPLETIONS_PATH, post(chat_completions))
         .route(JOBS_PATH, get(list_jobs))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
@@ -118,6 +122,10 @@ pub async fn serve_api(
         .with_graceful_shutdown(shutdown)
         .await
         .context("api server failed")
+}
+
+async fn web_client() -> Html<&'static str> {
+    Html(include_str!("../web/index.html"))
 }
 
 /// Client used by `llm-cluster prompt`: sends one user message as a non-streaming chat request
@@ -218,10 +226,21 @@ fn message_text(reply: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
+fn buffered_response_text(body: &[u8]) -> Result<String, String> {
+    let reply: Value = serde_json::from_slice(body)
+        .map_err(|error| format!("upstream reply is not valid JSON: {error}"))?;
+    message_text(&reply)
+        .map(str::to_owned)
+        .ok_or_else(|| format!("upstream reply has no string at {MESSAGE_CONTENT_POINTER}"))
+}
+
 /// Marks the job failed and answers with an OpenAI-style error body.
 fn fail_job(permit: JobPermit, status: StatusCode, reason: String) -> Response {
     warn!(request_id = permit.request_id(), %reason, "job failed");
-    let response = error_response(status, &reason);
+    let mut response = error_response(status, &reason);
+    if let Ok(request_id) = HeaderValue::from_str(permit.request_id()) {
+        response.headers_mut().insert(REQUEST_ID_HEADER, request_id);
+    }
     permit.fail(reason);
     response
 }
@@ -283,10 +302,10 @@ async fn relay_buffered(upstream: reqwest::Response, finish: JobFinish) -> Respo
             return fail_job(finish.permit, StatusCode::BAD_GATEWAY, reason);
         }
     };
-    let response_text = serde_json::from_slice::<Value>(&body)
-        .ok()
-        .and_then(|reply| message_text(&reply).map(str::to_owned))
-        .unwrap_or_default();
+    let response_text = match buffered_response_text(&body) {
+        Ok(text) => text,
+        Err(reason) => return fail_job(finish.permit, StatusCode::BAD_GATEWAY, reason),
+    };
     let request_id = &finish.turn.request_id;
     let response = relay_response(status, content_type, request_id, Body::from(body));
     finish.complete(response_text);
@@ -564,6 +583,16 @@ mod tests {
         assert!(parse_chat_request(b"not json").is_err());
         assert!(parse_chat_request(b"[1, 2]").is_err());
         assert!(parse_chat_request(br#"{"conversation_id": 7}"#).is_err());
+    }
+
+    #[test]
+    fn buffered_reply_requires_json_assistant_text() {
+        assert_eq!(
+            buffered_response_text(br#"{"choices":[{"message":{"content":"hello"}}]}"#).as_deref(),
+            Ok("hello")
+        );
+        assert!(buffered_response_text(b"not json").is_err());
+        assert!(buffered_response_text(br#"{"choices":[{"message":{}}]}"#).is_err());
     }
 
     #[test]
