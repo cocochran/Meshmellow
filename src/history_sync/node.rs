@@ -1,7 +1,8 @@
-use crate::history_sync::history::{History, NodeId};
+use crate::history_sync::history::{Epoch, History, NodeId};
 use crate::history_sync::leader::Leader;
 use crate::history_sync::message::{Outgoing, SyncMessage};
 use crate::history_sync::replica::Replica;
+use crate::history_sync::store::{HistoryStore, StoreError};
 use crate::node::PeerTable;
 
 /// A peer's history-sync role. Handles stepping down when a newer leader shows up.
@@ -24,6 +25,62 @@ impl Node {
             Self::Leader(l) => l.history(),
             Self::Replica(r) => r.history(),
         }
+    }
+
+    pub fn epoch(&self) -> Epoch {
+        match self {
+            Self::Leader(l) => l.epoch(),
+            Self::Replica(r) => r.epoch(),
+        }
+    }
+
+    /// Restores a node from disk after a restart. It comes back as a replica: the
+    /// current leader's next message brings it up to date, or an operator promotes it.
+    pub fn from_store(id: NodeId, store: &HistoryStore) -> Self {
+        Self::Replica(Replica::with_history(
+            id,
+            store.epoch(),
+            store.history().clone(),
+        ))
+    }
+
+    /// Saves any new entries and a newer epoch to `store`.
+    ///
+    /// On the main process, call this after recording a job (e.g. `complete_task`) and
+    /// before sending the returned messages, so workers never hold entries the leader lost.
+    pub fn persist(&self, store: &mut HistoryStore) -> Result<(), StoreError> {
+        let history = self.history();
+        if history.len() < store.len() {
+            return store.replace(history, self.epoch());
+        }
+        store.append(history.since(store.len()))?;
+        if self.epoch() > store.epoch() {
+            store.set_epoch(self.epoch())?;
+        }
+        Ok(())
+    }
+
+    /// Like [`Node::handle`], but saves the result to `store` before returning the replies,
+    /// so an `Ack` is only ever sent for entries already on disk.
+    pub fn handle_durable(
+        &mut self,
+        from: NodeId,
+        msg: SyncMessage,
+        store: &mut HistoryStore,
+    ) -> Result<Vec<Outgoing>, StoreError> {
+        let is_snapshot = matches!(msg, SyncMessage::Snapshot { .. });
+        let out = self.handle(from, msg);
+        // An Ack after a Snapshot means it was applied: the history was replaced, not extended.
+        let replaced = is_snapshot
+            && out
+                .iter()
+                .any(|(_, reply)| matches!(reply, SyncMessage::Ack { .. }));
+        if replaced {
+            store.replace(self.history(), self.epoch())?;
+        } else {
+            self.persist(store)?;
+        }
+        Ok(out)
     }
 
     /// Makes the main process sync with exactly the peers in `table`.

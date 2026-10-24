@@ -7,26 +7,36 @@ pub type Epoch = u64;
 /// Number of history entries, i.e. the index of the next entry to be appended.
 pub type Seq = u64;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Role {
-    System,
-    User,
-    Assistant,
-}
-
+/// One event in the conversation log.
+///
+/// A job is committed once its `JobCompleted` is in the log; a `JobStarted` with no
+/// `JobCompleted` after it was interrupted, and its `OutputCommitted` events say how
+/// much of the response was saved.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Entry {
-    pub task_id: u64,
-    pub role: Role,
-    pub content: String,
+#[serde(tag = "type")]
+pub enum Entry {
+    /// A prompt was accepted for inference.
+    JobStarted { request_id: String, prompt: String },
+    /// Part of a job's response, starting at byte `offset` of the full response.
+    OutputCommitted {
+        request_id: String,
+        offset: u64,
+        text: String,
+    },
+    /// The job's response is complete.
+    JobCompleted { request_id: String },
+    /// A failover made `leader` the main process in `epoch`.
+    EpochAdvanced { epoch: Epoch, leader: NodeId },
 }
 
 impl Entry {
-    pub fn new(task_id: u64, role: Role, content: impl Into<String>) -> Self {
-        Self {
-            task_id,
-            role,
-            content: content.into(),
+    /// The request this event belongs to, if it is a job event.
+    pub fn request_id(&self) -> Option<&str> {
+        match self {
+            Self::JobStarted { request_id, .. }
+            | Self::OutputCommitted { request_id, .. }
+            | Self::JobCompleted { request_id } => Some(request_id),
+            Self::EpochAdvanced { .. } => None,
         }
     }
 }

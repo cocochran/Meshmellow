@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use clap::{Parser, Subcommand};
 use iroh::Endpoint;
+use llm_cluster::history_sync::store::{self, HistoryStore, JobStatus};
 use llm_cluster::network::{self, SharedPeerTable};
 use llm_cluster::node::PeerTable;
 use llm_cluster::protocol::{CONTROL_ALPN, RPC_BRIDGE_ALPN};
@@ -84,6 +85,31 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:50052")]
         listen: SocketAddr,
     },
+    /// Read a conversation's history stored on this machine.
+    History {
+        #[command(subcommand)]
+        command: HistoryCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum HistoryCommand {
+    /// Print the stored conversation as versioned JSON, for recovery tools.
+    Export {
+        /// Conversation ID the history is stored under.
+        conversation: String,
+        /// Directory holding the node's stored history.
+        #[arg(long, default_value = store::DEFAULT_DATA_DIR)]
+        data_dir: PathBuf,
+    },
+    /// Print a short human-readable summary of the stored conversation.
+    Inspect {
+        /// Conversation ID the history is stored under.
+        conversation: String,
+        /// Directory holding the node's stored history.
+        #[arg(long, default_value = store::DEFAULT_DATA_DIR)]
+        data_dir: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -122,7 +148,43 @@ async fn main() -> anyhow::Result<()> {
             ref node_id,
             listen,
         } => bridge_connect(&cli.key, node_id, listen).await,
+        Command::History { command } => history(command),
     }
+}
+
+fn history(command: HistoryCommand) -> anyhow::Result<()> {
+    match command {
+        HistoryCommand::Export {
+            conversation,
+            data_dir,
+        } => {
+            let stored = HistoryStore::load(&data_dir, &conversation)?;
+            println!("{}", serde_json::to_string_pretty(&stored.export())?);
+        }
+        HistoryCommand::Inspect {
+            conversation,
+            data_dir,
+        } => {
+            let stored = HistoryStore::load(&data_dir, &conversation)?;
+            let export = stored.export();
+            println!("conversation: {}", export.conversation_id);
+            println!("cluster:      {}", export.cluster_id);
+            println!("model:        {}", export.model.model_hash);
+            println!("epoch:        {}", export.epoch);
+            println!("entries:      {}", export.committed_len);
+            for job in &export.jobs {
+                let status = match job.status {
+                    JobStatus::Completed => "completed",
+                    JobStatus::Interrupted => "INTERRUPTED",
+                };
+                println!(
+                    "  {} {status}, {} output bytes committed",
+                    job.request_id, job.committed_output_offset
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Sends logs to stderr so stdout carries only intentional CLI output such as the node ID.

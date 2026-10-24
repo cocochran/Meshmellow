@@ -149,10 +149,16 @@ impl Cluster {
     }
 
     /// Runs a task on the given leader and queues its sync messages.
-    pub fn complete_task(&mut self, leader: NodeId, task_id: u64, prompt: &str, response: &str) {
+    pub fn complete_task(
+        &mut self,
+        leader: NodeId,
+        request_id: &str,
+        prompt: &str,
+        response: &str,
+    ) {
         let out = self
             .leader_mut(leader)
-            .complete_task(task_id, prompt, response);
+            .complete_task(request_id, prompt, response);
         self.send(leader, out);
     }
 

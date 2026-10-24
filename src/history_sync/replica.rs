@@ -1,5 +1,5 @@
 use crate::history_sync::election::Candidate;
-use crate::history_sync::history::{Epoch, History, NodeId, Seq};
+use crate::history_sync::history::{Entry, Epoch, History, NodeId, Seq};
 use crate::history_sync::leader::Leader;
 use crate::history_sync::message::SyncMessage;
 
@@ -129,6 +129,11 @@ impl Replica {
     /// Becomes the new main process after failover, seeded from this replica's history.
     pub fn promote(self, new_epoch: Epoch, peers: impl IntoIterator<Item = NodeId>) -> Leader {
         assert!(new_epoch > self.epoch, "a new leader needs a newer epoch");
-        Leader::new(self.id, new_epoch, self.history, peers)
+        let mut history = self.history;
+        history.extend([Entry::EpochAdvanced {
+            epoch: new_epoch,
+            leader: self.id,
+        }]);
+        Leader::new(self.id, new_epoch, history, peers)
     }
 }

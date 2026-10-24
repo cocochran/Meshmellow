@@ -17,7 +17,12 @@ fn main() {
             cluster.drop_next_to(last, 1);
             println!("  (dropping the next message to node {})", n - 1);
         }
-        cluster.complete_task(first, t, &format!("prompt {t}"), &format!("response {t}"));
+        cluster.complete_task(
+            first,
+            &format!("job-{t}"),
+            &format!("prompt {t}"),
+            &format!("response {t}"),
+        );
         cluster.run();
         report(&cluster, &format!("after task {t}"));
     }
@@ -38,13 +43,13 @@ fn main() {
     );
     report(&cluster, "after failover");
 
-    cluster.complete_task(elected.id, 3, "prompt 3", "response 3");
+    cluster.complete_task(elected.id, "job-3", "prompt 3", "response 3");
     cluster.run();
     report(&cluster, "after task 3");
 
     println!("\nNode 0 returns with a stale view and tries to run a task.");
     cluster.reconnect(first);
-    cluster.complete_task(first, 99, "stale", "stale");
+    cluster.complete_task(first, "stale", "stale", "stale");
     cluster.run();
     cluster.rejoin(first);
     cluster.run();

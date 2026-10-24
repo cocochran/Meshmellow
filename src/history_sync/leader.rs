@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::history_sync::history::{Entry, Epoch, History, NodeId, Role, Seq};
+use crate::history_sync::history::{Entry, Epoch, History, NodeId, Seq};
 use crate::history_sync::message::{Outgoing, SyncMessage};
 
 /// Per-peer replication state tracked by the main process.
@@ -106,14 +106,43 @@ impl Leader {
         self.history.extend(entries);
     }
 
-    /// Records a completed task (prompt and response) and returns the sync
-    /// messages to send to all workers.
-    pub fn complete_task(&mut self, task_id: u64, prompt: &str, response: &str) -> Vec<Outgoing> {
+    /// Records that a prompt was accepted and returns the sync messages for all workers.
+    ///
+    /// Syncing the start lets a successor see the job as interrupted if this
+    /// process dies before the response completes.
+    pub fn start_job(&mut self, request_id: &str, prompt: &str) -> Vec<Outgoing> {
+        self.append([Entry::JobStarted {
+            request_id: request_id.to_owned(),
+            prompt: prompt.to_owned(),
+        }]);
+        self.sync()
+    }
+
+    /// Records a started job's full response and returns the sync messages for all workers.
+    pub fn complete_job(&mut self, request_id: &str, response: &str) -> Vec<Outgoing> {
         self.append([
-            Entry::new(task_id, Role::User, prompt),
-            Entry::new(task_id, Role::Assistant, response),
+            Entry::OutputCommitted {
+                request_id: request_id.to_owned(),
+                offset: 0,
+                text: response.to_owned(),
+            },
+            Entry::JobCompleted {
+                request_id: request_id.to_owned(),
+            },
         ]);
         self.sync()
+    }
+
+    /// Records a whole job (prompt and response) at once and returns the sync
+    /// messages for all workers.
+    pub fn complete_task(
+        &mut self,
+        request_id: &str,
+        prompt: &str,
+        response: &str,
+    ) -> Vec<Outgoing> {
+        self.start_job(request_id, prompt);
+        self.complete_job(request_id, response)
     }
 
     /// Messages that bring every peer up to date. Peers already up to date are skipped.

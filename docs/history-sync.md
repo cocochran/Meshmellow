@@ -14,10 +14,11 @@ Prototype of conversation-history synchronization for MeshThing. This file docum
 6. [`replica.rs` — worker side](#6-replicars--worker-side)
 7. [`election.rs` — failover choice](#7-electionrs--failover-choice)
 8. [`node.rs` — role switching](#8-noders--role-switching)
-9. [`sim.rs` — in-memory cluster](#9-simrs--in-memory-cluster)
-10. [`examples/history_sync.rs` — demo binary](#10-exampleshistory_syncrs--demo-binary)
-11. [Tests](#11-tests)
-12. [Cross-cutting future work](#12-cross-cutting-future-work)
+9. [`store.rs` — durable storage and export](#9-storers--durable-storage-and-export)
+10. [`sim.rs` — in-memory cluster](#10-simrs--in-memory-cluster)
+11. [`examples/history_sync.rs` — demo binary](#11-exampleshistory_syncrs--demo-binary)
+12. [Tests](#12-tests)
+13. [Cross-cutting future work](#13-cross-cutting-future-work)
 
 ---
 
@@ -43,15 +44,17 @@ The README requires that after every completed task the main process sends the c
 ### Module map
 
 ```text
-history.rs   Entry, Role, History, NodeId/Epoch/Seq aliases
+history.rs   Entry (job events), History, NodeId/Epoch/Seq
 message.rs   SyncMessage (wire format), Outgoing
 leader.rs    Leader — main-process sync logic
 replica.rs   Replica — worker sync logic + promote()
 election.rs  Candidate, Elected, elect()
 node.rs      Node — Leader|Replica with automatic step-down
+store.rs     HistoryStore — on-disk log + snapshot, ConversationExport
 sim.rs       Cluster — in-memory network for tests and the demo
 examples/history_sync.rs  Demo binary
-tests/history_sync.rs     Integration tests
+tests/history_sync.rs     Sync integration tests
+tests/history_store.rs    Storage and export tests
 ```
 
 ---
@@ -102,29 +105,26 @@ pub type Seq    = u64;
 - Consider **newtypes** (`struct Epoch(u64)`) once the crate stabilises, so an epoch can't be passed where a length is expected.
 - The architecture doc's event log uses `(term, index)` — that's `(Epoch, Seq)` under different names. Keep them aligned if the shared protocol crate adopts that naming.
 
-### `enum Role { System, User, Assistant }`
+### `enum Entry` — job events
 
-Who authored an entry. **Why:** These are the standard chat-template roles the LLM runtime (llama.cpp) expects when rebuilding the prompt, so a new leader can re-prefill straight from history.
+One event in the conversation log (architecture §9), serialized with a `"type"` tag:
 
-#### As the project evolves
-- May need `Tool` or other roles if the chat template grows.
-- If entries become general events (see `Entry`), `Role` moves inside a `ChatTurn` event variant rather than being on every entry.
-
-### `struct Entry { task_id, role, content }`
-
-One message in the conversation.
-
-| Function | Purpose |
+| Variant | Records |
 |---|---|
-| `Entry::new(task_id, role, content)` | Convenience constructor; `content: impl Into<String>` accepts `&str` or `String`. |
+| `JobStarted { request_id, prompt }` | A prompt was accepted |
+| `OutputCommitted { request_id, offset, text }` | Part of the response, starting at byte `offset` |
+| `JobCompleted { request_id }` | The response is complete |
+| `EpochAdvanced { epoch, leader }` | A failover made `leader` the main process |
 
-**Why:** `task_id` groups the prompt and response of one job, so recovery can tell which task an entry belongs to and re-run an interrupted one. `content` is plain text because that's what's needed to rebuild the prompt; the architecture doc says the KV cache is rebuilt by re-prefilling, not replicated.
+`Entry::request_id()` returns the job an event belongs to.
+
+**Why events instead of chat turns:** a job with `JobStarted` but no `JobCompleted` was interrupted, which is what recovery (M-16) needs to see. `request_id` is a `String` to match `protocol::Prompt.request_id`. Text, not KV cache, is stored: a new leader re-prefills from it.
 
 #### As the project evolves
-- **Generalize to the event log in architecture §9:** `JobQueued`, `JobStarted`, `ResponseChunkCommitted{request_id, offset, token_ids}`, `JobCompleted`, `PlacementCommitted`, `LeaderEpochAdvanced`, … Likely `enum Event` replaces `Entry`; the replication logic doesn't care what an entry contains.
-- Add **`conversation_id`** — Yash's P2P `History` message is keyed by it, and one mesh may host several conversations.
-- **`task_id: u64` → request UUID** to match the doc's job schema (`request_id`).
-- Storing **token IDs** as well as text would allow exact replay and deduplication of streamed chunks.
+- Commit output in chunks during generation (`Leader::complete_job` writes one chunk at the end today).
+- Add **`conversation_id`** and more architecture §9 events (`JobQueued`, `PlacementCommitted`) as the job queue and placement land.
+- Store **token IDs** as well as text for exact replay and deduplication.
+- Chat roles (system prompt, tools) would go in the model manifest or new variants.
 
 ### `struct History`
 
@@ -143,7 +143,7 @@ Append-only list of entries; the LLM context.
 **Why a wrapper instead of a bare `Vec<Entry>`:** It enforces append-only at the type level (no `remove`, no `insert`), and gives one place to later add hashing, persistence, or compaction without touching the protocol code.
 
 #### As the project evolves
-- **Persistence (the "history storage" task):** back `History` with an on-disk append-only log (e.g. one length-prefixed record per entry) plus periodic snapshots, reloaded at startup. The architecture checklist requires conversation state to survive a leader restart.
+- **Persistence** is done by `HistoryStore` (§9), which mirrors a `History` to disk; `History` itself stays a plain in-memory type.
 - **Hash chain:** store a running hash so `Append` can carry `prev_hash` (architecture §14 `STATE_APPEND`) and replicas can detect divergence directly, rather than relying only on epochs.
 - **Size:** full history in memory grows forever (README open question). Options: snapshot + truncate, keep only the last *N* turns in memory, or page from disk.
 - Encryption at rest (architecture §12.3): every node holds the full chat.
@@ -228,7 +228,9 @@ Fields: `id`, `epoch`, `history`, `peers: BTreeMap<NodeId, PeerState>`, `deposed
 | `remove_peer(id)` | Stops syncing to a peer. | Called by membership/heartbeat when a node leaves. |
 | `up_to_date_peers()` | Peers holding the full current history. | The basis for a future commit/quorum check and status display. |
 | `append(entries)` | Adds entries without sending. | Separated from sending so several entries can be batched, and so it's testable. |
-| `complete_task(task_id, prompt, response)` | Appends user + assistant entries and returns sync messages. | Implements the README rule "after every completed task, send history to all workers" in one call. |
+| `start_job(request_id, prompt)` | Appends `JobStarted` and returns sync messages. | Syncing the start lets a successor see the job as interrupted if this process dies mid-generation. |
+| `complete_job(request_id, response)` | Appends `OutputCommitted` + `JobCompleted` and returns sync messages. | Implements the README rule "after every completed task, send history to all workers". |
+| `complete_task(request_id, prompt, response)` | Both of the above in one call. | Convenience for tests and the simulator. |
 | `sync()` | Messages that bring every lagging peer up to date. | **The single retransmit mechanism:** it's stateless with respect to what was previously sent, so calling it again after packet loss resends exactly what's missing. Returns nothing once deposed. |
 | `message_for(state)` (private) | Picks snapshot, append from *n*, or nothing. | Keeps the decision in one place. |
 | `snapshot()` (private) | Builds a full-history `Snapshot`. | Shared by `sync` and `Resync` handling. |
@@ -244,7 +246,7 @@ Fields: `id`, `epoch`, `history`, `peers: BTreeMap<NodeId, PeerState>`, `deposed
 #### As the project evolves
 - **Quorum commit (open decision B):** use the ack table to compute a commit index (the highest `Seq` acked by a majority of voters), and only report a task as durably saved once it's committed. Needed for the "strict no-loss" policy in architecture §9.
 - **Snapshot cost:** after failover, every peer gets a full snapshot. Once `prev_hash` exists, a replica whose prefix matches could get an append instead.
-- **Streaming chunks:** `complete_task` only syncs at task end. The architecture doc suggests committing response chunks during generation so less is lost on failure.
+- **Streaming chunks:** `complete_job` commits the whole response at once. The architecture doc suggests committing response chunks during generation so less is lost on failure.
 - **Membership:** `Leader::set_peers` (or `Node::set_peers(&PeerTable)`) replaces the peer list from the `PeerTable`, keeping existing peers' progress. Incoming connections leave the table when they close; dialed connections must call `network::forget_peer` themselves. Nothing calls `set_peers` on a live node yet, because there's no control loop.
 - **Job queue:** the leader is also meant to own the FIFO job queue (§10); its state changes would ride this same log.
 
@@ -265,7 +267,7 @@ Fields: `id`, `epoch`, `leader: Option<NodeId>`, `history`, `in_sync_epoch: bool
 | `id()`, `epoch()`, `leader()`, `history()`, `len()`, `is_empty()` | Accessors. | `epoch` and `len` feed `Candidate` for elections. |
 | `handle(msg) -> Option<SyncMessage>` | Applies a leader message and returns the reply. | See the rules below. |
 | `ack()` (private) | Builds `Ack{epoch, len}`. | Shared reply after any successful apply. |
-| `promote(self, new_epoch, peers) -> Leader` | Becomes the main process after failover. | **Consumes** the replica so the old role can't still be in use. Asserts that `new_epoch` is newer, because reusing an epoch would break fencing. The history moves into the leader without copying. |
+| `promote(self, new_epoch, peers) -> Leader` | Becomes the main process after failover. | **Consumes** the replica so the old role can't still be in use. Asserts that `new_epoch` is newer, because reusing an epoch would break fencing. Appends `EpochAdvanced` so the log records the takeover. |
 
 **`handle` rules and why:**
 1. **Message from an older epoch → `Reject{our epoch}`.** Checked first, before anything else (fencing). Rejects aren't answered, to avoid reject ping-pong.
@@ -341,7 +343,68 @@ A peer's current role.
 
 ---
 
-## 9. `sim.rs` — in-memory cluster
+## 9. `store.rs` — durable storage and export
+
+### On-disk layout
+
+```text
+<data-dir>/history/<conversation_id>/
+├── meta.json       StoreMeta: format version, conversation/cluster ID, ModelManifest, epoch
+├── snapshot.json   { generation, entries[] } — the first entries of the history
+└── log.jsonl       { generation, index, entry } per entry after the snapshot
+```
+
+**Why:** JSON is readable by people and by David's Python harness. `meta.json` and `snapshot.json` are replaced atomically (write a temporary file, flush, rename). The log is append-only and flushed before `append` returns.
+
+**Crash safety:** a crash at any point leaves a loadable prefix of the history.
+- A torn last log line (no newline) is dropped and cut from the file.
+- Log lines the snapshot already covers (`index < snapshot length`) are skipped, so a crash between writing a snapshot and truncating the log can't duplicate entries.
+- `replace` writes the new snapshot under a new `generation` before truncating the log, so leftover lines from the old history are ignored.
+
+### `struct HistoryStore`
+
+| Function | Purpose |
+|---|---|
+| `open(data_dir, meta)` | Opens a conversation, creating it if absent. An existing one must have the same cluster ID and model hash, or `StoreError::Mismatch`. |
+| `load(data_dir, conversation_id)` | Opens an existing conversation only (`NotFound` otherwise); used by the CLI. |
+| `append(entries)` | Adds entries; on disk when it returns. Every `SNAPSHOT_EVERY` (100) log entries, the log is folded into the snapshot. |
+| `replace(history, epoch)` | Swaps in a whole new history, e.g. a snapshot from a new leader. |
+| `set_epoch(epoch)` | Records a newer leadership epoch in `meta.json`. |
+| `export()` | Returns a `ConversationExport`. |
+| `history()`, `epoch()`, `len()`, `meta()`, `dir()` | Accessors. |
+
+Conversation IDs become directory names, so only 1–128 letters, digits, `-`, `_`, `.` are accepted (not `.` or `..`).
+
+### Hooking the store into sync (`node.rs`)
+
+| Function | Use |
+|---|---|
+| `Node::from_store(id, &store)` | After a restart: the node comes back as a replica with its saved history and epoch. |
+| `Node::persist(&mut store)` | On the main process, after `start_job` / `complete_job` / `complete_task` and **before** sending their messages. |
+| `Node::handle_durable(from, msg, &mut store)` | Instead of `handle` on a worker: saves the result before returning replies, so an `Ack` only covers entries already on disk. |
+
+### `ConversationExport` and `JobState`
+
+Versioned JSON for recovery tools: `format_version`, `conversation_id`, `cluster_id`, `model` (`model_hash` + `generation` settings), `epoch`, `committed_len` (the log boundary), `jobs`, `entries`. Each `JobState` has `request_id`, `prompt`, `status` (`completed` / `interrupted`), `committed_output` and `committed_output_offset` (bytes). Output chunks are only joined when they line up end to end.
+
+"Committed" means on this node's disk. It does not yet mean a majority of nodes.
+
+### CLI
+
+```text
+llm-cluster history export  <conversation> [--data-dir meshthing-data]   # JSON to stdout
+llm-cluster history inspect <conversation> [--data-dir meshthing-data]   # summary, interrupted jobs flagged
+```
+
+#### As the project evolves
+- **Restore:** a command and API that start a leader from an export (manual takeover).
+- **Quorum commit:** mark entries committed only once a majority has acked them; the export format can carry that boundary in `committed_len`.
+- **Size:** postcard instead of JSON, and chunked snapshots for long conversations.
+- **Encryption at rest** (architecture §12.3): every node holds the full chat.
+
+---
+
+## 10. `sim.rs` — in-memory cluster
 
 ### `struct Envelope` (private)
 
@@ -379,7 +442,7 @@ Fields: `nodes`, a FIFO `queue`, an `offline` set, `drop_next` counts per node, 
 
 ---
 
-## 10. `examples/history_sync.rs` — demo binary
+## 11. `examples/history_sync.rs` — demo binary
 
 `cargo run --example history_sync -- <nodes>` (default 5, minimum 2) runs this scenario on a simulated mesh:
 
@@ -403,7 +466,7 @@ Replace or supplement it with a real CLI once Iroh integration lands, e.g. a `me
 
 ---
 
-## 11. Tests
+## 12. Tests
 
 `tests/history_sync.rs` — integration tests against the public API:
 
@@ -427,15 +490,15 @@ Replace or supplement it with a real CLI once Iroh integration lands, e.g. a `me
 
 ---
 
-## 12. Cross-cutting future work
+## 13. Cross-cutting future work
 
 Prioritized list of changes not tied to a single item:
 
-1. **Connection-time ranking in `elect`** — add `connected_at_unix_ms` as a tie-breaker (see §7).
-2. **Persistence — the "history storage" task:** an on-disk log plus snapshots, loaded at startup, and an export interface for David's recovery tests (M-16).
+1. **Control loop:** read `History` frames off control streams into `Node::handle_durable`, call `Node::persist` after leader actions, and implement Yash's `HistorySink` on top of `Leader::start_job` / `complete_job`.
+2. **Restore from export:** start a new leader from a `ConversationExport` for manual takeover (M-16).
 3. **Iroh integration:** carry `to_bytes()` inside Yash's `History { conversation_id, payload }` message; later move to postcard and possibly a dedicated state stream.
 4. **Protocol fields:** `conversation_id`, `cluster_id`, `prev_hash`, protocol version.
-5. **Event-log entries** in place of chat turns (architecture §9).
+5. **Output chunks during generation** instead of one chunk at completion.
 6. **Commit policy (open decision B):** best-effort replication (current) or majority commit.
 7. **Election:** manual takeover for 2 nodes (agreed with David's bot); real consensus once there are 3+ voters; connection time and reliability as a preference.
 8. **Membership:** call `Node::set_peers(&PeerTable)` whenever the peer table changes, once a control loop exists; add heartbeat timeouts so a silent peer is removed too.

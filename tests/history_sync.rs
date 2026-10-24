@@ -1,5 +1,5 @@
 use llm_cluster::history_sync::election::{Candidate, elect};
-use llm_cluster::history_sync::history::{Entry, NodeId, Role};
+use llm_cluster::history_sync::history::{Entry, NodeId};
 use llm_cluster::history_sync::leader::Leader;
 use llm_cluster::history_sync::message::SyncMessage;
 use llm_cluster::history_sync::node::Node;
@@ -10,7 +10,12 @@ use llm_cluster::protocol::{Hello, PROTOCOL_VERSION};
 
 fn run_tasks(cluster: &mut Cluster, leader: NodeId, tasks: std::ops::Range<u64>) {
     for t in tasks {
-        cluster.complete_task(leader, t, &format!("prompt {t}"), &format!("response {t}"));
+        cluster.complete_task(
+            leader,
+            &format!("job-{t}"),
+            &format!("prompt {t}"),
+            &format!("response {t}"),
+        );
         cluster.run();
     }
 }
@@ -30,7 +35,8 @@ fn syncs_any_number_of_nodes() {
         let mut cluster = Cluster::new(n);
         run_tasks(&mut cluster, id(0), 0..5);
         assert!(cluster.converged(), "{n} nodes did not converge");
-        assert_eq!(cluster.node(id(0)).history().len(), 10);
+        // Three events per job: started, output, completed.
+        assert_eq!(cluster.node(id(0)).history().len(), 15);
     }
 }
 
@@ -39,7 +45,7 @@ fn sends_deltas_after_first_snapshot() {
     let mut leader = Leader::new(id(0), 1, Default::default(), [id(1)]);
     let mut replica = Replica::new(id(1));
 
-    let out = leader.complete_task(0, "a", "b");
+    let out = leader.complete_task("job-0", "a", "b");
     assert!(matches!(out[0].1, SyncMessage::Snapshot { .. }));
     let ack = replica.handle(out[0].1.clone()).unwrap();
     leader.handle(id(1), ack);
@@ -48,11 +54,11 @@ fn sends_deltas_after_first_snapshot() {
         "up-to-date peer should get nothing"
     );
 
-    let out = leader.complete_task(1, "c", "d");
+    let out = leader.complete_task("job-1", "c", "d");
     match &out[0].1 {
         SyncMessage::Append { start, entries, .. } => {
-            assert_eq!(*start, 2);
-            assert_eq!(entries.len(), 2);
+            assert_eq!(*start, 3);
+            assert_eq!(entries.len(), 3);
         }
         other => panic!("expected append, got {other:?}"),
     }
@@ -65,7 +71,7 @@ fn duplicate_appends_are_idempotent() {
     let snap = leader.sync().remove(0).1;
     leader.handle(id(1), replica.handle(snap).unwrap());
 
-    let append = leader.complete_task(0, "a", "b").remove(0).1;
+    let append = leader.complete_task("job-0", "a", "b").remove(0).1;
     replica.handle(append.clone());
     replica.handle(append);
     assert_eq!(replica.history(), leader.history());
@@ -91,10 +97,13 @@ fn gap_triggers_snapshot() {
     let mut replica = Replica::new(id(1));
     leader.handle(id(1), replica.handle(leader.sync().remove(0).1).unwrap());
 
-    leader.complete_task(0, "lost", "lost"); // never delivered
+    leader.complete_task("lost", "lost", "lost"); // never delivered
     // Pretend the peer acked further than it really did, so the next append has a gap.
-    leader.handle(id(1), SyncMessage::Ack { epoch: 1, len: 2 });
-    leader.append([Entry::new(1, Role::User, "next")]);
+    leader.handle(id(1), SyncMessage::Ack { epoch: 1, len: 3 });
+    leader.append([Entry::JobStarted {
+        request_id: "next".to_owned(),
+        prompt: "next".to_owned(),
+    }]);
     let append = leader.sync().remove(0).1;
     let reply = replica.handle(append).unwrap();
     assert!(matches!(reply, SyncMessage::Resync { .. }));
@@ -117,11 +126,16 @@ fn failover_continues_session_from_replica_history() {
     assert_eq!(elected.id, id(1));
     cluster.run();
     assert!(cluster.converged());
-    assert_eq!(cluster.node(elected.id).history().len(), 6);
+    // Nine job events plus the EpochAdvanced the new leader records.
+    assert_eq!(cluster.node(elected.id).history().len(), 10);
+    assert!(matches!(
+        cluster.node(elected.id).history().entries().last(),
+        Some(Entry::EpochAdvanced { epoch: 2, leader }) if *leader == id(1)
+    ));
 
     run_tasks(&mut cluster, elected.id, 3..5);
     assert!(cluster.converged());
-    assert_eq!(cluster.node(elected.id).history().len(), 10);
+    assert_eq!(cluster.node(elected.id).history().len(), 16);
 }
 
 #[test]
@@ -138,7 +152,7 @@ fn election_prefers_most_complete_history() {
     assert_eq!(elected.id, id(3));
     cluster.run();
     assert!(cluster.converged());
-    assert_eq!(cluster.node(id(1)).history().len(), 6);
+    assert_eq!(cluster.node(id(1)).history().len(), 10);
 }
 
 #[test]
@@ -152,7 +166,7 @@ fn returning_stale_leader_is_rejected_and_resynced() {
 
     // Old main process comes back unaware and runs a task of its own.
     cluster.reconnect(id(0));
-    cluster.complete_task(id(0), 99, "stale", "stale");
+    cluster.complete_task(id(0), "stale", "stale", "stale");
     cluster.run();
     assert!(
         matches!(cluster.node(id(0)), Node::Replica(_)),
@@ -170,7 +184,7 @@ fn returning_stale_leader_is_rejected_and_resynced() {
             .history()
             .entries()
             .iter()
-            .all(|e| e.task_id != 99)
+            .all(|e| e.request_id() != Some("stale"))
     );
 }
 
@@ -183,12 +197,12 @@ fn disconnected_peer_stops_syncing_and_catches_up_on_rejoin() {
     let peers: Vec<NodeId> = cluster.leader_mut(id(0)).peers().collect();
     assert_eq!(peers, vec![id(1)]);
     run_tasks(&mut cluster, id(0), 1..3);
-    assert_eq!(cluster.node(id(2)).history().len(), 2);
+    assert_eq!(cluster.node(id(2)).history().len(), 3);
 
     cluster.rejoin(id(2));
     cluster.run();
     assert!(cluster.converged());
-    assert_eq!(cluster.node(id(2)).history().len(), 6);
+    assert_eq!(cluster.node(id(2)).history().len(), 9);
 }
 
 #[test]
@@ -247,7 +261,7 @@ fn election_is_deterministic() {
 #[test]
 fn messages_round_trip_through_wire_format() {
     let mut leader = Leader::new(id(7), 3, Default::default(), [id(1), id(2)]);
-    for (_, msg) in leader.complete_task(0, "hello", "world") {
+    for (_, msg) in leader.complete_task("job-0", "hello", "world") {
         assert_eq!(SyncMessage::from_bytes(&msg.to_bytes()).unwrap(), msg);
     }
 }
