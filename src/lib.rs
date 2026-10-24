@@ -2,5 +2,8 @@
 
 pub mod network;
 pub mod node;
+pub mod placement;
 pub mod protocol;
 pub mod rpc_bridge;
+pub mod rpc_plan;
+pub mod verification;

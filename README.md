@@ -46,3 +46,13 @@ Because history is synced after each task, at most the in-progress task is lost 
 ## Status
  
 Early development.
+
+The compute placement library selects contiguous model blocks using explicit
+contribution budgets and measured compute/link costs. It can require multiple
+contributors, produce advisory llama.cpp RPC arguments, and validate collected
+runtime evidence against the selected peers and budgets. See
+[compute placement](docs/compute-placement.md) and the
+[live validation plan](docs/live-validation-plan.md).
+
+Run `cargo run --example placement` for a synthetic plan. Live profile collection,
+launch supervision and memory-cap enforcement still require integration.
