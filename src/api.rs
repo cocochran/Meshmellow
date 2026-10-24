@@ -19,7 +19,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderName, HeaderValue, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::{Stream, StreamExt, stream};
@@ -35,6 +35,9 @@ pub const CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
 
 /// Lists every tracked job as JSON.
 pub const JOBS_PATH: &str = "/jobs";
+
+/// Browser client served by the leader at the root path.
+pub const WEB_CLIENT_PATH: &str = "/";
 
 /// Optional top-level request field naming the conversation; never forwarded upstream.
 pub const CONVERSATION_ID_FIELD: &str = "conversation_id";
@@ -103,6 +106,7 @@ pub async fn serve_api(
         upstream_url: format!("http://{}{CHAT_COMPLETIONS_PATH}", config.upstream),
     });
     let router = Router::new()
+        .route(WEB_CLIENT_PATH, get(web_client))
         .route(CHAT_COMPLETIONS_PATH, post(chat_completions))
         .route(JOBS_PATH, get(list_jobs))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
@@ -118,6 +122,10 @@ pub async fn serve_api(
         .with_graceful_shutdown(shutdown)
         .await
         .context("api server failed")
+}
+
+async fn web_client() -> Html<&'static str> {
+    Html(include_str!("../web/index.html"))
 }
 
 /// Client used by `llm-cluster prompt`: sends one user message as a non-streaming chat request

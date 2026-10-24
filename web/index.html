@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>MeshThing</title>
+  <style>
+    :root { color-scheme: dark; font: 16px/1.5 ui-sans-serif, system-ui, sans-serif; background: #101216; color: #eceef3; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; }
+    button, textarea { font: inherit; }
+    .shell { width: min(1100px, 100%); min-height: 100vh; margin: auto; padding: 24px; display: grid; grid-template-rows: auto 1fr; gap: 20px; }
+    header { display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #292d36; padding: 2px 0 18px; }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .mark { width: 38px; height: 38px; display: grid; place-items: center; border-radius: 12px; background: #9ce6c1; color: #15231c; font-weight: 900; }
+    h1, h2, p { margin: 0; }
+    h1 { font-size: 1.1rem; letter-spacing: .02em; }
+    .subtle, .status, .job-meta { color: #9ba3b2; font-size: .86rem; }
+    .status { display: flex; align-items: center; gap: 8px; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #8f98a8; }
+    .dot.ok { background: #75d9a4; }
+    .layout { min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 270px; gap: 20px; }
+    .chat, aside { border: 1px solid #292d36; border-radius: 16px; background: #171a20; }
+    .chat { min-height: 70vh; display: flex; flex-direction: column; overflow: hidden; }
+    .messages { flex: 1; overflow-y: auto; padding: 24px; display: flex; flex-direction: column; align-items: stretch; gap: 16px; }
+    .welcome { margin: auto; max-width: 440px; text-align: center; color: #aab1bf; }
+    .welcome h2 { margin-bottom: 8px; color: #eceef3; font-size: 1.3rem; }
+    .message { max-width: min(82%, 720px); padding: 12px 16px; border-radius: 14px; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .message.user { align-self: flex-end; background: #263b32; }
+    .message.assistant { align-self: flex-start; background: #222630; }
+    .message.error { color: #ffb4a9; border: 1px solid #71413d; }
+    .composer { border-top: 1px solid #292d36; padding: 16px; display: flex; gap: 12px; align-items: flex-end; }
+    textarea { flex: 1; min-height: 54px; max-height: 180px; resize: vertical; padding: 13px 14px; color: inherit; background: #101216; border: 1px solid #363b47; border-radius: 12px; outline: none; }
+    textarea:focus { border-color: #75d9a4; }
+    button { min-height: 48px; padding: 0 18px; border: 0; border-radius: 12px; background: #9ce6c1; color: #15231c; font-weight: 750; cursor: pointer; }
+    button:disabled { opacity: .55; cursor: wait; }
+    aside { padding: 18px; }
+    aside h2 { font-size: 1rem; margin-bottom: 4px; }
+    .jobs { list-style: none; padding: 0; margin: 18px 0 0; display: grid; gap: 10px; }
+    .job { padding: 11px 12px; border-radius: 10px; background: #20232b; }
+    .job-top { display: flex; justify-content: space-between; gap: 8px; font-size: .9rem; }
+    .job-id { color: #aeb6c4; font-family: ui-monospace, monospace; font-size: .76rem; }
+    .empty { margin-top: 18px; color: #858d9b; font-size: .88rem; }
+    @media (max-width: 760px) { .shell { padding: 14px; gap: 14px; } .layout { grid-template-columns: 1fr; } .chat { min-height: 58vh; } aside { order: 2; } .message { max-width: 94%; } }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header>
+      <div class="brand"><div class="mark" aria-hidden="true">M</div><div><h1>MeshThing</h1><p class="subtle">Your local mesh assistant</p></div></div>
+      <div class="status" role="status"><span class="dot" id="health-dot"></span><span id="health-text">Connecting…</span></div>
+    </header>
+    <main class="layout">
+      <section class="chat" aria-label="Chat">
+        <div class="messages" id="messages" aria-live="polite">
+          <div class="welcome" id="welcome"><h2>Ask your mesh</h2><p>Prompts are sent to the leader running on this device. Replies stream in as the model generates them.</p></div>
+        </div>
+        <form class="composer" id="composer">
+          <label for="prompt" class="subtle" style="position:absolute;left:-10000px">Your prompt</label>
+          <textarea id="prompt" rows="2" placeholder="Message MeshThing…" required></textarea>
+          <button id="send" type="submit">Send</button>
+        </form>
+      </section>
+      <aside aria-labelledby="jobs-heading">
+        <h2 id="jobs-heading">Recent jobs</h2>
+        <p class="subtle">Requests handled by this leader</p>
+        <ul class="jobs" id="jobs" aria-live="polite"></ul>
+        <p class="empty" id="jobs-empty">No requests yet.</p>
+      </aside>
+    </main>
+  </div>
+  <script>
+    const messages = document.querySelector("#messages");
+    const welcome = document.querySelector("#welcome");
+    const form = document.querySelector("#composer");
+    const promptBox = document.querySelector("#prompt");
+    const sendButton = document.querySelector("#send");
+    const jobList = document.querySelector("#jobs");
+    const jobsEmpty = document.querySelector("#jobs-empty");
+    const healthDot = document.querySelector("#health-dot");
+    const healthText = document.querySelector("#health-text");
+    const conversationId = crypto.randomUUID();
+    const history = [];
+
+    function addMessage(role, text = "") {
+      welcome?.remove();
+      const bubble = document.createElement("div");
+      bubble.className = `message ${role}`;
+      bubble.textContent = text;
+      messages.append(bubble);
+      messages.scrollTop = messages.scrollHeight;
+      return bubble;
+    }
+
+    async function refreshJobs() {
+      try {
+        const response = await fetch("/jobs", { cache: "no-store" });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const jobs = await response.json();
+        healthDot.classList.add("ok");
+        healthText.textContent = "Leader connected";
+        jobList.replaceChildren();
+        jobsEmpty.hidden = jobs.length !== 0;
+        for (const job of jobs.slice(-12).reverse()) {
+          const item = document.createElement("li");
+          item.className = "job";
+          const top = document.createElement("div");
+          top.className = "job-top";
+          const state = document.createElement("strong");
+          state.textContent = job.status;
+          const time = document.createElement("span");
+          time.className = "job-meta";
+          time.textContent = job.finished_at_unix_ms ? "finished" : "active";
+          top.append(state, time);
+          const id = document.createElement("div");
+          id.className = "job-id";
+          id.textContent = job.request_id.slice(0, 8);
+          item.append(top, id);
+          jobList.append(item);
+        }
+      } catch {
+        healthDot.classList.remove("ok");
+        healthText.textContent = "Leader unavailable";
+      }
+    }
+
+    function consumeEvent(data, target) {
+      if (data === "[DONE]") return true;
+      const event = JSON.parse(data);
+      const text = event.choices?.[0]?.delta?.content;
+      if (typeof text === "string") target.textContent += text;
+      messages.scrollTop = messages.scrollHeight;
+      return false;
+    }
+
+    async function streamReply(response, target) {
+      if (!response.body) throw new Error("The browser could not read the streamed reply.");
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let complete = false;
+      while (true) {
+        const { value, done } = await reader.read();
+        buffer += decoder.decode(value, { stream: !done });
+        const lines = buffer.split(/\r?\n/);
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.startsWith("data:")) continue;
+          if (consumeEvent(line.slice(5).trimStart(), target)) complete = true;
+        }
+        if (done) break;
+      }
+      if (buffer.startsWith("data:") && consumeEvent(buffer.slice(5).trimStart(), target)) complete = true;
+      if (!complete) throw new Error("The reply ended before the stream completed. Please try again.");
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const text = promptBox.value.trim();
+      if (!text || sendButton.disabled) return;
+      history.push({ role: "user", content: text });
+      addMessage("user", text);
+      const reply = addMessage("assistant");
+      promptBox.value = "";
+      sendButton.disabled = true;
+      promptBox.disabled = true;
+      try {
+        const response = await fetch("/v1/chat/completions", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ messages: history, stream: true, conversation_id: conversationId })
+        });
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({}));
+          throw new Error(body.error?.message ?? `Request failed (${response.status}).`);
+        }
+        await streamReply(response, reply);
+        history.push({ role: "assistant", content: reply.textContent });
+      } catch (error) {
+        reply.classList.add("error");
+        reply.textContent = error instanceof Error ? error.message : "Request failed.";
+        history.pop();
+      } finally {
+        sendButton.disabled = false;
+        promptBox.disabled = false;
+        promptBox.focus();
+        refreshJobs();
+      }
+    });
+
+    refreshJobs();
+    setInterval(refreshJobs, 1500);
+  </script>
+</body>
+</html>
