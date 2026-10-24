@@ -15,5 +15,6 @@ pub mod process;
 pub mod protocol;
 pub mod rpc_bridge;
 pub mod rpc_plan;
+pub mod shard;
 pub mod verification;
 pub mod worker;
