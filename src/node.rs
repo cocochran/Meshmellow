@@ -19,6 +19,8 @@ pub struct PeerInfo {
     /// Wall-clock UTC time (Unix ms) of this peer's most recent connection; overwritten on reconnect.
     /// Logging only — never use for leader ordering (architecture §9). Requested by connor-claude-003.
     pub connected_at_unix_ms: u64,
+    /// Unique identifier for this connection, independent of the wall clock.
+    pub connection_token: u64,
     /// Wall-clock UTC time (Unix ms) the latest accepted heartbeat arrived; `None` until one does.
     /// Reset on reconnect. Logging and diagnostics only; liveness tracking is M-11.
     pub last_heartbeat_unix_ms: Option<u64>,
@@ -31,6 +33,7 @@ pub struct PeerInfo {
 #[derive(Debug, Default)]
 pub struct PeerTable {
     peers: HashMap<NodeId, PeerInfo>,
+    next_connection_token: u64,
 }
 
 impl PeerTable {
@@ -52,10 +55,15 @@ impl PeerTable {
         hello: &Hello,
         connected_at_unix_ms: u64,
     ) -> &PeerInfo {
+        self.next_connection_token = self
+            .next_connection_token
+            .checked_add(1)
+            .expect("peer connection token exhausted");
         let info = PeerInfo {
             node_id,
             protocol_version: hello.protocol_version,
             connected_at_unix_ms,
+            connection_token: self.next_connection_token,
             last_heartbeat_unix_ms: None,
             last_heartbeat_sequence: None,
         };
@@ -70,11 +78,11 @@ impl PeerTable {
 
     /// Removes a peer whose connection closed, unless it has reconnected since.
     ///
-    /// `connected_at_unix_ms` identifies the closed connection: if the entry carries a different
-    /// timestamp, a newer connection replaced it and the entry is kept. Returns whether it was removed.
-    pub fn remove_connection(&mut self, node_id: &NodeId, connected_at_unix_ms: u64) -> bool {
+    /// `connection_token` identifies the closed connection even when a reconnect occurs in
+    /// the same millisecond. Returns whether the entry was removed.
+    pub fn remove_connection(&mut self, node_id: &NodeId, connection_token: u64) -> bool {
         match self.peers.entry(*node_id) {
-            Entry::Occupied(entry) if entry.get().connected_at_unix_ms == connected_at_unix_ms => {
+            Entry::Occupied(entry) if entry.get().connection_token == connection_token => {
                 entry.remove();
                 true
             }
@@ -220,8 +228,9 @@ mod tests {
         let a = node(1);
         let mut table = PeerTable::new();
         table.record_connection_at(a, &hello(a), 1_000);
+        let token = table.get(&a).unwrap().connection_token;
 
-        assert!(table.remove_connection(&a, 1_000));
+        assert!(table.remove_connection(&a, token));
         assert!(table.get(&a).is_none());
     }
 
@@ -230,10 +239,23 @@ mod tests {
         let a = node(1);
         let mut table = PeerTable::new();
         table.record_connection_at(a, &hello(a), 1_000);
+        let old_token = table.get(&a).unwrap().connection_token;
         table.record_connection_at(a, &hello(a), 2_000);
 
-        assert!(!table.remove_connection(&a, 1_000));
+        assert!(!table.remove_connection(&a, old_token));
         assert_eq!(table.get(&a).map(|p| p.connected_at_unix_ms), Some(2_000));
+    }
+
+    #[test]
+    fn closing_an_old_connection_in_the_same_millisecond_keeps_the_new_one() {
+        let a = node(1);
+        let mut table = PeerTable::new();
+        let old_token = table.record_connection_at(a, &hello(a), 1_000).connection_token;
+        let new_token = table.record_connection_at(a, &hello(a), 1_000).connection_token;
+
+        assert_ne!(old_token, new_token);
+        assert!(!table.remove_connection(&a, old_token));
+        assert_eq!(table.get(&a).map(|p| p.connection_token), Some(new_token));
     }
 
     #[test]
