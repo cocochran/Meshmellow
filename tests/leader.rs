@@ -13,6 +13,7 @@ use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode};
 use llm_cluster::api;
+use llm_cluster::evidence::EvidenceConfig;
 use llm_cluster::leader::{LeaderConfig, run_leader_on};
 use llm_cluster::planning::{self, PlanningRequest};
 use llm_cluster::protocol::{CONTROL_ALPN, RPC_BRIDGE_ALPN};
@@ -33,7 +34,17 @@ const LOOPBACK_ANY_PORT: &str = "127.0.0.1:0";
 /// Peer ID of the leader's own device in the test plan; it has no RPC bridge.
 const LEADER_PEER_ID: &str = "leader";
 const MIN_PEERS: usize = 2;
+const MODEL_HASH: &str = "synthetic-model";
+const RUNTIME_ID: &str = "synthetic-runtime";
+const CONTEXT_TOKENS: u64 = 8192;
+const PEER_MEMORY_BUDGET_BYTES: u64 = 300_000_000;
+/// Peak memory reported for each planned peer in run evidence; within the peer budget.
+const EVIDENCE_PEAK_BYTES: u64 = 250_000_000;
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// A rejected plan must fail well within this, far below the leader's worker wait.
+const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the leader may take to read and act on run evidence once it is written.
+const EVIDENCE_SETTLE: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const WORKER_WAIT: Duration = Duration::from_secs(30);
 const SHORT_WORKER_WAIT: Duration = Duration::from_millis(500);
@@ -62,7 +73,8 @@ struct Cluster {
 }
 
 impl Cluster {
-    /// Builds the cluster; `fake_flags` are appended to the plan's server_args for fake_llama_server.
+    /// Builds the cluster; `fake_flags` reach fake_llama_server as extra llama-server arguments,
+    /// so the plan stays exactly what `planning::build_plan` produced.
     async fn new(name: &str, fake_flags: &[&str]) -> Self {
         init_tracing();
         let dir = scratch_dir(name);
@@ -77,14 +89,15 @@ impl Cluster {
         let llama_port = free_loopback_addr().await.port();
         let api_addr = free_loopback_addr().await;
         let argv_log = dir.join("llama-argv.json");
-        let fake_args = ["--argv-log", &path_arg(&argv_log)]
+        let extra_llama_args: Vec<String> = ["--argv-log", &path_arg(&argv_log)]
             .into_iter()
             .chain(fake_flags.iter().copied())
             .map(str::to_owned)
             .collect();
-        let launch = write_launch_files(&dir, worker_endpoint.id(), rpc_endpoint, fake_args);
+        let launch = write_launch_files(&dir, worker_endpoint.id(), rpc_endpoint);
         let expected_argv = [
             launch.server_args,
+            extra_llama_args.clone(),
             vec![
                 "--host".to_owned(),
                 Ipv4Addr::LOCALHOST.to_string(),
@@ -99,7 +112,10 @@ impl Cluster {
             cluster_id: CLUSTER_ID.to_owned(),
             plan_path: launch.plan_path,
             profile_path: launch.profile_path,
+            min_peers: MIN_PEERS,
+            evidence: None,
             llama_server: example_bin("fake_llama_server"),
+            extra_llama_args,
             llama_port,
             api_addr,
             worker_wait: WORKER_WAIT,
@@ -119,6 +135,28 @@ impl Cluster {
 
     fn llama_addr(&self) -> SocketAddr {
         SocketAddr::from((Ipv4Addr::LOCALHOST, self.config.llama_port))
+    }
+
+    /// Turns on post-run verification and returns the file the test must write evidence to.
+    fn expect_evidence(&mut self) -> PathBuf {
+        let path = self.dir.join("evidence.json");
+        self.config.evidence = Some(EvidenceConfig {
+            path: path.clone(),
+            wait: TEST_TIMEOUT,
+        });
+        path
+    }
+
+    /// Asserts that neither llama-server nor the job API was ever started.
+    async fn assert_nothing_launched(&self) {
+        assert!(
+            !self.argv_log.exists(),
+            "llama-server must not start for a rejected plan"
+        );
+        assert!(
+            TcpStream::connect(self.config.api_addr).await.is_err(),
+            "the job API must not serve for a rejected plan"
+        );
     }
 
     /// Runs the leader in the background until the returned sender fires (or is dropped).
@@ -174,18 +212,11 @@ struct LaunchFiles {
     server_args: Vec<String>,
 }
 
-/// Plans the test profile with `planning::build_plan`, appends `extra_args` to its server_args,
-/// and writes both files into `dir`.
-fn write_launch_files(
-    dir: &Path,
-    worker: EndpointId,
-    rpc_endpoint: SocketAddr,
-    extra_args: Vec<String>,
-) -> LaunchFiles {
+/// Plans the test profile with `planning::build_plan` and writes both files into `dir`.
+fn write_launch_files(dir: &Path, worker: EndpointId, rpc_endpoint: SocketAddr) -> LaunchFiles {
     let profile = profile_json(worker, rpc_endpoint);
     let request: PlanningRequest = serde_json::from_value(profile.clone()).expect("valid profile");
-    let mut plan = planning::build_plan(&request, MIN_PEERS).expect("feasible plan");
-    plan.server_args.extend(extra_args);
+    let plan = planning::build_plan(&request, MIN_PEERS).expect("feasible plan");
     let plan_path = dir.join("plan.json");
     let profile_path = dir.join("profile.json");
     write_json(&plan_path, &serde_json::to_value(&plan).expect("plan JSON"));
@@ -204,12 +235,12 @@ fn profile_json(worker: EndpointId, rpc_endpoint: SocketAddr) -> Value {
     let peer = |id: &str| {
         json!({
             "id": id,
-            "model_hash": "synthetic-model",
-            "runtime_id": "synthetic-runtime",
-            "context_tokens": 8192,
+            "model_hash": MODEL_HASH,
+            "runtime_id": RUNTIME_ID,
+            "context_tokens": CONTEXT_TOKENS,
             "authorized": true,
             "healthy": true,
-            "memory_budget_bytes": 300_000_000u64,
+            "memory_budget_bytes": PEER_MEMORY_BUDGET_BYTES,
             "reserved_bytes": 50_000_000u64,
             "decode_us_per_layer": [1000, 1000, 1000, 1000],
         })
@@ -217,9 +248,9 @@ fn profile_json(worker: EndpointId, rpc_endpoint: SocketAddr) -> Value {
     let layer = json!({"weight_bytes": 100_000_000u64, "kv_bytes_per_token": 1024});
     json!({
         "model": {
-            "model_hash": "synthetic-model",
-            "runtime_id": "synthetic-runtime",
-            "context_tokens": 8192,
+            "model_hash": MODEL_HASH,
+            "runtime_id": RUNTIME_ID,
+            "context_tokens": CONTEXT_TOKENS,
             "layers": [layer, layer, layer, layer],
         },
         "peers": [peer(&worker), peer(LEADER_PEER_ID)],
@@ -255,6 +286,35 @@ fn path_arg(path: &Path) -> String {
 fn write_json(path: &Path, value: &Value) {
     std::fs::write(path, serde_json::to_vec_pretty(value).expect("encode JSON"))
         .expect("write JSON");
+}
+
+/// Rewrites the JSON file at `path` with `edit` applied.
+fn edit_json(path: &Path, edit: impl FnOnce(&mut Value)) {
+    let text = std::fs::read_to_string(path).expect("read JSON");
+    let mut value = serde_json::from_str(&text).expect("parse JSON");
+    edit(&mut value);
+    write_json(path, &value);
+}
+
+/// RunEvidence for the test plan: both planned peers within their memory budget, the leader's
+/// device with one compute event and the worker with `worker_compute_events`.
+fn run_evidence(worker: EndpointId, worker_compute_events: u64) -> Value {
+    let device = |peer_id: String, compute_events: u64| {
+        json!({
+            "peer_id": peer_id,
+            "peak_bytes": EVIDENCE_PEAK_BYTES,
+            "compute_events": compute_events,
+        })
+    };
+    json!({
+        "model_hash": MODEL_HASH,
+        "runtime_id": RUNTIME_ID,
+        "context_tokens": CONTEXT_TOKENS,
+        "devices": [
+            device(worker.to_string(), worker_compute_events),
+            device(LEADER_PEER_ID.to_owned(), 1),
+        ],
+    })
 }
 
 /// Binds an endpoint on loopback only, with relays and public address lookup disabled.
@@ -351,11 +411,111 @@ async fn assert_process_exits(pid: u64) {
 }
 
 async fn leader_error(leader: JoinHandle<anyhow::Result<()>>) -> String {
-    let result = timeout(TEST_TIMEOUT, leader)
+    leader_error_within(TEST_TIMEOUT, leader).await
+}
+
+async fn leader_error_within(limit: Duration, leader: JoinHandle<anyhow::Result<()>>) -> String {
+    let result = timeout(limit, leader)
         .await
-        .expect("leader finishes")
+        .unwrap_or_else(|_| panic!("leader did not finish within {limit:?}"))
         .expect("leader did not panic");
     format!("{:#}", result.expect_err("leader must fail"))
+}
+
+async fn assert_prompt_succeeds(api_addr: SocketAddr) {
+    let reply = timeout(TEST_TIMEOUT, api::prompt(api_addr, PROMPT))
+        .await
+        .expect("prompt finishes")
+        .expect("prompt succeeds");
+    assert!(reply.contains(PROMPT), "unexpected reply {reply:?}");
+}
+
+async fn stop_cleanly(stop: oneshot::Sender<()>, leader: JoinHandle<anyhow::Result<()>>) {
+    stop.send(()).expect("leader still running");
+    timeout(TEST_TIMEOUT, leader)
+        .await
+        .expect("leader stops")
+        .expect("leader did not panic")
+        .expect("leader shuts down cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_plan_is_rejected_before_anything_launches() {
+    let cluster = Cluster::new("legacy-plan", &[]).await;
+    edit_json(&cluster.config.plan_path, |plan| {
+        plan["runtime_devices"] = json!([]);
+    });
+
+    // No worker is started: a leader that got past preflight would wait WORKER_WAIT for it.
+    let (_stop, leader) = cluster.start_leader();
+    let message = leader_error_within(PREFLIGHT_TIMEOUT, leader).await;
+
+    assert!(message.contains("regenerate the plan"), "{message}");
+    cluster.assert_nothing_launched().await;
+    cluster.finish(None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn plan_failing_validation_is_rejected_before_anything_launches() {
+    let cluster = Cluster::new("invalid-plan", &[]).await;
+    edit_json(&cluster.config.plan_path, |plan| {
+        plan["placement"]["model_hash"] = json!("some-other-model");
+    });
+
+    let (_stop, leader) = cluster.start_leader();
+    let message = leader_error_within(PREFLIGHT_TIMEOUT, leader).await;
+
+    assert!(message.contains("IdentityMismatch"), "{message}");
+    cluster.assert_nothing_launched().await;
+    cluster.finish(None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn valid_run_evidence_keeps_the_leader_serving() {
+    let mut cluster = Cluster::new("evidence-valid", &[]).await;
+    let evidence_path = cluster.expect_evidence();
+
+    let (stop, leader) = cluster.start_leader();
+    let worker = cluster.start_worker();
+    wait_until_listening(cluster.config.api_addr).await;
+    write_json(
+        &evidence_path,
+        &run_evidence(cluster.worker_endpoint.id(), 1),
+    );
+    tokio::time::sleep(EVIDENCE_SETTLE).await;
+
+    assert!(
+        !leader.is_finished(),
+        "leader must keep serving after verification passes"
+    );
+    assert_prompt_succeeds(cluster.config.api_addr).await;
+    stop_cleanly(stop, leader).await;
+    cluster.finish(Some(worker)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_verification_shuts_the_leader_down() {
+    let mut cluster = Cluster::new("evidence-invalid", &[]).await;
+    let evidence_path = cluster.expect_evidence();
+    let worker_id = cluster.worker_endpoint.id().to_string();
+
+    let (_stop, leader) = cluster.start_leader();
+    let worker = cluster.start_worker();
+    wait_until_listening(cluster.config.api_addr).await;
+    let launch = read_argv_log(&cluster.argv_log);
+    write_json(
+        &evidence_path,
+        &run_evidence(cluster.worker_endpoint.id(), 0),
+    );
+    let message = leader_error(leader).await;
+
+    assert!(message.contains("NoCompute"), "{message}");
+    assert!(message.contains(&worker_id), "{message}");
+    assert_process_exits(launch["pid"].as_u64().expect("pid in argv log")).await;
+    assert_stops_listening(cluster.config.api_addr).await;
+    assert_stops_listening(cluster.llama_addr()).await;
+    assert_stops_listening(cluster.rpc_endpoint).await;
+    cluster.finish(Some(worker)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -403,18 +563,10 @@ async fn leader_serves_prompts_over_planned_bridges_and_stops_cleanly() {
     .await
     .expect("bridge round trip finishes");
     assert_eq!(echoed, BRIDGE_PAYLOAD);
-    let reply = timeout(TEST_TIMEOUT, api::prompt(cluster.config.api_addr, PROMPT))
-        .await
-        .expect("prompt finishes")
-        .expect("prompt succeeds");
-    assert!(reply.contains(PROMPT), "unexpected reply {reply:?}");
+    // No evidence file is configured, so no verification runs and serving is unchanged.
+    assert_prompt_succeeds(cluster.config.api_addr).await;
 
-    stop.send(()).expect("leader still running");
-    timeout(TEST_TIMEOUT, leader)
-        .await
-        .expect("leader stops")
-        .expect("leader did not panic")
-        .expect("leader shuts down cleanly");
+    stop_cleanly(stop, leader).await;
     assert_process_exits(launch["pid"].as_u64().expect("pid in argv log")).await;
     assert_stops_listening(cluster.config.api_addr).await;
     assert_stops_listening(cluster.llama_addr()).await;
