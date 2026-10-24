@@ -1,0 +1,365 @@
+{
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Explain how splitting one language model across two computers differs from running two independent models. Use three short sentences."
+      }
+    ],
+    "max_tokens": 128,
+    "temperature": 0,
+    "seed": 42,
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    },
+    "cache_prompt": false,
+    "timings_per_token": true
+  },
+  "generation": {
+    "status": "passed",
+    "text": "Splitting a single model distributes its weights across two machines to run one unified system, whereas running two independent models creates two separate systems with distinct parameters. The split model shares a single knowledge base and produces consistent outputs, while independent models operate as separate entities that may generate different results. This approach optimizes hardware utilization for one task, unlike parallel independent runs which process two completely separate tasks simultaneously.",
+    "ttft_seconds": 0.5566062500001863,
+    "server_timings": {
+      "cache_n": 0,
+      "prompt_n": 34,
+      "prompt_ms": 546.822,
+      "prompt_per_token_ms": 16.083,
+      "prompt_per_second": 62.177454455014605,
+      "predicted_n": 79,
+      "predicted_ms": 6888.562,
+      "predicted_per_token_ms": 88.31489743589744,
+      "predicted_per_second": 11.32311794537089
+    },
+    "finish_reason": "stop",
+    "usage": {
+      "completion_tokens": 79,
+      "prompt_tokens": 34,
+      "total_tokens": 113,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "elapsed_seconds": 7.445437666014186,
+    "delivered_generation_tokens_per_second": 11.322675108390472
+  },
+  "samples": [
+    {
+      "file": "0-348160.bin",
+      "bytes": 348160
+    },
+    {
+      "file": "1-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "10-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "11-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "12-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "13-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "14-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "15-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "16-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "17-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "18-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "19-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "2-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "20-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "21-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "22-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "23-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "24-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "25-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "26-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "27-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "28-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "29-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "3-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "30-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "31-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "32-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "33-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "34-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "35-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "36-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "37-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "38-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "39-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "4-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "40-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "41-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "42-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "43-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "44-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "45-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "46-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "47-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "48-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "49-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "5-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "50-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "51-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "52-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "53-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "54-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "55-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "56-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "57-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "58-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "59-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "6-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "60-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "61-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "62-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "63-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "64-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "65-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "66-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "67-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "68-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "69-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "7-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "70-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "71-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "72-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "73-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "74-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "75-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "76-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "77-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "78-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "8-10240.bin",
+      "bytes": 10240
+    },
+    {
+      "file": "9-10240.bin",
+      "bytes": 10240
+    }
+  ],
+  "timing_note": "Capture file I/O affects timings; do not use as throughput evidence."
+}

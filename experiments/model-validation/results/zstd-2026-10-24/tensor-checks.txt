@@ -1,0 +1,8 @@
+passed: 4 bytes per tensor, async=0
+passed: 4096 bytes per tensor, async=0
+passed: 65536 bytes per tensor, async=0
+passed: 80000 bytes per tensor, async=0
+passed: 4 bytes per tensor, async=1
+passed: 4096 bytes per tensor, async=1
+passed: 65536 bytes per tensor, async=1
+passed: 80000 bytes per tensor, async=1

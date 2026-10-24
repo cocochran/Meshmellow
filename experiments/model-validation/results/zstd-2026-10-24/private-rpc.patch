@@ -1,0 +1,296 @@
+diff --git a/ggml/src/ggml-rpc/CMakeLists.txt b/ggml/src/ggml-rpc/CMakeLists.txt
+index 8976651..d52f465 100644
+--- a/ggml/src/ggml-rpc/CMakeLists.txt
++++ b/ggml/src/ggml-rpc/CMakeLists.txt
+@@ -6,6 +6,9 @@ ggml_add_backend_library(ggml-rpc
+                          transport.cpp
+                         )
+ 
++target_include_directories(ggml-rpc PRIVATE /opt/homebrew/opt/zstd/include)
++target_link_libraries(ggml-rpc PRIVATE /opt/homebrew/opt/zstd/lib/libzstd.a)
++
+ if (WIN32)
+     target_link_libraries(ggml-rpc PRIVATE ws2_32)
+ endif()
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 49f1107..37d24fc 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -4,6 +4,7 @@
+ #include "ggml-cpp.h"
+ #include "transport.h"
+ #include "log.h"
++#include <zstd.h>
+ 
+ #include <array>
+ #include <chrono>
+@@ -20,6 +21,8 @@
+ #include <unordered_map>
+ #include <unordered_set>
+ #include <cstring>
++#include <cstdlib>
++#include <cstdio>
+ #include <fstream>
+ #include <filesystem>
+ #include <algorithm>
+@@ -320,7 +323,81 @@ static uint64_t fnv_hash(const uint8_t * data, size_t len, uint64_t hash = 0xcbf
+     return hash;
+ }
+ 
++static bool rpc_coalesce_enabled() {
++    static const char * test_file = std::getenv("GGML_RPC_COALESCE_TEST_FILE");
++    if (test_file != nullptr) {
++        FILE * file = std::fopen(test_file, "rb");
++        if (file == nullptr) {
++            return false;
++        }
++        const int value = std::fgetc(file);
++        std::fclose(file);
++        return value == '1';
++    }
++    static const bool enabled = [] {
++        const char * value = std::getenv("GGML_RPC_COALESCE");
++        return value != nullptr && std::strcmp(value, "1") == 0;
++    }();
++    return enabled;
++}
++
++static constexpr size_t RPC_COALESCE_MAX_BYTES = 64 * 1024;
++
++static constexpr uint64_t RPC_ZSTD_FLAG = uint64_t(1) << 63;
++static constexpr size_t RPC_ZSTD_MAX_BYTES = 1024 * 1024;
++
++static bool rpc_zstd_enabled() {
++    static const bool enabled = [] {
++        const char * value = std::getenv("GGML_RPC_ZSTD");
++        return value != nullptr && std::strcmp(value, "1") == 0;
++    }();
++    return enabled;
++}
++
++static int rpc_zstd_level() {
++    static const char * path = std::getenv("GGML_RPC_ZSTD_TEST_FILE");
++    if (path == nullptr) {
++        return 1;
++    }
++    FILE * file = std::fopen(path, "rb");
++    if (file == nullptr) {
++        return 0;
++    }
++    const int value = std::fgetc(file);
++    std::fclose(file);
++    return value == '1' ? 1 : 0;
++}
++
+ static bool send_msg(socket_ptr sock, const void * msg, size_t msg_size) {
++    if (rpc_zstd_enabled() && msg_size >= 4096 && msg_size <= RPC_ZSTD_MAX_BYTES) {
++        const int level = rpc_zstd_level();
++        if (level > 0) {
++            thread_local std::unique_ptr<ZSTD_CCtx, decltype(&ZSTD_freeCCtx)> context(ZSTD_createCCtx(), ZSTD_freeCCtx);
++            if (!context) {
++                return false;
++            }
++            std::vector<uint8_t> compressed(ZSTD_compressBound(msg_size));
++            const size_t size = ZSTD_compressCCtx(context.get(), compressed.data(), compressed.size(), msg, msg_size, level);
++            if (ZSTD_isError(size)) {
++                return false;
++            }
++            if (size + 64 < msg_size) {
++                const uint64_t encoded_size = RPC_ZSTD_FLAG | size;
++                LOG_DBG("[zstd] raw=%zu wire=%zu level=%d\n", msg_size, size, level);
++                return sock->send_data(&encoded_size, sizeof(encoded_size)) &&
++                       sock->send_data(compressed.data(), size) && sock->flush();
++            }
++        }
++        LOG_DBG("[zstd] raw=%zu wire=%zu level=%d\n", msg_size, msg_size, level);
++    }
++    if (rpc_coalesce_enabled() && msg_size <= RPC_COALESCE_MAX_BYTES) {
++        std::vector<uint8_t> frame(sizeof(msg_size) + msg_size);
++        std::memcpy(frame.data(), &msg_size, sizeof(msg_size));
++        if (msg_size > 0) {
++            std::memcpy(frame.data() + sizeof(msg_size), msg, msg_size);
++        }
++        return sock->send_data(frame.data(), frame.size()) && sock->flush();
++    }
+     if (!sock->send_data(&msg_size, sizeof(msg_size))) {
+         return false;
+     }
+@@ -373,6 +450,16 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
+ // No response
+ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
+     uint8_t cmd_byte = cmd;
++    if (rpc_coalesce_enabled() && input_size <= RPC_COALESCE_MAX_BYTES) {
++        const size_t header_size = sizeof(cmd_byte) + sizeof(input_size);
++        std::vector<uint8_t> frame(header_size + input_size);
++        std::memcpy(frame.data(), &cmd_byte, sizeof(cmd_byte));
++        std::memcpy(frame.data() + sizeof(cmd_byte), &input_size, sizeof(input_size));
++        if (input_size > 0) {
++            std::memcpy(frame.data() + header_size, input, input_size);
++        }
++        return sock->send_data(frame.data(), frame.size()) && sock->flush();
++    }
+     if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) {
+         return false;
+     }
+@@ -387,23 +474,60 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input,
+ 
+ // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
+ // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
+-static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
+-    if (!send_rpc_cmd(sock, cmd, input, input_size)) {
+-        return false;
+-    }
++static bool recv_rpc_response(socket_ptr sock, void * output, size_t output_size) {
+     uint64_t out_size;
+     if (!sock->recv_data(&out_size, sizeof(out_size))) {
+         return false;
+     }
++    if ((out_size & RPC_ZSTD_FLAG) != 0) {
++        const uint64_t compressed_size = out_size & ~RPC_ZSTD_FLAG;
++        if (!rpc_zstd_enabled() || output_size < 4096 || output_size > RPC_ZSTD_MAX_BYTES ||
++            compressed_size == 0 || compressed_size >= output_size) {
++            return false;
++        }
++        std::vector<uint8_t> compressed(compressed_size);
++        if (!sock->recv_data(compressed.data(), compressed.size()) ||
++            ZSTD_getFrameContentSize(compressed.data(), compressed.size()) != output_size) {
++            return false;
++        }
++        thread_local std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> context(ZSTD_createDCtx(), ZSTD_freeDCtx);
++        if (!context) {
++            return false;
++        }
++        const size_t decoded = ZSTD_decompressDCtx(context.get(), output, output_size, compressed.data(), compressed.size());
++        return !ZSTD_isError(decoded) && decoded == output_size;
++    }
+     if (out_size != output_size) {
+         return false;
+     }
+     if (!sock->recv_data(output, output_size)) {
+         return false;
+     }
++    static const char * capture_dir = std::getenv("GGML_RPC_CAPTURE_DIR");
++    static std::atomic_uint capture_count = 0;
++    if (capture_dir != nullptr && output_size >= 4096 && output_size <= 1024 * 1024) {
++        const std::string marker = std::string(capture_dir) + "/enabled";
++        FILE * enabled = std::fopen(marker.c_str(), "rb");
++        if (enabled != nullptr) {
++            std::fclose(enabled);
++            const unsigned index = capture_count.fetch_add(1);
++            if (index < 128) {
++                const std::string path = std::string(capture_dir) + "/" + std::to_string(index) + "-" + std::to_string(output_size) + ".bin";
++                FILE * file = std::fopen(path.c_str(), "wb");
++                if (file != nullptr) {
++                    std::fwrite(output, 1, output_size, file);
++                    std::fclose(file);
++                }
++            }
++        }
++    }
+     return true;
+ }
+ 
++static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
++    return send_rpc_cmd(sock, cmd, input, input_size) && recv_rpc_response(sock, output, output_size);
++}
++
+ // RPC client-side implementation
+ 
+ // with busy spinning on, the dispatcher still blocks on its queue after this long without commands
+@@ -429,7 +553,8 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
+     bool status = send_rpc_cmd(sock, RPC_CMD_HELLO, &request, sizeof(request), &response, sizeof(response));
+     RPC_STATUS_ASSERT(status);
+ 
+-    if (response.major != RPC_PROTO_MAJOR_VERSION || response.minor > RPC_PROTO_MINOR_VERSION) {
++    const uint8_t expected_major = RPC_PROTO_MAJOR_VERSION + (rpc_zstd_enabled() ? 1 : 0);
++    if (response.major != expected_major || response.minor > RPC_PROTO_MINOR_VERSION) {
+         LOG_ERROR("RPC server version mismatch: %d.%d.%d\n",
+                        response.major, response.minor, response.patch);
+         return false;
+@@ -522,6 +647,7 @@ private:
+         size_t                        input_size;
+         void                        * output;
+         size_t                        output_size;
++        bool                          force_flush = false;
+         std::promise<void>            completion;
+     };
+     using rpc_msg_ptr   = std::shared_ptr<rpc_msg>;
+@@ -551,6 +677,7 @@ void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, s
+     msg->input_size = input_size;
+     msg->output = nullptr;
+     msg->output_size = 0;
++    msg->force_flush = true;
+     GGML_ASSERT(queue.push(msg));
+     auto future = msg->completion.get_future();
+     future.wait();
+@@ -659,6 +786,21 @@ void rpc_dispatcher::start(const std::string & endpoint) {
+ 
+ void rpc_dispatcher::work() {
+     auto last_cmd = std::chrono::steady_clock::now();
++    const char * batch_env = std::getenv("GGML_RPC_BATCH_WRITES");
++    const bool batch = batch_env != nullptr && std::strcmp(batch_env, "1") == 0 &&
++                       std::strcmp(sock->transport_name(), "TCP") == 0;
++    std::vector<uint8_t> pending;
++    if (batch) {
++        pending.reserve(RPC_COALESCE_MAX_BYTES);
++    }
++    auto flush_pending = [&]() {
++        if (pending.empty()) {
++            return true;
++        }
++        const bool status = sock->send_data(pending.data(), pending.size()) && sock->flush();
++        pending.clear();
++        return status;
++    };
+     while (running) {
+         rpc_msg_ptr msg_ptr;
+         // spin only while commands keep coming, so an idle dispatcher does not keep a core busy
+@@ -677,10 +819,30 @@ void rpc_dispatcher::work() {
+                      rpc_log_format_size(msg_ptr->input_size).c_str(), rpc_log_format_size(msg_ptr->output_size).c_str());
+             const bool trace = rpc_log_debug_level() >= 3;
+             const auto t0 = std::chrono::steady_clock::now();
+-            if (msg_ptr->output) {
++            const size_t header_size = sizeof(uint8_t) + sizeof(msg_ptr->input_size);
++            if (batch && msg_ptr->input_size <= RPC_COALESCE_MAX_BYTES - header_size) {
++                if (pending.size() > RPC_COALESCE_MAX_BYTES - header_size - msg_ptr->input_size) {
++                    RPC_STATUS_ASSERT(flush_pending());
++                }
++                const size_t start = pending.size();
++                pending.resize(start + header_size + msg_ptr->input_size);
++                pending[start] = static_cast<uint8_t>(msg_ptr->cmd);
++                std::memcpy(pending.data() + start + sizeof(uint8_t), &msg_ptr->input_size, sizeof(msg_ptr->input_size));
++                if (msg_ptr->input_size > 0) {
++                    std::memcpy(pending.data() + start + header_size, msg_ptr->input.get(), msg_ptr->input_size);
++                }
++                if (msg_ptr->output || msg_ptr->force_flush) {
++                    RPC_STATUS_ASSERT(flush_pending());
++                }
++                if (msg_ptr->output) {
++                    RPC_STATUS_ASSERT(recv_rpc_response(sock, msg_ptr->output, msg_ptr->output_size));
++                }
++            } else if (msg_ptr->output) {
++                RPC_STATUS_ASSERT(flush_pending());
+                 bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size, msg_ptr->output, msg_ptr->output_size);
+                 RPC_STATUS_ASSERT(status);
+             } else {
++                RPC_STATUS_ASSERT(flush_pending());
+                 bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size);
+                 RPC_STATUS_ASSERT(status);
+             }
+@@ -689,6 +851,7 @@ void rpc_dispatcher::work() {
+                 LOG_DBG3("[%s] %s done in %.3f ms\n", __func__, rpc_cmd_name(msg_ptr->cmd), elapsed.count());
+             }
+         } else {
++            RPC_STATUS_ASSERT(flush_pending());
+             LOG_DBG3("[%s] sync barrier\n", __func__);
+         }
+         msg_ptr->completion.set_value();
+@@ -1452,7 +1615,7 @@ private:
+ };
+ 
+ void rpc_server::hello(rpc_msg_hello_rsp & response) {
+-    response.major = RPC_PROTO_MAJOR_VERSION;
++    response.major = RPC_PROTO_MAJOR_VERSION + (rpc_zstd_enabled() ? 1 : 0);
+     response.minor = RPC_PROTO_MINOR_VERSION;
+     response.patch = RPC_PROTO_PATCH_VERSION;
+     LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);

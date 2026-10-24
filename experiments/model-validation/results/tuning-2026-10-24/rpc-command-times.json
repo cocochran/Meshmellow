@@ -1,0 +1,27 @@
+{
+  "GET_ALLOC_SIZE": {
+    "count": 7,
+    "total_ms": 70.38,
+    "median_ms": 9.771
+  },
+  "SET_TENSOR": {
+    "count": 711,
+    "total_ms": 120.02,
+    "median_ms": 0.153
+  },
+  "GRAPH_COMPUTE": {
+    "count": 2,
+    "total_ms": 0.79,
+    "median_ms": 0.394
+  },
+  "GET_TENSOR": {
+    "count": 79,
+    "total_ms": 4875.51,
+    "median_ms": 42.922
+  },
+  "GRAPH_RECOMPUTE": {
+    "count": 77,
+    "total_ms": 13.47,
+    "median_ms": 0.182
+  }
+}

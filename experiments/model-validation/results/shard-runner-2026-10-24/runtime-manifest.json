@@ -1,0 +1,24 @@
+{
+  "base_commit": "71255fefc092b0344f2acddb891388814ae961be",
+  "patch_sha256": "19a75a87eecc3344061a10a988b742c7ab9b2aa1e16e0cbe11208079246a0c90",
+  "libraries": {
+    "libllama.0.7.0.dylib": "0b67a9648b5fa5c7688a1d63cdeabdd16901873d1faeefdcbdcf731866d9cf54",
+    "libggml-cpu.0.27.0.dylib": "578ffcfbe72351ead65d20432cf22b17719d583b0cd3e3e1eafe5fda01fbce5b",
+    "libggml.0.27.0.dylib": "ec0ba4f3924ebb46ad4b3dbe47373ce088facde4fea877b5ae7d408339996bad",
+    "libggml-metal.0.27.0.dylib": "8b7ae07029c2dfb2fe2086194f67cc58819993c10d36e41a5b79f83be41e9155",
+    "libggml-blas.0.27.0.dylib": "9f35c2fd44e76a48e111999ae708ecbb5563a045864cf6ae5eab7bf0f80729a4",
+    "libggml-base.0.27.0.dylib": "615690f9ac4d5c8316574cc8777f1acb40714bc976a061262663870852119904"
+  },
+  "runner_sha256": "6b163dd3716878af055bba8de962181cb9d65d574e5113f426bbf31ebdae815d",
+  "iroh": {
+    "base_commit": "74acef0d8feb5be81850822991e2b5a090063076",
+    "guard_patch_sha256": "97055f58d60655fce18f8a9127be37e5a53877b7daedaf1949f653cd97db8089"
+  },
+  "m1_cpu_library_sha256": "06ca0b2a8d23b60c3b57cf4671ff0ce8f4803b5389e4a9b974ba7879947c9980",
+  "m1_private_llama_sha256": "0b67a9648b5fa5c7688a1d63cdeabdd16901873d1faeefdcbdcf731866d9cf54",
+  "memory_metrics": {
+    "buffer_bytes": "GGML model/context/compute allocations sampled at initialization and synchronized step boundaries",
+    "max_rss_bytes": "getrusage process lifetime resident high-water mark",
+    "vm": "macOS TASK_VM_INFO: current resident_size, phys_footprint, ledger_phys_footprint_peak and compressed. Report separately; no summing with GPU or buffer totals. Coverage is not yet accepted as contribution-budget evidence."
+  }
+}
