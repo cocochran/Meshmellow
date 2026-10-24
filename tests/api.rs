@@ -196,6 +196,56 @@ fn request_id_of(response: &reqwest::Response) -> String {
 }
 
 #[tokio::test]
+async fn truncated_upstream_sse_fails_client_body_and_does_not_commit_history() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router =
+        axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async {
+                let chunks =
+                    futures_util::stream::unfold(false, |sent| async move {
+                        if sent {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            None
+                        } else {
+                            Some((Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"
+                )), true))
+                        }
+                    });
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    axum::body::Body::from_stream(chunks),
+                )
+            }),
+        );
+    let upstream = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let api = TestApi::start(address).await;
+    let mut body = chat_body("test interrupted answer");
+    body["stream"] = json!(true);
+    let response = api.post_chat(&body).await;
+    let request_id = request_id_of(&response);
+    assert!(
+        response.bytes().await.is_err(),
+        "incomplete SSE must not look like a complete HTTP response"
+    );
+    wait_for("failed job", || async {
+        (api.job_status(&request_id).await == "failed").then_some(())
+    })
+    .await;
+    assert!(
+        api.sink.turns().is_empty(),
+        "partial response must not become completed history"
+    );
+    api.stop().await;
+    upstream.abort();
+    let _ = upstream.await;
+}
+
+#[tokio::test]
 async fn non_streaming_requests_are_proxied_and_strip_conversation_id() {
     let fake = FakeLlama::start(&[]).await;
     let api = TestApi::start(fake.addr).await;
