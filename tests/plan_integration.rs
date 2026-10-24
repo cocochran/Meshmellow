@@ -28,6 +28,36 @@ fn verifies_saved_plan_against_current_inputs() {
 }
 
 #[test]
+fn device_bindings_round_trip_in_assignment_order() {
+    let (request, output, evidence) = fixture();
+    assert_eq!(output.runtime_devices[0].peer_id, "worker");
+    assert_eq!(output.runtime_devices[1].peer_id, "leader");
+    assert_eq!(
+        output.runtime_devices[0].rpc_endpoint.unwrap().port(),
+        50053
+    );
+    assert_eq!(output.runtime_devices[1].rpc_endpoint, None);
+    let saved = serde_json::to_value(&output).unwrap();
+    let restored: PlanningOutput = serde_json::from_value(saved).unwrap();
+    assert_eq!(verify_output(&request, &restored, &evidence, 2), Ok(()));
+}
+
+#[test]
+fn rejects_changed_bindings_but_loads_legacy_plans() {
+    let (request, mut output, evidence) = fixture();
+    let mut saved = serde_json::to_value(&output).unwrap();
+    saved.as_object_mut().unwrap().remove("runtime_devices");
+    let legacy: PlanningOutput = serde_json::from_value(saved).unwrap();
+    assert!(legacy.runtime_devices.is_empty());
+    assert_eq!(verify_output(&request, &legacy, &evidence, 2), Ok(()));
+    output.runtime_devices[0].rpc_endpoint = Some("127.0.0.1:50054".parse().unwrap());
+    assert_eq!(
+        verify_output(&request, &output, &evidence, 2),
+        Err(VerificationError::InvalidPlan)
+    );
+}
+
+#[test]
 fn refuses_truncated_model_and_altered_launch_arguments() {
     let (request, mut output, evidence) = fixture();
     output.placement.assignments.last_mut().unwrap().layers.end -= 1;

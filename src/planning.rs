@@ -26,6 +26,9 @@ pub struct PlanningOutput {
     pub placement: Placement,
     /// Pass as individual process arguments, not as a shell command.
     pub server_args: Vec<String>,
+    /// Selected devices in assignment order. Empty when loading legacy plans.
+    #[serde(default)]
+    pub runtime_devices: Vec<RuntimeDevice>,
 }
 
 /// Verify a saved launch plan against current model/profile inputs and evidence.
@@ -96,6 +99,9 @@ pub fn verify_output(
     }
     let argv =
         rpc_plan::server_args(placement, &devices, &request.model_path).map_err(|_| InvalidPlan)?;
+    if !output.runtime_devices.is_empty() && output.runtime_devices != devices {
+        return Err(InvalidPlan);
+    }
     if argv != output.server_args {
         return Err(InvalidPlan);
     }
@@ -145,5 +151,6 @@ pub fn build_plan(
         advisory: true,
         placement,
         server_args,
+        runtime_devices: devices,
     })
 }
