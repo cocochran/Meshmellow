@@ -76,3 +76,27 @@ Flag reference checked against the team's recorded runtime pin:
 The architectural distinction between RPC and a future direct activation pipeline
 follows the shared MeshLLM research document. Main's older README describes that
 future pipeline; this component targets controller-driven RPC.
+
+### Checking collected runtime evidence
+
+Call `verification::verify_run(&placement, &current_profiles, &evidence, 2)`
+after a fresh inference run. `RunEvidence` identifies the loaded model hash,
+runtime pin and context; each `DeviceEvidence` supplies a peer ID, nonzero peak
+total contribution bytes (load plus inference), and fresh compute-event count.
+The check requires every planned contributor, rejects duplicate/unplanned peers,
+rechecks current authorization/health and profile identity, and rejects peaks
+over the opt-in budget or contributors with zero compute events. Evidence order
+is independent of placement order.
+
+The caller is responsible for collecting trustworthy evidence for the exact run,
+including all relevant memory allocations. This function does not parse logs,
+measure memory, enforce limits, stop processes, or prove future runs will fit.
+On failure the launcher must stop/replan before treating the placement as verified.
+
+The confirmed initial integration uses remote M1 `RPC0` then local M2 Pro `MTL0`
+with runtime pin `71255fefc092b0344f2acddb891388814ae961be`; discover device
+names on each run rather than assuming these IDs are stable. Keep output tensors
+local and verify that in allocation logs. Yash's current bridge CLI starts one
+`bridge-connect` process per remote worker on distinct supplied loopback ports;
+there is no peer-to-endpoint discovery API yet. Use explicitly enrolled peers;
+the initial published bridge requires a separate approval guard.
