@@ -44,13 +44,6 @@ impl PeerTable {
         self.record_connection_at(node_id, hello, now_unix_ms())
     }
 
-    /// Records a connection at an explicit Unix-ms timestamp, replacing any earlier entry for that peer.
-    pub fn record_connection_at(
-        &mut self,
-        node_id: NodeId,
-        hello: &Hello,
-        connected_at_unix_ms: u64,
-    ) -> &PeerInfo {
     /// Records a connection at an explicit Unix-ms timestamp, replacing any earlier entry for that peer
     /// (including its heartbeat state).
     pub fn record_connection_at(&mut self, hello: &Hello, connected_at_unix_ms: u64) -> &PeerInfo {
@@ -69,6 +62,7 @@ impl PeerTable {
             Entry::Vacant(slot) => slot.insert(info),
         }
     }
+
 
     /// Removes a peer whose connection closed, unless it has reconnected since.
     ///
