@@ -40,14 +40,11 @@ pub enum VerificationError {
     },
 }
 
-/// Require evidence for every selected peer and no unplanned contributors.
-/// Profiles must be current; the caller must associate observations with this
-/// exact run and collect peaks over load AND inference. Success validates these
-/// observations only: it is neither a hard cap nor proof of future behavior.
-pub fn verify_run(
+/// Validate placement shape and current contributor eligibility before launch.
+/// Does not require or assert runtime telemetry.
+pub fn validate_placement(
     placement: &Placement,
     profiles: &[PeerProfile],
-    evidence: &RunEvidence,
     min_peers: usize,
 ) -> Result<(), VerificationError> {
     use VerificationError::*;
@@ -58,12 +55,6 @@ pub fn verify_run(
         || placement.context_tokens == 0
     {
         return Err(InvalidPlan);
-    }
-    if evidence.model_hash != placement.model_hash
-        || evidence.runtime_id != placement.runtime_id
-        || evidence.context_tokens != placement.context_tokens
-    {
-        return Err(IdentityMismatch);
     }
     let mut selected = HashSet::new();
     let mut next = 0;
@@ -83,6 +74,47 @@ pub fn verify_run(
             return Err(DuplicatePeer(profile.id.clone()));
         }
     }
+    for assignment in &placement.assignments {
+        let id = &assignment.peer_id;
+        let profile = profiles
+            .iter()
+            .find(|p| p.id == *id)
+            .ok_or_else(|| MissingPeer(id.clone()))?;
+        if !profile.authorized
+            || !profile.healthy
+            || profile.model_hash != placement.model_hash
+            || profile.runtime_id != placement.runtime_id
+            || profile.context_tokens != placement.context_tokens
+        {
+            return Err(IneligiblePeer(id.clone()));
+        }
+    }
+    Ok(())
+}
+
+/// Require evidence for every selected peer and no unplanned contributors.
+/// Profiles must be current; the caller must associate observations with this
+/// exact run and collect peaks over load AND inference. Success validates these
+/// observations only: it is neither a hard cap nor proof of future behavior.
+pub fn verify_run(
+    placement: &Placement,
+    profiles: &[PeerProfile],
+    evidence: &RunEvidence,
+    min_peers: usize,
+) -> Result<(), VerificationError> {
+    use VerificationError::*;
+    validate_placement(placement, profiles, min_peers)?;
+    if evidence.model_hash != placement.model_hash
+        || evidence.runtime_id != placement.runtime_id
+        || evidence.context_tokens != placement.context_tokens
+    {
+        return Err(IdentityMismatch);
+    }
+    let selected: HashSet<_> = placement
+        .assignments
+        .iter()
+        .map(|a| a.peer_id.as_str())
+        .collect();
     let mut observed = HashSet::new();
     for device in &evidence.devices {
         if !observed.insert(device.peer_id.as_str()) {
@@ -98,14 +130,6 @@ pub fn verify_run(
             .iter()
             .find(|p| p.id == *id)
             .ok_or_else(|| MissingPeer(id.clone()))?;
-        if !profile.authorized
-            || !profile.healthy
-            || profile.model_hash != placement.model_hash
-            || profile.runtime_id != placement.runtime_id
-            || profile.context_tokens != placement.context_tokens
-        {
-            return Err(IneligiblePeer(id.clone()));
-        }
         let device = evidence
             .devices
             .iter()

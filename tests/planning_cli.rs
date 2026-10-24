@@ -1,6 +1,39 @@
 use std::process::Command;
 
 #[test]
+fn final_peer_constraint_prevents_skipping_local_device() {
+    let mut request: llm_cluster::planning::PlanningRequest =
+        serde_json::from_str(include_str!("../examples/placement-profile.json")).unwrap();
+    for peer in &mut request.peers {
+        peer.memory_budget_bytes = 1_000_000_000;
+    }
+    request.peers[0].decode_us_per_layer = vec![1; 4];
+    request.peers[1].decode_us_per_layer = vec![100; 4];
+    request.links[0].transfer_us = 0;
+    request.final_peer_id = None;
+    let unconstrained = llm_cluster::planning::build_plan(&request, 1).unwrap();
+    assert_eq!(unconstrained.placement.assignments.len(), 1);
+    assert_eq!(unconstrained.placement.assignments[0].peer_id, "worker");
+    request.final_peer_id = Some("leader".into());
+    let constrained = llm_cluster::planning::build_plan(&request, 1).unwrap();
+    assert_eq!(
+        constrained.placement.assignments.last().unwrap().peer_id,
+        "leader"
+    );
+    assert_eq!(constrained.placement.predicted_decode_us, 103);
+    request.peers[1].healthy = false;
+    assert_eq!(
+        llm_cluster::planning::build_plan(&request, 1).unwrap_err(),
+        llm_cluster::placement::PlanError::NoFeasiblePlacement
+    );
+    request.final_peer_id = Some("unknown".into());
+    assert!(matches!(
+        llm_cluster::planning::build_plan(&request, 1),
+        Err(llm_cluster::placement::PlanError::InvalidInput(_))
+    ));
+}
+
+#[test]
 fn verifies_collected_evidence_and_rejects_budget_overrun() {
     let directory = std::env::temp_dir().join(format!("mesh-verify-{}", std::process::id()));
     std::fs::create_dir_all(&directory).unwrap();

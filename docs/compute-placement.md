@@ -28,6 +28,14 @@ Errors exit unsuccessfully without printing a plan. The command neither binds
 network endpoints nor creates a node key, and does not launch inference or
 verify model file contents. Pass argv elements individually when launching.
 
+Set optional `final_peer_id` to the local peer ID to require its ownership of the
+last block group. The synthetic profile includes `"final_peer_id": "leader"`.
+Unknown IDs fail validation; an ineligible or memory-constrained required peer
+produces no feasible placement. Omitting the field preserves unconstrained
+selection. Library callers can use `placement::plan_with_final_peer` for the same
+constraint. This controls the proposed final block group; verify actual final
+and output tensor ownership in runtime logs separately.
+
 Save planning stdout as `plan.json`, then validate caller-collected evidence:
 
 ```sh
@@ -43,6 +51,44 @@ or model-loading events. Success prints `{"verified":true}`; failure exits
 unsuccessfully with no success output. The command validates supplied observations
 only; it does not gather telemetry, enforce caps, authenticate evidence or stop a
 running process. The launcher must stop/replan on failure.
+
+Launcher integration should call `planning::build_plan` before launch and
+`planning::verify_output` with current profiles and fresh evidence afterward.
+The latter also checks full model coverage, model/runtime/context identity,
+the required final peer, recomputed memory estimates and exact launch argv
+against supplied device mappings. It rejects stale or edited saved plans.
+
+New plan output also includes `runtime_devices`, the selected device mappings in
+assignment order. For each entry with a non-null `rpc_endpoint`, the leader can
+associate `peer_id` with that loopback listener and start its bridge. Entries
+with null endpoints represent local devices. These are caller-supplied mappings;
+the leader must parse/authenticate node IDs and apply enrollment policy itself.
+Never infer remote status from assignment position or parse `server_args` to
+recover endpoint bindings. Legacy JSON loads with an empty device list; a launcher
+requiring structured mappings should reject it and ask for a regenerated plan.
+Verification compares nonempty saved bindings against the current profile.
+Runtime identity must include applied patches/library hashes when the base
+commit alone does not identify the executed runtime. Actual layer/output
+ownership still requires runtime allocation evidence.
+
+Before starting child processes, use
+`planning::validate_output(&request, &output, min_peers)` to check the saved
+plan against current inputs without requiring runtime evidence. It validates
+eligibility, topology and allowed peer order as well as coverage, memory and
+launch mappings. `verify_output` performs the same preflight and then validates
+fresh evidence; do not fabricate telemetry to call it before inference.
+
+The launcher fixture pair `examples/launcher-profile.json` and
+`examples/launcher-plan.json` uses one remote node ID in valid Iroh format and a
+local Metal device. All model/cost/budget values are synthetic. The remote
+identity is an example with no running worker: replace it with the enrolled
+worker's real ID and regenerate before a live launch.
+
+```sh
+cargo run --example check_plan -- examples/launcher-plan.json examples/launcher-profile.json
+```
+
+This checks the fixture and prints the bridge mapping without starting services.
 
 ## Inputs and integration
 
