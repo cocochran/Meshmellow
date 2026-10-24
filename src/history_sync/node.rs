@@ -1,7 +1,8 @@
-use crate::history::{History, NodeId};
-use crate::leader::Leader;
-use crate::message::{Outgoing, SyncMessage};
-use crate::replica::Replica;
+use crate::history_sync::history::{History, NodeId};
+use crate::history_sync::leader::Leader;
+use crate::history_sync::message::{Outgoing, SyncMessage};
+use crate::history_sync::replica::Replica;
+use crate::node::PeerTable;
 
 /// A peer's history-sync role. Handles stepping down when a newer leader shows up.
 #[derive(Debug)]
@@ -22,6 +23,14 @@ impl Node {
         match self {
             Self::Leader(l) => l.history(),
             Self::Replica(r) => r.history(),
+        }
+    }
+
+    /// Makes the main process sync with exactly the peers in `table`.
+    /// Workers don't track peers, so this does nothing on a replica.
+    pub fn set_peers(&mut self, table: &PeerTable) {
+        if let Self::Leader(leader) = self {
+            leader.set_peers(table.ids());
         }
     }
 
@@ -50,13 +59,19 @@ impl Node {
             }
         }
         match self {
-            Self::Replica(r) => r.handle(msg).map(|reply| vec![(from, reply)]).unwrap_or_default(),
+            Self::Replica(r) => r
+                .handle(msg)
+                .map(|reply| vec![(from, reply)])
+                .unwrap_or_default(),
             Self::Leader(_) => unreachable!(),
         }
     }
 
     fn from_newer_leader(leader: &Leader, msg: &SyncMessage) -> bool {
-        matches!(msg, SyncMessage::Snapshot { .. } | SyncMessage::Append { .. }) && msg.epoch() > leader.epoch()
+        matches!(
+            msg,
+            SyncMessage::Snapshot { .. } | SyncMessage::Append { .. }
+        ) && msg.epoch() > leader.epoch()
     }
 
     /// Converts a leader into a replica that keeps its history.

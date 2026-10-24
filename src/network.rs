@@ -16,7 +16,7 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
-use crate::node::PeerTable;
+use crate::node::{NodeId, PeerTable};
 use crate::protocol::{self, CONTROL_ALPN, Hello, Message, PROTOCOL_VERSION};
 
 /// Peer table shared between the accept loop and the code that dials out.
@@ -84,7 +84,7 @@ pub async fn dial_peer(
         .await
         .context("failed to connect to peer")?;
     let hello = finish_handshake(&connection, dialer_handshake(&connection, local)).await?;
-    record_peer(peers, &hello)?;
+    record_peer(peers, connection.remote_id(), &hello)?;
     Ok((connection, hello))
 }
 
@@ -122,14 +122,44 @@ pub async fn serve_control(
 }
 
 /// Handles one incoming control connection from hello to disconnect, logging the outcome.
+///
+/// When the connection closes the peer is removed from `peers`, unless it has already
+/// reconnected on a newer connection.
 async fn run_control_session(incoming: Incoming, local: &Hello, peers: &SharedPeerTable) {
     match accept_peer(incoming, local, peers).await {
         Ok((connection, hello)) => {
+            let remote = connection.remote_id();
+            let connected_at = connected_at(peers, &remote);
             let reason = connection.closed().await;
             info!(peer = %hello.node_id, %reason, "peer disconnected");
+            if let Some(connected_at) = connected_at {
+                forget_peer(peers, &remote, connected_at);
+            }
         }
         Err(error) => warn!("rejected incoming connection: {error:#}"),
     }
+}
+
+/// Removes `node_id` from `peers` once its connection that started at `connected_at_unix_ms`
+/// has closed; a newer connection from the same peer is kept.
+///
+/// [`serve_control`] does this for incoming connections. Code that keeps a connection from
+/// [`dial_peer`] open should call it when that connection closes.
+pub fn forget_peer(peers: &SharedPeerTable, node_id: &NodeId, connected_at_unix_ms: u64) {
+    match peers.lock() {
+        Ok(mut table) => {
+            if table.remove_connection(node_id, connected_at_unix_ms) {
+                info!(peer = %node_id, "peer removed from table");
+            }
+        }
+        Err(_) => warn!(peer = %node_id, "peer table lock poisoned; peer not removed"),
+    }
+}
+
+/// The recorded connection time for `node_id`, if it is in the table.
+fn connected_at(peers: &SharedPeerTable, node_id: &NodeId) -> Option<u64> {
+    let table = peers.lock().ok()?;
+    table.get(node_id).map(|info| info.connected_at_unix_ms)
 }
 
 /// Runs one side of the hello exchange under [`HELLO_TIMEOUT`], closing the connection with
@@ -177,7 +207,7 @@ async fn acceptor_handshake(
         .context("peer never opened the hello stream")?;
     let hello = read_hello(&mut recv).await?;
     validate_hello(&hello, connection.remote_id(), local)?;
-    record_peer(peers, &hello)?;
+    record_peer(peers, connection.remote_id(), &hello)?;
     protocol::write_frame(&mut send, &Message::Hello(local.clone())).await?;
     finish_stream(&mut send)?;
     Ok(hello)
@@ -214,11 +244,12 @@ fn validate_hello(hello: &Hello, remote: EndpointId, local: &Hello) -> anyhow::R
     Ok(())
 }
 
-fn record_peer(peers: &SharedPeerTable, hello: &Hello) -> anyhow::Result<()> {
+/// Records the validated peer under its authenticated node ID.
+fn record_peer(peers: &SharedPeerTable, remote: NodeId, hello: &Hello) -> anyhow::Result<()> {
     let mut table = peers
         .lock()
         .map_err(|_| anyhow!("peer table lock poisoned"))?;
-    let info = table.record_connection(hello);
+    let info = table.record_connection(remote, hello);
     info!(
         peer = %info.node_id,
         protocol_version = info.protocol_version,

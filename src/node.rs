@@ -6,11 +6,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::protocol::Hello;
 
+/// Identifies a node everywhere in the crate: its Iroh endpoint ID (an Ed25519 public key).
+pub type NodeId = iroh::EndpointId;
+
 /// What this node knows about one peer, taken from that peer's most recent [`Hello`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerInfo {
-    /// Peer's Iroh node ID as text.
-    pub node_id: String,
+    /// Peer's Iroh node ID, as authenticated by the connection.
+    pub node_id: NodeId,
     /// Protocol version the peer announced.
     pub protocol_version: u16,
     /// Wall-clock UTC time (Unix ms) of this peer's most recent connection; overwritten on reconnect.
@@ -18,10 +21,10 @@ pub struct PeerInfo {
     pub connected_at_unix_ms: u64,
 }
 
-/// Peers this node has completed a hello exchange with, keyed by node ID.
+/// Peers this node currently has a control connection with, keyed by node ID.
 #[derive(Debug, Default)]
 pub struct PeerTable {
-    peers: HashMap<String, PeerInfo>,
+    peers: HashMap<NodeId, PeerInfo>,
 }
 
 impl PeerTable {
@@ -30,19 +33,24 @@ impl PeerTable {
         Self::default()
     }
 
-    /// Records a connection from the peer that sent `hello`, stamped with the current wall-clock time.
-    pub fn record_connection(&mut self, hello: &Hello) -> &PeerInfo {
-        self.record_connection_at(hello, now_unix_ms())
+    /// Records a connection from `node_id`, which sent `hello`, stamped with the current wall-clock time.
+    pub fn record_connection(&mut self, node_id: NodeId, hello: &Hello) -> &PeerInfo {
+        self.record_connection_at(node_id, hello, now_unix_ms())
     }
 
     /// Records a connection at an explicit Unix-ms timestamp, replacing any earlier entry for that peer.
-    pub fn record_connection_at(&mut self, hello: &Hello, connected_at_unix_ms: u64) -> &PeerInfo {
+    pub fn record_connection_at(
+        &mut self,
+        node_id: NodeId,
+        hello: &Hello,
+        connected_at_unix_ms: u64,
+    ) -> &PeerInfo {
         let info = PeerInfo {
-            node_id: hello.node_id.clone(),
+            node_id,
             protocol_version: hello.protocol_version,
             connected_at_unix_ms,
         };
-        match self.peers.entry(hello.node_id.clone()) {
+        match self.peers.entry(node_id) {
             Entry::Occupied(mut existing) => {
                 existing.insert(info);
                 existing.into_mut()
@@ -51,14 +59,33 @@ impl PeerTable {
         }
     }
 
+    /// Removes a peer whose connection closed, unless it has reconnected since.
+    ///
+    /// `connected_at_unix_ms` identifies the closed connection: if the entry carries a different
+    /// timestamp, a newer connection replaced it and the entry is kept. Returns whether it was removed.
+    pub fn remove_connection(&mut self, node_id: &NodeId, connected_at_unix_ms: u64) -> bool {
+        match self.peers.entry(*node_id) {
+            Entry::Occupied(entry) if entry.get().connected_at_unix_ms == connected_at_unix_ms => {
+                entry.remove();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Looks up a peer by node ID.
-    pub fn get(&self, node_id: &str) -> Option<&PeerInfo> {
+    pub fn get(&self, node_id: &NodeId) -> Option<&PeerInfo> {
         self.peers.get(node_id)
     }
 
     /// Iterates over every known peer in no particular order.
     pub fn peers(&self) -> impl Iterator<Item = &PeerInfo> {
         self.peers.values()
+    }
+
+    /// Iterates over the node IDs of every known peer in no particular order.
+    pub fn ids(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.peers.keys().copied()
     }
 }
 
@@ -75,9 +102,13 @@ mod tests {
     use super::*;
     use crate::protocol::PROTOCOL_VERSION;
 
-    fn hello(node_id: &str) -> Hello {
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn hello(node_id: NodeId) -> Hello {
         Hello {
-            node_id: node_id.to_owned(),
+            node_id: node_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
             cluster_id: "test".to_owned(),
             last_log_index: 0,
@@ -86,19 +117,21 @@ mod tests {
 
     #[test]
     fn record_stores_hello_fields() {
+        let a = node(1);
         let mut table = PeerTable::new();
-        let info = table.record_connection_at(&hello("a"), 1_000).clone();
+        let info = table.record_connection_at(a, &hello(a), 1_000).clone();
 
-        assert_eq!(info.node_id, "a");
+        assert_eq!(info.node_id, a);
         assert_eq!(info.protocol_version, PROTOCOL_VERSION);
         assert_eq!(info.connected_at_unix_ms, 1_000);
     }
 
     #[test]
     fn record_uses_current_time() {
+        let a = node(1);
         let before = now_unix_ms();
         let mut table = PeerTable::new();
-        let stamped = table.record_connection(&hello("a")).connected_at_unix_ms;
+        let stamped = table.record_connection(a, &hello(a)).connected_at_unix_ms;
 
         assert!(stamped >= before);
         assert!(stamped <= now_unix_ms());
@@ -106,22 +139,50 @@ mod tests {
 
     #[test]
     fn reconnect_overwrites_connected_at() {
+        let a = node(1);
         let mut table = PeerTable::new();
-        table.record_connection_at(&hello("a"), 1_000);
-        table.record_connection_at(&hello("a"), 2_000);
+        table.record_connection_at(a, &hello(a), 1_000);
+        table.record_connection_at(a, &hello(a), 2_000);
 
         assert_eq!(table.peers().count(), 1);
-        assert_eq!(table.get("a").map(|p| p.connected_at_unix_ms), Some(2_000));
+        assert_eq!(table.get(&a).map(|p| p.connected_at_unix_ms), Some(2_000));
     }
 
     #[test]
     fn lookup_finds_only_recorded_peers() {
+        let (a, b, c) = (node(1), node(2), node(3));
         let mut table = PeerTable::new();
-        table.record_connection_at(&hello("a"), 1_000);
-        table.record_connection_at(&hello("b"), 1_500);
+        table.record_connection_at(a, &hello(a), 1_000);
+        table.record_connection_at(b, &hello(b), 1_500);
 
-        assert_eq!(table.get("b").map(|p| p.node_id.as_str()), Some("b"));
-        assert!(table.get("c").is_none());
+        assert_eq!(table.get(&b).map(|p| p.node_id), Some(b));
+        assert!(table.get(&c).is_none());
         assert_eq!(table.peers().count(), 2);
+        let mut ids: Vec<_> = table.ids().collect();
+        ids.sort();
+        let mut expected = vec![a, b];
+        expected.sort();
+        assert_eq!(ids, expected);
+    }
+
+    #[test]
+    fn closing_a_connection_removes_the_peer() {
+        let a = node(1);
+        let mut table = PeerTable::new();
+        table.record_connection_at(a, &hello(a), 1_000);
+
+        assert!(table.remove_connection(&a, 1_000));
+        assert!(table.get(&a).is_none());
+    }
+
+    #[test]
+    fn closing_an_old_connection_keeps_the_reconnected_peer() {
+        let a = node(1);
+        let mut table = PeerTable::new();
+        table.record_connection_at(a, &hello(a), 1_000);
+        table.record_connection_at(a, &hello(a), 2_000);
+
+        assert!(!table.remove_connection(&a, 1_000));
+        assert_eq!(table.get(&a).map(|p| p.connected_at_unix_ms), Some(2_000));
     }
 }

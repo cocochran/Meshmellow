@@ -1,7 +1,7 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::history::{Entry, Epoch, History, NodeId, Role, Seq};
-use crate::message::{Outgoing, SyncMessage};
+use crate::history_sync::history::{Entry, Epoch, History, NodeId, Role, Seq};
+use crate::history_sync::message::{Outgoing, SyncMessage};
 
 /// Per-peer replication state tracked by the main process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,8 +26,19 @@ pub struct Leader {
 }
 
 impl Leader {
-    pub fn new(id: NodeId, epoch: Epoch, history: History, peers: impl IntoIterator<Item = NodeId>) -> Self {
-        let mut leader = Self { id, epoch, history, peers: BTreeMap::new(), deposed_by: None };
+    pub fn new(
+        id: NodeId,
+        epoch: Epoch,
+        history: History,
+        peers: impl IntoIterator<Item = NodeId>,
+    ) -> Self {
+        let mut leader = Self {
+            id,
+            epoch,
+            history,
+            peers: BTreeMap::new(),
+            deposed_by: None,
+        };
         for peer in peers {
             leader.add_peer(peer);
         }
@@ -67,6 +78,18 @@ impl Leader {
 
     pub fn remove_peer(&mut self, peer: NodeId) {
         self.peers.remove(&peer);
+    }
+
+    /// Replaces the peer list with `peers`, e.g. the IDs in the node's `PeerTable`.
+    ///
+    /// Peers already tracked keep their progress; new ones start with a snapshot,
+    /// and peers that are no longer listed stop being synced.
+    pub fn set_peers(&mut self, peers: impl IntoIterator<Item = NodeId>) {
+        let current: BTreeSet<NodeId> = peers.into_iter().filter(|&peer| peer != self.id).collect();
+        self.peers.retain(|peer, _| current.contains(peer));
+        for peer in current {
+            self.peers.entry(peer).or_insert(PeerState::NeedsSnapshot);
+        }
     }
 
     /// Peers that hold the full current history.
@@ -118,7 +141,11 @@ impl Leader {
     }
 
     fn snapshot(&self) -> SyncMessage {
-        SyncMessage::Snapshot { epoch: self.epoch, leader: self.id, entries: self.history.entries().to_vec() }
+        SyncMessage::Snapshot {
+            epoch: self.epoch,
+            leader: self.id,
+            entries: self.history.entries().to_vec(),
+        }
     }
 
     /// Handles a reply from a worker and returns any immediate follow-up messages.
@@ -142,13 +169,15 @@ impl Leader {
                 }
                 Vec::new()
             }
-            SyncMessage::Resync { epoch, .. } if epoch == self.epoch => match self.peers.get_mut(&from) {
-                Some(state) => {
-                    *state = PeerState::NeedsSnapshot;
-                    vec![(from, self.snapshot())]
+            SyncMessage::Resync { epoch, .. } if epoch == self.epoch => {
+                match self.peers.get_mut(&from) {
+                    Some(state) => {
+                        *state = PeerState::NeedsSnapshot;
+                        vec![(from, self.snapshot())]
+                    }
+                    None => Vec::new(),
                 }
-                None => Vec::new(),
-            },
+            }
             // A peer still on an older epoch sent us something: tell it who's in charge.
             msg if msg.epoch() < self.epoch && !matches!(msg, SyncMessage::Reject { .. }) => {
                 vec![(from, SyncMessage::Reject { epoch: self.epoch })]

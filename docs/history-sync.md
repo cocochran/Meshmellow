@@ -1,8 +1,8 @@
-# history-sync — Design Documentation
+# History sync — Design Documentation
 
-Prototype of conversation-history synchronization for MeshThing. This file documents every structure and function in the crate: what it does, **why it's built that way**, and — in each **"As the project evolves"** subsection — what will likely need to change.
+Prototype of conversation-history synchronization for MeshThing. This file documents every structure and function in the `history_sync` module of `llm-cluster` (`src/history_sync/`): what it does, **why it's built that way**, and — in each **"As the project evolves"** subsection — what will likely need to change.
 
-> **Status:** prototype on the `history-sync` branch. History lives in memory only; nothing is persisted to disk yet.
+> **Status:** prototype on the `history-sync` branch, merged into the main `llm-cluster` crate as the `history_sync` module (`src/history_sync/`). History lives in memory only; nothing is persisted to disk yet.
 
 ## Contents
 
@@ -15,7 +15,7 @@ Prototype of conversation-history synchronization for MeshThing. This file docum
 7. [`election.rs` — failover choice](#7-electionrs--failover-choice)
 8. [`node.rs` — role switching](#8-noders--role-switching)
 9. [`sim.rs` — in-memory cluster](#9-simrs--in-memory-cluster)
-10. [`main.rs` — demo binary](#10-mainrs--demo-binary)
+10. [`examples/history_sync.rs` — demo binary](#10-exampleshistory_syncrs--demo-binary)
 11. [Tests](#11-tests)
 12. [Cross-cutting future work](#12-cross-cutting-future-work)
 
@@ -23,7 +23,7 @@ Prototype of conversation-history synchronization for MeshThing. This file docum
 
 ## 1. Overview
 
-The README requires that after every completed task the main process sends the conversation history to every worker, so any peer can take over if the prompted device drops out. This crate implements that for **any number of nodes**:
+The README requires that after every completed task the main process sends the conversation history to every worker, so any peer can take over if the prompted device drops out. These modules implement that for **any number of nodes**:
 
 - One **`Leader`** (the main process) owns the authoritative history.
 - Every other peer runs a **`Replica`** holding a copy.
@@ -50,8 +50,8 @@ replica.rs   Replica — worker sync logic + promote()
 election.rs  Candidate, Elected, elect()
 node.rs      Node — Leader|Replica with automatic step-down
 sim.rs       Cluster — in-memory network for tests and the demo
-main.rs      Demo binary
-lib.rs       Re-exports the public API
+examples/history_sync.rs  Demo binary
+tests/history_sync.rs     Integration tests
 ```
 
 ---
@@ -86,7 +86,7 @@ Stale leader (epoch E-1) --- Append ---> Replica (epoch E)
 ### Type aliases: `NodeId`, `Epoch`, `Seq`
 
 ```rust
-pub type NodeId = u64;
+pub use crate::node::NodeId; // = iroh::EndpointId
 pub type Epoch  = u64;
 pub type Seq    = u64;
 ```
@@ -95,10 +95,10 @@ pub type Seq    = u64;
 - **`Epoch`** is the leadership term, bumped on every failover.
 - **`Seq`** is a history length, which is also the index of the next entry.
 
-**Why:** Aliases document intent at every call site (`fn handle(from: NodeId, …)`) without the friction of newtypes in a prototype. `u64` keeps them `Copy`, cheap to hash and order, and trivially serializable. `Seq` doubles as "length" and "next index" because the history is append-only, so one number fully describes a replica's progress.
+**Why:** `NodeId` is the Iroh endpoint ID (a 32-byte public key), defined once in `src/node.rs` and shared with the `PeerTable`, so a peer has the same ID in networking and in history sync. It's `Copy`, ordered (needed for deterministic tie-breaking) and serializable. `Epoch` and `Seq` stay `u64` aliases that document intent at every call site. `Seq` doubles as "length" and "next index" because the history is append-only, so one number fully describes a replica's progress.
 
 #### As the project evolves
-- **`NodeId` must become the Iroh endpoint ID** (a public key, 32 bytes). Yash's P2P layer already has one. Expect `type NodeId = iroh::NodeId` or a newtype around `[u8; 32]`. Ordering (`Ord`) is still needed for deterministic tie-breaking, and byte arrays provide it.
+- The wire `Hello.node_id` is still a `String`; peers are recorded under the connection's authenticated ID, not the string.
 - Consider **newtypes** (`struct Epoch(u64)`) once the crate stabilises, so an epoch can't be passed where a length is expected.
 - The architecture doc's event log uses `(term, index)` — that's `(Epoch, Seq)` under different names. Keep them aligned if the shared protocol crate adopts that naming.
 
@@ -245,7 +245,7 @@ Fields: `id`, `epoch`, `history`, `peers: BTreeMap<NodeId, PeerState>`, `deposed
 - **Quorum commit (open decision B):** use the ack table to compute a commit index (the highest `Seq` acked by a majority of voters), and only report a task as durably saved once it's committed. Needed for the "strict no-loss" policy in architecture §9.
 - **Snapshot cost:** after failover, every peer gets a full snapshot. Once `prev_hash` exists, a replica whose prefix matches could get an append instead.
 - **Streaming chunks:** `complete_task` only syncs at task end. The architecture doc suggests committing response chunks during generation so less is lost on failure.
-- **Membership** should come from the heartbeat task / Yash's `PeerInfo`, not manual `add_peer` calls.
+- **Membership:** `Leader::set_peers` (or `Node::set_peers(&PeerTable)`) replaces the peer list from the `PeerTable`, keeping existing peers' progress. Incoming connections leave the table when they close; dialed connections must call `network::forget_peer` themselves. Nothing calls `set_peers` on a live node yet, because there's no control loop.
 - **Job queue:** the leader is also meant to own the FIFO job queue (§10); its state changes would ride this same log.
 
 ---
@@ -286,13 +286,11 @@ Fields: `id`, `epoch`, `leader: Option<NodeId>`, `history`, `in_sync_epoch: bool
 
 ## 7. `election.rs` — failover choice
 
-> A connection-time ranking was started and reverted (see commit `3a4f323` on local `main`); "As the project evolves" below describes how to add it without breaking fencing.
+### `struct Candidate { id, epoch, len, connected_at_unix_ms }`
 
-### `struct Candidate { id, epoch, len }`
+What a surviving peer reports when the main process is lost: its epoch, history length, and when it last connected (from `PeerInfo.connected_at_unix_ms` in `src/node.rs`).
 
-What a surviving peer reports when the main process is lost: its epoch and history length.
-
-**Why these fields:** The replacement should lose as little history as possible. The highest epoch plus the longest history identifies the most up-to-date copy.
+**Why these fields:** The replacement should lose as little history as possible, so the highest epoch plus the longest history identifies the most up-to-date copy. Among equally up-to-date peers, the one connected longest is preferred as the likeliest to stay online.
 
 ### `struct Elected { id, epoch }`
 
@@ -302,19 +300,18 @@ The winner and the **new** epoch it must lead with.
 
 ### `fn elect(candidates) -> Option<Elected>`
 
-Picks the candidate with the highest `(epoch, len)`, breaks ties by lowest `NodeId`, and returns `epoch = max_epoch + 1`. Returns `None` if there are no candidates.
+Picks the candidate with the highest `(epoch, len)`, then the earliest `connected_at_unix_ms` (connected longest), then the lowest `NodeId`, and returns `epoch = max_epoch + 1`. Returns `None` if there are no candidates.
 
 **Why:**
 - **Deterministic:** every survivor that sees the same candidate list picks the same winner, without another round of messages.
 - **Most-complete history first:** minimizes lost conversation.
-- **Lowest ID on ties:** an arbitrary but stable rule.
+- **Connection time second, not first:** a long-connected peer with a shorter history would overwrite newer entries on every other node. And because it's a wall-clock reading that can differ between devices, it only breaks ties.
+- **Lowest ID last:** an arbitrary but stable rule.
 
 **Known limitation (documented in code):** this is a *preference*, not consensus. If survivors see different candidate lists (a network partition), two winners are possible. The architecture doc (§9) says automatic failover is only safe with a majority vote of at least 3 voting nodes, and that 2-node demos should use **manual takeover**. David's bot confirmed its tests will use manual takeover.
 
 #### As the project evolves
-- **Connection time (Yash's attribute):** the P2P layer exposes `PeerInfo.connected_at_unix_ms: u64` (UTC ms of the most recent connection, overwritten on reconnect). To prefer long-connected nodes:
-  - Add it as a **new field**, e.g. `connected_at_unix_ms: u64`. **Do not replace `epoch`**: `Elected.epoch` must stay "highest epoch seen + 1", or fencing breaks.
-  - Use it as a **tie-breaker or secondary rule**, since device clocks can be skewed. Earlier connection (a smaller value) means longer uptime. The architecture doc says not to rely on wall-clock time for ordering or fencing.
+- **Real connection times:** `Candidate.connected_at_unix_ms` is filled from the simulator's `PeerTable` (a logical clock). A live node uses `Replica::candidate(connected_at)` with the value from its `PeerTable` entry (and its own start time) when building candidates. Note that a reconnect resets it, so a briefly dropped node loses its seniority.
 - **Reliability ranking (architecture §2):** prefer always-on desktops over phones that may sleep. Add device class, power source, or uptime to `Candidate`.
 - **Real consensus:** replace with Raft-style voting (terms, majority votes, explicit voter set) once 3+ voters exist. The `Candidate` fields map onto Raft's "last log term / index" rule for vote eligibility.
 - **Manual takeover mode** for 2 nodes: a function that promotes a user-chosen node, still bumping the epoch.
@@ -382,9 +379,9 @@ Fields: `nodes`, a FIFO `queue`, an `offline` set, `drop_next` counts per node, 
 
 ---
 
-## 10. `main.rs` — demo binary
+## 10. `examples/history_sync.rs` — demo binary
 
-`cargo run -- <nodes>` (default 5, minimum 2) runs this scenario on a simulated mesh:
+`cargo run --example history_sync -- <nodes>` (default 5, minimum 2) runs this scenario on a simulated mesh:
 
 1. Three tasks, with one message to the last node dropped.
 2. A retransmit.
@@ -408,7 +405,7 @@ Replace or supplement it with a real CLI once Iroh integration lands, e.g. a `me
 
 ## 11. Tests
 
-`tests/cluster.rs` — integration tests against the public API:
+`tests/history_sync.rs` — integration tests against the public API:
 
 | Test | What it proves |
 |---|---|
@@ -441,5 +438,5 @@ Prioritized list of changes not tied to a single item:
 5. **Event-log entries** in place of chat turns (architecture §9).
 6. **Commit policy (open decision B):** best-effort replication (current) or majority commit.
 7. **Election:** manual takeover for 2 nodes (agreed with David's bot); real consensus once there are 3+ voters; connection time and reliability as a preference.
-8. **Membership** driven by heartbeats and the P2P layer's `PeerInfo`, not manual `add_peer`.
+8. **Membership:** call `Node::set_peers(&PeerTable)` whenever the peer table changes, once a control loop exists; add heartbeat timeouts so a silent peer is removed too.
 9. **Security:** encryption at rest, authenticated sender checks, size limits on snapshots.

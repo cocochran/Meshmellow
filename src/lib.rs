@@ -1,5 +1,6 @@
 //! MeshThing: a peer-to-peer mesh that splits one LLM across devices.
 
+pub mod history_sync;
 pub mod network;
 pub mod node;
 pub mod placement;

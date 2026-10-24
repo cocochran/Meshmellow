@@ -67,7 +67,7 @@ impl TestNode {
 
     fn assert_knows(&self, other: &TestNode) {
         let table = self.peers.lock().expect("peer table lock");
-        let info = table.get(&other.hello.node_id).unwrap_or_else(|| {
+        let info = table.get(&other.endpoint.id()).unwrap_or_else(|| {
             panic!(
                 "{} does not list {}",
                 self.hello.node_id, other.hello.node_id

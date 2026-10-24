@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-/// Identifies a peer in the mesh. With Iroh this would map to a `NodeId`/public key.
-pub type NodeId = u64;
+/// Identifies a peer in the mesh: its Iroh endpoint ID, the same type the peer table uses.
+pub use crate::node::NodeId;
 /// Leadership term. Bumped on every failover so stale main processes can be rejected.
 pub type Epoch = u64;
 /// Number of history entries, i.e. the index of the next entry to be appended.
@@ -23,7 +23,11 @@ pub struct Entry {
 
 impl Entry {
     pub fn new(task_id: u64, role: Role, content: impl Into<String>) -> Self {
-        Self { task_id, role, content: content.into() }
+        Self {
+            task_id,
+            role,
+            content: content.into(),
+        }
     }
 }
 

@@ -1,6 +1,7 @@
-use crate::history::{Epoch, History, NodeId, Seq};
-use crate::leader::Leader;
-use crate::message::SyncMessage;
+use crate::history_sync::election::Candidate;
+use crate::history_sync::history::{Epoch, History, NodeId, Seq};
+use crate::history_sync::leader::Leader;
+use crate::history_sync::message::SyncMessage;
 
 /// History-sync side of a worker on a non-prompted device. Holds a copy of the
 /// history so it can take over as the main process if the leader disappears.
@@ -21,7 +22,13 @@ impl Replica {
 
     /// A replica that keeps existing history, e.g. a main process that stepped down.
     pub fn with_history(id: NodeId, epoch: Epoch, history: History) -> Self {
-        Self { id, epoch, leader: None, history, in_sync_epoch: false }
+        Self {
+            id,
+            epoch,
+            leader: None,
+            history,
+            in_sync_epoch: false,
+        }
     }
 
     pub fn id(&self) -> NodeId {
@@ -48,6 +55,17 @@ impl Replica {
         self.history.is_empty()
     }
 
+    /// This replica's entry for a failover election. `connected_at_unix_ms` is when
+    /// it joined the mesh, as the other peers' `PeerTable`s record it.
+    pub fn candidate(&self, connected_at_unix_ms: u64) -> Candidate {
+        Candidate {
+            id: self.id,
+            epoch: self.epoch,
+            len: self.len(),
+            connected_at_unix_ms,
+        }
+    }
+
     /// Applies a message from the main process and returns the reply to send back.
     pub fn handle(&mut self, msg: SyncMessage) -> Option<SyncMessage> {
         if msg.epoch() < self.epoch {
@@ -57,21 +75,33 @@ impl Replica {
             };
         }
         match msg {
-            SyncMessage::Snapshot { epoch, leader, entries } => {
+            SyncMessage::Snapshot {
+                epoch,
+                leader,
+                entries,
+            } => {
                 self.epoch = epoch;
                 self.leader = Some(leader);
                 self.history = History::from_entries(entries);
                 self.in_sync_epoch = true;
                 Some(self.ack())
             }
-            SyncMessage::Append { epoch, leader, start, entries } => {
+            SyncMessage::Append {
+                epoch,
+                leader,
+                start,
+                entries,
+            } => {
                 // A new leader's history may diverge from ours, so only accept
                 // appends after its snapshot, and only without gaps.
                 if epoch > self.epoch || !self.in_sync_epoch || start > self.len() {
                     self.epoch = epoch;
                     self.leader = Some(leader);
                     self.in_sync_epoch = false;
-                    return Some(SyncMessage::Resync { epoch, len: self.len() });
+                    return Some(SyncMessage::Resync {
+                        epoch,
+                        len: self.len(),
+                    });
                 }
                 // Skip entries we already have from a retransmission.
                 let skip = (self.len() - start) as usize;
@@ -90,7 +120,10 @@ impl Replica {
     }
 
     fn ack(&self) -> SyncMessage {
-        SyncMessage::Ack { epoch: self.epoch, len: self.len() }
+        SyncMessage::Ack {
+            epoch: self.epoch,
+            len: self.len(),
+        }
     }
 
     /// Becomes the new main process after failover, seeded from this replica's history.
