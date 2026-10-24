@@ -71,6 +71,8 @@ def measure(base: str, payload: dict[str, Any], timeout: float) -> dict[str, Any
                     done = True
                     break
                 event = json.loads(data)
+                if not isinstance(event, dict):
+                    raise RuntimeError("Expected a JSON object in the generation stream")
                 if "error" in event:
                     raise RuntimeError(str(event["error"]))
                 if event.get("usage"):
@@ -91,6 +93,11 @@ def measure(base: str, payload: dict[str, Any], timeout: float) -> dict[str, Any
     except (OSError, ValueError, RuntimeError, http.client.HTTPException) as error:
         result["error"] = str(error)
     result["elapsed_seconds"] = time.monotonic() - started
+    tokens = result.get("usage", {}).get("completion_tokens", 0)
+    ttft = result["ttft_seconds"]
+    if result["status"] == "passed" and tokens > 1 and ttft is not None:
+        result["delivered_generation_tokens_per_second"] = (
+            (tokens - 1) / (result["elapsed_seconds"] - ttft))
     return result
 
 
@@ -142,6 +149,8 @@ def main() -> int:
         report["server"] = {key: props.get(key) for key in
                             ["model_alias", "model_ftype", "build_info", "total_slots"]}
         report["server"]["n_ctx"] = props.get("default_generation_settings", {}).get("n_ctx")
+        report["server"]["speculative_types"] = props.get(
+            "default_generation_settings", {}).get("params", {}).get("speculative.types")
         report["server"]["chat_template_sha256"] = hashlib.sha256(
             props.get("chat_template", "").encode()).hexdigest()
         report["limitations"].append("Server model hash is not remotely verified; filename match only.")

@@ -72,6 +72,10 @@ class StreamingEvidenceTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertIn("worker lost", result["error"])
 
+    def test_non_object_event_is_failure(self) -> None:
+        with patch("urllib.request.urlopen", return_value=stream("[]")):
+            self.assertEqual(measure("http://localhost", {}, 5)["status"], "failed")
+
 
 if __name__ == "__main__":
     unittest.main()

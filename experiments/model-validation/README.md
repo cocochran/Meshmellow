@@ -1,5 +1,8 @@
 # Model validation (M-12, M-13)
 
+See [throughput tuning](TUNING.md) for placement, prediction, Iroh and RPC trace
+comparisons, including optimizations that did not reproduce a speedup.
+
 This harness measures an already running llama.cpp server using Python 3.10+
 and the standard library. It saves the model SHA-256, runtime commit, chat
 template hash, context, full request, streamed response, first-visible-text
