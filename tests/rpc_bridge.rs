@@ -3,13 +3,17 @@
 //! disabled, so the endpoints talk over a direct path.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use iroh::address_lookup::memory::MemoryLookup;
-use iroh::endpoint::presets;
+use iroh::endpoint::{ConnectionError, presets};
 use iroh::{Endpoint, EndpointAddr, RelayMode};
 use llm_cluster::protocol::RPC_BRIDGE_ALPN;
-use llm_cluster::rpc_bridge::{run_leader, serve_worker};
+use llm_cluster::rpc_bridge::{
+    PEER_NOT_APPROVED, PEER_NOT_APPROVED_REASON, PeerAllowlist, run_leader, serve_worker,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -24,6 +28,8 @@ const ABORTED_PAYLOAD_LEN: usize = 64 * 1024;
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 const LISTENER_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const LOOPBACK_ANY_PORT: &str = "127.0.0.1:0";
+/// Grace period for a wrongly forwarded stream to reach the RPC server before asserting it never did.
+const STRAY_FORWARD_GRACE: Duration = Duration::from_millis(200);
 
 /// The three running pieces of a bridge plus the leader's client-facing address.
 struct Bridge {
@@ -43,10 +49,11 @@ impl Bridge {
         lookup.add_endpoint_info(direct_addr(&worker_endpoint));
 
         let leader_listen = free_loopback_port().await;
+        let allowed = PeerAllowlist::new([leader_endpoint.id()]).expect("allowlist");
         let worker = tokio::spawn({
             let endpoint = worker_endpoint.clone();
             async move {
-                serve_worker(endpoint, echo_addr)
+                serve_worker(endpoint, echo_addr, allowed)
                     .await
                     .expect("worker bridge")
             }
@@ -130,6 +137,22 @@ async fn spawn_echo_server() -> SocketAddr {
         }
     });
     addr
+}
+
+/// Fake `ggml-rpc-server` that only counts the connections it receives.
+async fn spawn_counting_server() -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind(LOOPBACK_ANY_PORT)
+        .await
+        .expect("bind counting server");
+    let addr = listener.local_addr().expect("counting server address");
+    let connects = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&connects);
+    tokio::spawn(async move {
+        while listener.accept().await.is_ok() {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    (addr, connects)
 }
 
 /// Reserves an ephemeral loopback port for the leader listener (run_leader binds it itself).
@@ -228,4 +251,54 @@ async fn listener_survives_an_aborted_client() {
     .expect("later client is still served");
     assert_eq!(echoed, SMALL_PAYLOAD);
     bridge.shut_down().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unapproved_peer_is_closed_before_reaching_the_rpc_server() {
+    init_tracing();
+    let (rpc_addr, connects) = spawn_counting_server().await;
+    let worker_endpoint = bind_endpoint(vec![RPC_BRIDGE_ALPN.to_vec()], None).await;
+    let someone_else = iroh::SecretKey::generate().public();
+    let allowed = PeerAllowlist::new([someone_else]).expect("allowlist");
+    let worker = tokio::spawn({
+        let endpoint = worker_endpoint.clone();
+        async move {
+            serve_worker(endpoint, rpc_addr, allowed)
+                .await
+                .expect("worker bridge")
+        }
+    });
+
+    let stranger = bind_endpoint(Vec::new(), None).await;
+    let connection = stranger
+        .connect(direct_addr(&worker_endpoint), RPC_BRIDGE_ALPN)
+        .await
+        .expect("the handshake itself succeeds; authorization happens after it");
+    // Try to use the bridge anyway; the worker must refuse before forwarding anything.
+    if let Ok((mut send, _recv)) = connection.open_bi().await {
+        // The connection may already be closed, in which case the write fails, as it should.
+        let _ = send.write_all(b"ggml rpc command").await;
+    }
+    let closed = timeout(TEST_TIMEOUT, connection.closed())
+        .await
+        .expect("worker closes the connection");
+
+    let ConnectionError::ApplicationClosed(close) = closed else {
+        panic!("expected an application close, got {closed:?}");
+    };
+    assert_eq!(close.error_code, PEER_NOT_APPROVED);
+    assert_eq!(&close.reason[..], PEER_NOT_APPROVED_REASON);
+    tokio::time::sleep(STRAY_FORWARD_GRACE).await;
+    assert_eq!(
+        connects.load(Ordering::SeqCst),
+        0,
+        "the rpc server must never see an unapproved peer"
+    );
+
+    stranger.close().await;
+    worker_endpoint.close().await;
+    timeout(TEST_TIMEOUT, worker)
+        .await
+        .expect("worker stops after endpoint close")
+        .expect("worker did not panic");
 }
