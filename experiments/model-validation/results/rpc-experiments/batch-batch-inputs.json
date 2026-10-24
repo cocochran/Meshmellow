@@ -1,0 +1,153 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-10-24T19:23:08.917392+00:00",
+  "transport": "ssh-rpc",
+  "base_url": "http://127.0.0.1:8082",
+  "platform": "macOS-26.7.1-arm64-arm-64bit-Mach-O",
+  "status": "passed",
+  "runs": [
+    {
+      "status": "passed",
+      "text": "Splitting a single model distributes its weights across two machines to run one unified system, whereas running two independent models creates two separate systems with distinct parameters. The split model shares a single knowledge base and produces consistent outputs, while independent models operate as separate entities that may generate different results. This approach optimizes hardware utilization for one task, unlike parallel independent runs which process two completely separate tasks simultaneously.",
+      "ttft_seconds": 0.7819313749932917,
+      "server_timings": {
+        "cache_n": 0,
+        "prompt_n": 34,
+        "prompt_ms": 776.047,
+        "prompt_per_token_ms": 22.824911764705885,
+        "prompt_per_second": 43.81177944119364,
+        "predicted_n": 79,
+        "predicted_ms": 5981.298,
+        "predicted_per_token_ms": 76.6833076923077,
+        "predicted_per_second": 13.0406476988774
+      },
+      "finish_reason": "stop",
+      "usage": {
+        "completion_tokens": 79,
+        "prompt_tokens": 34,
+        "total_tokens": 113,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "elapsed_seconds": 6.76324395800475,
+      "delivered_generation_tokens_per_second": 13.040615904532567,
+      "run": 1
+    },
+    {
+      "status": "passed",
+      "text": "Splitting a single model distributes its weights across two machines to run one unified system, whereas running two independent models creates two separate systems with distinct parameters. The split model shares a single knowledge base and produces consistent outputs, while independent models operate as separate entities that may generate different results. This approach optimizes hardware utilization for one task, unlike parallel independent runs which process two completely separate tasks simultaneously.",
+      "ttft_seconds": 0.40786245799972676,
+      "server_timings": {
+        "cache_n": 0,
+        "prompt_n": 34,
+        "prompt_ms": 404.876,
+        "prompt_per_token_ms": 11.908117647058823,
+        "prompt_per_second": 83.97632855491558,
+        "predicted_n": 79,
+        "predicted_ms": 6400.439,
+        "predicted_per_token_ms": 82.05691025641026,
+        "predicted_per_second": 12.186664071011378
+      },
+      "finish_reason": "stop",
+      "usage": {
+        "completion_tokens": 79,
+        "prompt_tokens": 34,
+        "total_tokens": 113,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "elapsed_seconds": 6.8084410409937846,
+      "delivered_generation_tokens_per_second": 12.1863983058096,
+      "run": 2
+    },
+    {
+      "status": "passed",
+      "text": "Splitting a single model distributes its weights across two machines to run one unified system, whereas running two independent models creates two separate systems with distinct parameters. The split model shares a single knowledge base and produces consistent outputs, while independent models operate as separate entities that may generate different results. This approach optimizes hardware utilization for one task, unlike parallel independent runs which process two completely separate tasks simultaneously.",
+      "ttft_seconds": 0.39872329200443346,
+      "server_timings": {
+        "cache_n": 0,
+        "prompt_n": 34,
+        "prompt_ms": 394.233,
+        "prompt_per_token_ms": 11.595088235294117,
+        "prompt_per_second": 86.2434144275086,
+        "predicted_n": 79,
+        "predicted_ms": 6658.656,
+        "predicted_per_token_ms": 85.36738461538461,
+        "predicted_per_second": 11.71407563328095
+      },
+      "finish_reason": "stop",
+      "usage": {
+        "completion_tokens": 79,
+        "prompt_tokens": 34,
+        "total_tokens": 113,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "elapsed_seconds": 7.057649499998661,
+      "delivered_generation_tokens_per_second": 11.713600295849325,
+      "run": 3
+    }
+  ],
+  "limitations": [
+    "Transport is operator-supplied; generated text does not prove remote compute.",
+    "TTFT measures first visible content, not hidden reasoning or model load.",
+    "No peak device memory or remote hardware telemetry is collected here.",
+    "All runs use an already loaded model; run 1 is not a cold-load measurement.",
+    "Server model hash is not remotely verified; filename match only."
+  ],
+  "model": {
+    "filename": "Qwen_Qwen3.5-4B-Q4_K_M.gguf",
+    "bytes": 3013027808,
+    "sha256": "13c16f426047e2de38cd075bdade4a7bcbc8c774384876f677740cda65f8a983"
+  },
+  "runtime_commit": "71255fefc092b0344f2acddb891388814ae961be",
+  "runtime_dirty": true,
+  "server": {
+    "model_alias": "${DEMO_ROOT}/models/Qwen_Qwen3.5-4B-Q4_K_M.gguf",
+    "model_ftype": "Q4_K - Medium",
+    "build_info": "b1-71255fe",
+    "total_slots": 1,
+    "n_ctx": 8192,
+    "speculative_types": "none",
+    "chat_template_sha256": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715"
+  },
+  "health": {
+    "status": "ok"
+  },
+  "startup_allocation_evidence": [
+    "0.02.058.110 I load_tensors:   CPU_Mapped model buffer size =   497.31 MiB",
+    "0.02.058.116 I load_tensors:  MTL0_Mapped model buffer size =   497.32 MiB",
+    "0.02.058.117 I load_tensors:  MTL0_Mapped model buffer size =  1055.32 MiB",
+    "0.02.058.118 I load_tensors: RPC0[127.0.0.1:50053] model buffer size =  1188.11 MiB",
+    "0.21.122.020 I llama_kv_cache:       MTL0 KV buffer size =   128.00 MiB",
+    "0.21.163.011 I llama_kv_cache: RPC0[127.0.0.1:50053] KV buffer size =   128.00 MiB",
+    "0.21.431.834 I sched_reserve: RPC0[127.0.0.1:50053] compute buffer size =   109.21 MiB",
+    "0.21.431.838 I sched_reserve:       MTL0 compute buffer size =   103.21 MiB",
+    "0.21.431.839 I sched_reserve:        CPU compute buffer size =    28.02 MiB"
+  ],
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Explain how splitting one language model across two computers differs from running two independent models. Use three short sentences."
+      }
+    ],
+    "max_tokens": 128,
+    "temperature": 0,
+    "seed": 42,
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    },
+    "cache_prompt": false,
+    "timings_per_token": true
+  },
+  "summary": {
+    "runs": 3,
+    "median_ttft_seconds": 0.40786245799972676,
+    "median_elapsed_seconds": 6.8084410409937846
+  }
+}

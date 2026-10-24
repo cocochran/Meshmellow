@@ -2,6 +2,7 @@
 """Compare RPC placements sequentially against the same model and prompt."""
 
 import argparse
+import hashlib
 import json
 import os
 import statistics
@@ -38,6 +39,8 @@ def main() -> int:
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--only", nargs="+", choices=[item[0] for item in CONFIGURATIONS])
     parser.add_argument("--profile", action="store_true", help="Log RPC command timings; affects performance")
+    parser.add_argument("--library-overlay", type=Path)
+    parser.add_argument("--rpc-batch-comparison", action="store_true")
     args = parser.parse_args()
     if args.runs < 1 or args.max_tokens < 1 or not 0 < args.port < 65536:
         parser.error("runs/max-tokens must be positive, port must be 1..65535")
@@ -45,6 +48,9 @@ def main() -> int:
     base = f"http://127.0.0.1:{args.port}"
     configurations = (CONFIGURATIONS[:5] if not args.only else
                       [item for item in CONFIGURATIONS if item[0] in args.only])
+    if args.rpc_batch_comparison:
+        configurations = [(name, "1,1", ["--cache-ram", "0", "--ctx-checkpoints", "0"])
+                          for name in ["batch-control", "batch-inputs", "batch-control-repeat"]]
     summaries = []
     for name, split, options in configurations:
         log_path = args.output_dir / f"{name}.log"
@@ -58,11 +64,18 @@ def main() -> int:
         ]
         summary = {"configuration": name, "server_command": server_command,
                    "rpc_profiling": args.profile, "status": "failed"}
+        env = {**os.environ, "GGML_RPC_NO_RDMA": "1", "GGML_RPC_COALESCE": "0",
+               "GGML_RPC_DEBUG": "3" if args.profile else "0",
+               "GGML_RPC_BATCH_WRITES": "1" if name == "batch-inputs" else "0"}
+        summary["rpc_batch_writes"] = env["GGML_RPC_BATCH_WRITES"]
+        if args.library_overlay:
+            env["DYLD_LIBRARY_PATH"] = str(args.library_overlay.resolve())
+            summary["rpc_overlay_sha256"] = hashlib.sha256(
+                (args.library_overlay / "libggml-rpc.0.dylib").read_bytes()).hexdigest()
         print(f"Starting {name}: remote/local split {split}", flush=True)
         with log_path.open("x") as log:
             process = subprocess.Popen(server_command, stdout=log, stderr=subprocess.STDOUT,
-                                       env={**os.environ, "GGML_RPC_NO_RDMA": "1",
-                                            "GGML_RPC_DEBUG": "3" if args.profile else "0"})
+                                       env=env)
             try:
                 deadline = time.monotonic() + 120
                 while True:

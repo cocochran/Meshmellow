@@ -1,0 +1,167 @@
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 49f1107..8f876d4 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -20,6 +20,8 @@
+ #include <unordered_map>
+ #include <unordered_set>
+ #include <cstring>
++#include <cstdlib>
++#include <cstdio>
+ #include <fstream>
+ #include <filesystem>
+ #include <algorithm>
+@@ -320,7 +322,35 @@ static uint64_t fnv_hash(const uint8_t * data, size_t len, uint64_t hash = 0xcbf
+     return hash;
+ }
+ 
++static bool rpc_coalesce_enabled() {
++    static const char * test_file = std::getenv("GGML_RPC_COALESCE_TEST_FILE");
++    if (test_file != nullptr) {
++        FILE * file = std::fopen(test_file, "rb");
++        if (file == nullptr) {
++            return false;
++        }
++        const int value = std::fgetc(file);
++        std::fclose(file);
++        return value == '1';
++    }
++    static const bool enabled = [] {
++        const char * value = std::getenv("GGML_RPC_COALESCE");
++        return value != nullptr && std::strcmp(value, "1") == 0;
++    }();
++    return enabled;
++}
++
++static constexpr size_t RPC_COALESCE_MAX_BYTES = 64 * 1024;
++
+ static bool send_msg(socket_ptr sock, const void * msg, size_t msg_size) {
++    if (rpc_coalesce_enabled() && msg_size <= RPC_COALESCE_MAX_BYTES) {
++        std::vector<uint8_t> frame(sizeof(msg_size) + msg_size);
++        std::memcpy(frame.data(), &msg_size, sizeof(msg_size));
++        if (msg_size > 0) {
++            std::memcpy(frame.data() + sizeof(msg_size), msg, msg_size);
++        }
++        return sock->send_data(frame.data(), frame.size()) && sock->flush();
++    }
+     if (!sock->send_data(&msg_size, sizeof(msg_size))) {
+         return false;
+     }
+@@ -373,6 +403,16 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
+ // No response
+ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
+     uint8_t cmd_byte = cmd;
++    if (rpc_coalesce_enabled() && input_size <= RPC_COALESCE_MAX_BYTES) {
++        const size_t header_size = sizeof(cmd_byte) + sizeof(input_size);
++        std::vector<uint8_t> frame(header_size + input_size);
++        std::memcpy(frame.data(), &cmd_byte, sizeof(cmd_byte));
++        std::memcpy(frame.data() + sizeof(cmd_byte), &input_size, sizeof(input_size));
++        if (input_size > 0) {
++            std::memcpy(frame.data() + header_size, input, input_size);
++        }
++        return sock->send_data(frame.data(), frame.size()) && sock->flush();
++    }
+     if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) {
+         return false;
+     }
+@@ -387,10 +427,7 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input,
+ 
+ // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
+ // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
+-static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
+-    if (!send_rpc_cmd(sock, cmd, input, input_size)) {
+-        return false;
+-    }
++static bool recv_rpc_response(socket_ptr sock, void * output, size_t output_size) {
+     uint64_t out_size;
+     if (!sock->recv_data(&out_size, sizeof(out_size))) {
+         return false;
+@@ -404,6 +441,10 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input,
+     return true;
+ }
+ 
++static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
++    return send_rpc_cmd(sock, cmd, input, input_size) && recv_rpc_response(sock, output, output_size);
++}
++
+ // RPC client-side implementation
+ 
+ // with busy spinning on, the dispatcher still blocks on its queue after this long without commands
+@@ -522,6 +563,7 @@ private:
+         size_t                        input_size;
+         void                        * output;
+         size_t                        output_size;
++        bool                          force_flush = false;
+         std::promise<void>            completion;
+     };
+     using rpc_msg_ptr   = std::shared_ptr<rpc_msg>;
+@@ -551,6 +593,7 @@ void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, s
+     msg->input_size = input_size;
+     msg->output = nullptr;
+     msg->output_size = 0;
++    msg->force_flush = true;
+     GGML_ASSERT(queue.push(msg));
+     auto future = msg->completion.get_future();
+     future.wait();
+@@ -659,6 +702,21 @@ void rpc_dispatcher::start(const std::string & endpoint) {
+ 
+ void rpc_dispatcher::work() {
+     auto last_cmd = std::chrono::steady_clock::now();
++    const char * batch_env = std::getenv("GGML_RPC_BATCH_WRITES");
++    const bool batch = batch_env != nullptr && std::strcmp(batch_env, "1") == 0 &&
++                       std::strcmp(sock->transport_name(), "TCP") == 0;
++    std::vector<uint8_t> pending;
++    if (batch) {
++        pending.reserve(RPC_COALESCE_MAX_BYTES);
++    }
++    auto flush_pending = [&]() {
++        if (pending.empty()) {
++            return true;
++        }
++        const bool status = sock->send_data(pending.data(), pending.size()) && sock->flush();
++        pending.clear();
++        return status;
++    };
+     while (running) {
+         rpc_msg_ptr msg_ptr;
+         // spin only while commands keep coming, so an idle dispatcher does not keep a core busy
+@@ -677,10 +735,30 @@ void rpc_dispatcher::work() {
+                      rpc_log_format_size(msg_ptr->input_size).c_str(), rpc_log_format_size(msg_ptr->output_size).c_str());
+             const bool trace = rpc_log_debug_level() >= 3;
+             const auto t0 = std::chrono::steady_clock::now();
+-            if (msg_ptr->output) {
++            const size_t header_size = sizeof(uint8_t) + sizeof(msg_ptr->input_size);
++            if (batch && msg_ptr->input_size <= RPC_COALESCE_MAX_BYTES - header_size) {
++                if (pending.size() > RPC_COALESCE_MAX_BYTES - header_size - msg_ptr->input_size) {
++                    RPC_STATUS_ASSERT(flush_pending());
++                }
++                const size_t start = pending.size();
++                pending.resize(start + header_size + msg_ptr->input_size);
++                pending[start] = static_cast<uint8_t>(msg_ptr->cmd);
++                std::memcpy(pending.data() + start + sizeof(uint8_t), &msg_ptr->input_size, sizeof(msg_ptr->input_size));
++                if (msg_ptr->input_size > 0) {
++                    std::memcpy(pending.data() + start + header_size, msg_ptr->input.get(), msg_ptr->input_size);
++                }
++                if (msg_ptr->output || msg_ptr->force_flush) {
++                    RPC_STATUS_ASSERT(flush_pending());
++                }
++                if (msg_ptr->output) {
++                    RPC_STATUS_ASSERT(recv_rpc_response(sock, msg_ptr->output, msg_ptr->output_size));
++                }
++            } else if (msg_ptr->output) {
++                RPC_STATUS_ASSERT(flush_pending());
+                 bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size, msg_ptr->output, msg_ptr->output_size);
+                 RPC_STATUS_ASSERT(status);
+             } else {
++                RPC_STATUS_ASSERT(flush_pending());
+                 bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size);
+                 RPC_STATUS_ASSERT(status);
+             }
+@@ -689,6 +767,7 @@ void rpc_dispatcher::work() {
+                 LOG_DBG3("[%s] %s done in %.3f ms\n", __func__, rpc_cmd_name(msg_ptr->cmd), elapsed.count());
+             }
+         } else {
++            RPC_STATUS_ASSERT(flush_pending());
+             LOG_DBG3("[%s] sync barrier\n", __func__);
+         }
+         msg_ptr->completion.set_value();

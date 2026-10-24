@@ -2,6 +2,8 @@
 
 See [throughput tuning](TUNING.md) for placement, prediction, Iroh and RPC trace
 comparisons, including optimizations that did not reproduce a speedup.
+See [RPC software experiments](RPC_EXPERIMENTS.md) for frame packing and input
+batching tests performed without changing network hardware.
 
 This harness measures an already running llama.cpp server using Python 3.10+
 and the standard library. It saves the model SHA-256, runtime commit, chat
