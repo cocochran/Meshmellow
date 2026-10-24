@@ -404,10 +404,17 @@ impl HistoryStore {
         write_json_atomic(&self.dir.join(SNAPSHOT_FILE), &snapshot)
     }
 
+    /// Empties the log. Uses a separate write handle: on Windows an append-only handle
+    /// lacks `FILE_WRITE_DATA`, so `set_len` on `self.log` fails with access denied.
+    /// Appends through `self.log` always go to the current end, so they land at offset 0 next.
     fn truncate_log(&mut self) -> Result<(), StoreError> {
         let path = self.dir.join(LOG_FILE);
-        self.log.set_len(0).map_err(io_at(&path))?;
-        self.log.sync_all().map_err(io_at(&path))
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .map_err(io_at(&path))?;
+        file.set_len(0).map_err(io_at(&path))?;
+        file.sync_all().map_err(io_at(&path))
     }
 }
 
