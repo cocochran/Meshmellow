@@ -46,7 +46,12 @@ impl PeerTable {
 
     /// Records a connection at an explicit Unix-ms timestamp, replacing any earlier entry for that peer
     /// (including its heartbeat state).
-    pub fn record_connection_at(&mut self, hello: &Hello, connected_at_unix_ms: u64) -> &PeerInfo {
+    pub fn record_connection_at(
+        &mut self,
+        node_id: NodeId,
+        hello: &Hello,
+        connected_at_unix_ms: u64,
+    ) -> &PeerInfo {
         let info = PeerInfo {
             node_id,
             protocol_version: hello.protocol_version,
@@ -63,7 +68,6 @@ impl PeerTable {
         }
     }
 
-
     /// Removes a peer whose connection closed, unless it has reconnected since.
     ///
     /// `connected_at_unix_ms` identifies the closed connection: if the entry carries a different
@@ -76,19 +80,26 @@ impl PeerTable {
             }
             _ => false,
         }
-    /// Records `heartbeat`, stamped with the current wall-clock time.
+    }
+
+    /// Records `heartbeat` from `node_id`, stamped with the current wall-clock time.
     ///
     /// Returns `false`, leaving the table unchanged, if the sender has not said hello or the
     /// sequence is not greater than the last accepted one.
-    pub fn record_heartbeat(&mut self, heartbeat: &Heartbeat) -> bool {
-        self.record_heartbeat_at(heartbeat, now_unix_ms())
+    pub fn record_heartbeat(&mut self, node_id: &NodeId, heartbeat: &Heartbeat) -> bool {
+        self.record_heartbeat_at(node_id, heartbeat, now_unix_ms())
     }
 
     /// Like [`Self::record_heartbeat`] with an explicit Unix-ms arrival time.
     ///
     /// Only the sequence is compared; epoch-aware ordering belongs to the heartbeat tracker (M-11).
-    pub fn record_heartbeat_at(&mut self, heartbeat: &Heartbeat, received_at_unix_ms: u64) -> bool {
-        let Some(info) = self.peers.get_mut(&heartbeat.node_id) else {
+    pub fn record_heartbeat_at(
+        &mut self,
+        node_id: &NodeId,
+        heartbeat: &Heartbeat,
+        received_at_unix_ms: u64,
+    ) -> bool {
+        let Some(info) = self.peers.get_mut(node_id) else {
             return false;
         };
         if info
@@ -136,20 +147,19 @@ mod tests {
     }
 
     fn hello(node_id: NodeId) -> Hello {
-    fn heartbeat(node_id: &str, sequence: u64) -> Heartbeat {
-        Heartbeat {
-            node_id: node_id.to_owned(),
-            epoch: 0,
-            sequence,
-        }
-    }
-
-    fn hello(node_id: &str) -> Hello {
         Hello {
             node_id: node_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
             cluster_id: "test".to_owned(),
             last_log_index: 0,
+        }
+    }
+
+    fn heartbeat(node_id: NodeId, sequence: u64) -> Heartbeat {
+        Heartbeat {
+            node_id: node_id.to_string(),
+            epoch: 0,
+            sequence,
         }
     }
 
@@ -162,6 +172,8 @@ mod tests {
         assert_eq!(info.node_id, a);
         assert_eq!(info.protocol_version, PROTOCOL_VERSION);
         assert_eq!(info.connected_at_unix_ms, 1_000);
+        assert_eq!(info.last_heartbeat_unix_ms, None);
+        assert_eq!(info.last_heartbeat_sequence, None);
     }
 
     #[test]
@@ -226,61 +238,66 @@ mod tests {
 
     #[test]
     fn heartbeat_from_unknown_peer_is_rejected() {
+        let a = node(1);
         let mut table = PeerTable::new();
 
-        assert!(!table.record_heartbeat_at(&heartbeat("a", 1), 1_000));
-        assert!(table.get("a").is_none());
+        assert!(!table.record_heartbeat_at(&a, &heartbeat(a, 1), 1_000));
+        assert!(table.get(&a).is_none());
     }
 
     #[test]
     fn heartbeat_updates_sequence_and_time() {
+        let a = node(1);
         let mut table = PeerTable::new();
-        table.record_connection_at(&hello("a"), 1_000);
+        table.record_connection_at(a, &hello(a), 1_000);
 
-        assert!(table.record_heartbeat_at(&heartbeat("a", 1), 1_100));
-        assert!(table.record_heartbeat_at(&heartbeat("a", 5), 1_200));
+        assert!(table.record_heartbeat_at(&a, &heartbeat(a, 1), 1_100));
+        assert!(table.record_heartbeat_at(&a, &heartbeat(a, 5), 1_200));
 
-        let info = table.get("a").expect("peer recorded");
+        let info = table.get(&a).expect("peer recorded");
         assert_eq!(info.last_heartbeat_sequence, Some(5));
         assert_eq!(info.last_heartbeat_unix_ms, Some(1_200));
     }
 
     #[test]
     fn repeated_or_older_sequence_is_rejected() {
+        let a = node(1);
         let mut table = PeerTable::new();
-        table.record_connection_at(&hello("a"), 1_000);
-        assert!(table.record_heartbeat_at(&heartbeat("a", 3), 1_100));
+        table.record_connection_at(a, &hello(a), 1_000);
+        assert!(table.record_heartbeat_at(&a, &heartbeat(a, 3), 1_100));
 
-        assert!(!table.record_heartbeat_at(&heartbeat("a", 3), 1_200));
-        assert!(!table.record_heartbeat_at(&heartbeat("a", 2), 1_300));
+        assert!(!table.record_heartbeat_at(&a, &heartbeat(a, 3), 1_200));
+        assert!(!table.record_heartbeat_at(&a, &heartbeat(a, 2), 1_300));
 
-        let info = table.get("a").expect("peer recorded");
+        let info = table.get(&a).expect("peer recorded");
         assert_eq!(info.last_heartbeat_sequence, Some(3));
         assert_eq!(info.last_heartbeat_unix_ms, Some(1_100));
     }
 
     #[test]
     fn reconnect_resets_heartbeat_state() {
+        let a = node(1);
         let mut table = PeerTable::new();
-        table.record_connection_at(&hello("a"), 1_000);
-        assert!(table.record_heartbeat_at(&heartbeat("a", 7), 1_100));
+        table.record_connection_at(a, &hello(a), 1_000);
+        assert!(table.record_heartbeat_at(&a, &heartbeat(a, 7), 1_100));
 
-        table.record_connection_at(&hello("a"), 2_000);
-        let info = table.get("a").expect("peer recorded");
+        table.record_connection_at(a, &hello(a), 2_000);
+        let info = table.get(&a).expect("peer recorded");
         assert_eq!(info.last_heartbeat_sequence, None);
         assert_eq!(info.last_heartbeat_unix_ms, None);
-        assert!(table.record_heartbeat_at(&heartbeat("a", 1), 2_100));
+        assert!(table.record_heartbeat_at(&a, &heartbeat(a, 1), 2_100));
     }
 
     #[test]
     fn record_heartbeat_uses_current_time() {
+        let a = node(1);
         let mut table = PeerTable::new();
-        table.record_connection(&hello("a"));
+        table.record_connection(a, &hello(a));
         let before = now_unix_ms();
 
-        assert!(table.record_heartbeat(&heartbeat("a", 1)));
+        assert!(table.record_heartbeat(&a, &heartbeat(a, 1)));
         let stamped = table
-            .get("a")
+            .get(&a)
             .and_then(|info| info.last_heartbeat_unix_ms)
             .expect("heartbeat stamped");
         assert!(stamped >= before);

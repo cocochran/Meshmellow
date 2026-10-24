@@ -99,7 +99,7 @@ fn spawn_worker(
 /// Polls `peers` until `check` returns a value for the worker's entry.
 async fn wait_for_peer<T>(
     peers: &SharedPeerTable,
-    worker: &str,
+    worker: EndpointId,
     check: impl Fn(Option<u64>) -> Option<T>,
 ) -> T {
     timeout(TEST_TIMEOUT, async {
@@ -107,7 +107,7 @@ async fn wait_for_peer<T>(
             let sequence = peers
                 .lock()
                 .expect("peer table lock")
-                .get(worker)
+                .get(&worker)
                 .and_then(|info| info.last_heartbeat_sequence);
             if let Some(found) = check(sequence) {
                 return found;
@@ -163,7 +163,7 @@ impl ControlLeader {
     }
 
     /// Waits for the worker's hello plus two heartbeats with increasing sequence numbers.
-    async fn assert_heartbeats_increase(&self, worker: &str) {
+    async fn assert_heartbeats_increase(&self, worker: EndpointId) {
         let first = wait_for_peer(&self.peers, worker, |sequence| sequence).await;
         let later = wait_for_peer(&self.peers, worker, |sequence| {
             sequence.filter(|&later| later > first)
@@ -246,9 +246,7 @@ async fn worker_bridges_rpc_and_heartbeats_until_cancelled() {
         leader.endpoint.id(),
     );
     let worker_task = spawn_worker(worker, direct_addr(&leader.endpoint), config);
-    leader
-        .assert_heartbeats_increase(&worker_id.to_string())
-        .await;
+    leader.assert_heartbeats_increase(worker_id).await;
 
     // Heartbeats start only after the RPC server is ready, so it is listening on loopback now.
     assert_eq!(rpc_addr.ip(), Ipv4Addr::LOCALHOST);
