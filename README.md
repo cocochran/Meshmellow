@@ -47,6 +47,19 @@ Because history is synced after each task, at most the in-progress task is lost 
  
 Early development.
 
+## Browser client
+
+When the leader is running, open `http://127.0.0.1:8080` for the built-in chat
+client. It streams replies from the leader and shows recent queued, running,
+completed, failed, and canceled jobs. The client is served by the leader itself;
+there is no separate frontend server or dependency install.
+
+Start the leader with the plan and profile you generated, for example:
+
+```sh
+cargo run -- leader --plan plan.json --profile profile.json --llama-server /path/to/llama-server
+```
+
 The compute placement library selects contiguous model blocks using explicit
 contribution budgets and measured compute/link costs. It can require multiple
 contributors, produce advisory llama.cpp RPC arguments, and validate collected
