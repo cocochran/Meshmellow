@@ -59,7 +59,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
 ## 3. Push / PR (only if `Push/PR: yes` in plan.md)
 
-- `git push -u origin "$RUN"`.
+- Confirm `git remote get-url origin` is `https://github.com/yash-joshi-0/HackOHIO26.git` (HTTPS, not SSH), then `git push -u origin "$RUN"`. If Git asks for credentials, stop and let Yash sign in via Git Credential Manager; never put a token in the URL.
 - If `gh` is installed: `gh pr create --base main --head "$RUN" --title "<first line>" --body-file <PR section>`. Otherwise give Yash the compare URL `https://github.com/yash-joshi-0/HackOHIO26/compare/main...<RUN>?expand=1` along with the title and body to paste.
 - If `Push/PR: no`: don't push. Give Yash the exact push command, the title, and the body.
 

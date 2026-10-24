@@ -26,6 +26,9 @@ This is the root of the skill tree. Every other skill assumes you have read it.
 | Kaneo project (MeshThing, slug `M`) | `q5fq2rozcxraow21ke93liku` |
 | Yash's Kaneo user ID | `7vdSXN5jWHGlHzFrBI6fw7nnBwymXnMl` |
 | GitHub repo | https://github.com/yash-joshi-0/HackOHIO26 |
+| Git remote (HTTPS only) | `https://github.com/yash-joshi-0/HackOHIO26.git` |
+
+Git access is over **HTTPS, never SSH**. Don't add `git@github.com:` remotes or `ssh://` URLs, and don't change `origin`. Before any fetch or push, check `git remote get-url origin` starts with `https://`. If it doesn't, stop and tell Yash instead of rewriting it.
 
 Kaneo status slugs: `to-do`, `in-progress`, `in-review`, `done`. Kaneo `search` needs an explicit `workspaceId`. Discord channel links in message text are written `<#channel-id>`.
 
