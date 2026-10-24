@@ -1,15 +1,19 @@
-//! MeshThing command-line entry point: start a node, dial peers, or run the RPC bridge.
+//! MeshThing command-line entry point: plan, run a worker or the leader, send prompts, or debug
+//! the mesh with the lower-level node and bridge commands.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use iroh::Endpoint;
+use llm_cluster::leader::{self, LeaderConfig};
 use llm_cluster::network::{self, SharedPeerTable};
 use llm_cluster::node::PeerTable;
 use llm_cluster::protocol::{CONTROL_ALPN, RPC_BRIDGE_ALPN};
-use llm_cluster::rpc_bridge;
+use llm_cluster::worker::{self, WorkerConfig};
+use llm_cluster::{api, rpc_bridge};
 use tracing_subscriber::EnvFilter;
 
 /// Log filter used when `RUST_LOG` is unset.
@@ -23,6 +27,17 @@ const CLOSE_CODE_DONE: u32 = 0;
 
 /// QUIC close reason sent alongside [`CLOSE_CODE_DONE`].
 const CLOSE_REASON_DONE: &[u8] = b"done";
+
+/// `--heartbeat-interval` default; matches [`worker::DEFAULT_HEARTBEAT_INTERVAL`].
+const DEFAULT_HEARTBEAT_INTERVAL_ARG: &str = "2s";
+
+/// `--worker-wait` default; matches [`leader::DEFAULT_WORKER_WAIT`].
+const DEFAULT_WORKER_WAIT_ARG: &str = "60s";
+
+/// `--llama-ready-timeout` default; matches [`leader::DEFAULT_LLAMA_READY_TIMEOUT`].
+const DEFAULT_LLAMA_READY_TIMEOUT_ARG: &str = "300s";
+
+const SECONDS_PER_MINUTE: u64 = 60;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -84,6 +99,56 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:50052")]
         listen: SocketAddr,
     },
+    /// Contribute this device to a cluster: supervise ggml-rpc-server and bridge it to the leader.
+    Worker {
+        /// The ggml-rpc-server binary.
+        #[arg(long)]
+        rpc_server: PathBuf,
+        /// Loopback port for ggml-rpc-server.
+        #[arg(long, default_value_t = rpc_bridge::DEFAULT_RPC_PORT)]
+        rpc_port: u16,
+        /// Extra argument for ggml-rpc-server, after `-H 127.0.0.1 -p <port>`; repeatable.
+        #[arg(long = "rpc-arg", allow_hyphen_values = true)]
+        rpc_args: Vec<String>,
+        /// Node ID printed by the leader; omit to run the bridge without a control link.
+        #[arg(long)]
+        leader: Option<String>,
+        /// Time between heartbeats to the leader, e.g. `2s` or `500ms`.
+        #[arg(long, default_value = DEFAULT_HEARTBEAT_INTERVAL_ARG, value_parser = parse_duration)]
+        heartbeat_interval: Duration,
+    },
+    /// Run the main process: wait for planned workers, start llama-server, and serve the job API.
+    Leader {
+        /// JSON produced by the plan command.
+        #[arg(long)]
+        plan: PathBuf,
+        /// Planning profile JSON the plan was built from (maps peers to bridge ports).
+        #[arg(long)]
+        profile: PathBuf,
+        /// The llama-server binary.
+        #[arg(long)]
+        llama_server: PathBuf,
+        /// Internal loopback port for llama-server.
+        #[arg(long, default_value_t = leader::DEFAULT_LLAMA_PORT)]
+        llama_port: u16,
+        /// Loopback address to serve the job API on.
+        #[arg(long, default_value_t = leader::DEFAULT_API_ADDR)]
+        api: SocketAddr,
+        /// How long to wait for every planned worker to connect, e.g. `60s` or `2m`.
+        #[arg(long, default_value = DEFAULT_WORKER_WAIT_ARG, value_parser = parse_duration)]
+        worker_wait: Duration,
+        /// How long llama-server may take to load the model and answer /health.
+        #[arg(long, default_value = DEFAULT_LLAMA_READY_TIMEOUT_ARG, value_parser = parse_duration)]
+        llama_ready_timeout: Duration,
+    },
+    /// Send one prompt to a running leader's job API and print the reply.
+    Prompt {
+        /// Job API address of the leader.
+        #[arg(long, default_value_t = leader::DEFAULT_API_ADDR)]
+        api: SocketAddr,
+        /// The prompt text.
+        text: String,
+    },
 }
 
 #[tokio::main]
@@ -127,6 +192,51 @@ async fn main() -> anyhow::Result<()> {
             ref node_id,
             listen,
         } => bridge_connect(&cli.key, node_id, listen).await,
+        Command::Worker {
+            rpc_server,
+            rpc_port,
+            rpc_args,
+            leader,
+            heartbeat_interval,
+        } => {
+            let config = WorkerConfig {
+                key_path: cli.key,
+                cluster_id: cli.cluster,
+                rpc_server,
+                rpc_port,
+                rpc_args,
+                leader: leader.as_deref().map(network::parse_node_id).transpose()?,
+                heartbeat_interval,
+            };
+            until_ctrl_c(worker::run_worker(config)).await
+        }
+        Command::Leader {
+            plan,
+            profile,
+            llama_server,
+            llama_port,
+            api,
+            worker_wait,
+            llama_ready_timeout,
+        } => {
+            // Not wrapped in until_ctrl_c: the leader handles Ctrl-C itself to stop its parts in order.
+            leader::run_leader_process(LeaderConfig {
+                key_path: cli.key,
+                cluster_id: cli.cluster,
+                plan_path: plan,
+                profile_path: profile,
+                llama_server,
+                llama_port,
+                api_addr: api,
+                worker_wait,
+                llama_ready_timeout,
+            })
+            .await
+        }
+        Command::Prompt { api, ref text } => {
+            println!("{}", api::prompt(api, text).await?);
+            Ok(())
+        }
     }
 }
 
@@ -179,12 +289,17 @@ async fn run_until_ctrl_c(
     endpoint: &Endpoint,
     task: impl Future<Output = anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
-    let result = tokio::select! {
-        result = task => result,
-        signal = tokio::signal::ctrl_c() => signal.map_err(anyhow::Error::from),
-    };
+    let result = until_ctrl_c(task).await;
     endpoint.close().await;
     result
+}
+
+/// Runs `task` until it finishes or Ctrl-C arrives; a cancelled `task` must clean up when dropped.
+async fn until_ctrl_c(task: impl Future<Output = anyhow::Result<()>>) -> anyhow::Result<()> {
+    tokio::select! {
+        result = task => result,
+        signal = tokio::signal::ctrl_c() => signal.map_err(anyhow::Error::from),
+    }
 }
 
 /// Prints the node ID in the one format peers and bots copy into `connect` / `bridge-connect`.
@@ -194,4 +309,127 @@ fn print_node_id(endpoint: &Endpoint) {
 
 fn new_peer_table() -> SharedPeerTable {
     Arc::new(Mutex::new(PeerTable::new()))
+}
+
+/// Parses durations such as `500ms`, `2s` or `5m`; a bare number means seconds.
+fn parse_duration(text: &str) -> Result<Duration, String> {
+    let invalid = || format!("invalid duration {text:?}: expected e.g. 500ms, 2s or 5m");
+    let trimmed = text.trim();
+    let unit_start = trimmed
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    let (digits, unit) = trimmed.split_at(unit_start);
+    let value: u64 = digits.parse().map_err(|_| invalid())?;
+    match unit {
+        "ms" => Ok(Duration::from_millis(value)),
+        "" | "s" => Ok(Duration::from_secs(value)),
+        "m" => value
+            .checked_mul(SECONDS_PER_MINUTE)
+            .map(Duration::from_secs)
+            .ok_or_else(invalid),
+        _ => Err(invalid()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::*;
+
+    #[test]
+    fn parses_duration_units() {
+        assert_eq!(parse_duration("500ms"), Ok(Duration::from_millis(500)));
+        assert_eq!(parse_duration("2s"), Ok(Duration::from_secs(2)));
+        assert_eq!(parse_duration("7"), Ok(Duration::from_secs(7)));
+        assert_eq!(parse_duration("2m"), Ok(Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn rejects_malformed_durations() {
+        for text in ["", "s", "1h", "-1s", "1.5s", "99999999999999999999m"] {
+            assert!(parse_duration(text).is_err(), "{text:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn duration_defaults_match_library_constants() {
+        assert_eq!(
+            parse_duration(DEFAULT_HEARTBEAT_INTERVAL_ARG),
+            Ok(worker::DEFAULT_HEARTBEAT_INTERVAL)
+        );
+        assert_eq!(
+            parse_duration(DEFAULT_WORKER_WAIT_ARG),
+            Ok(leader::DEFAULT_WORKER_WAIT)
+        );
+        assert_eq!(
+            parse_duration(DEFAULT_LLAMA_READY_TIMEOUT_ARG),
+            Ok(leader::DEFAULT_LLAMA_READY_TIMEOUT)
+        );
+    }
+
+    #[test]
+    fn cli_definition_is_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn worker_collects_repeated_rpc_args() {
+        let cli = Cli::try_parse_from([
+            "meshthing",
+            "worker",
+            "--rpc-server",
+            "rpc",
+            "--rpc-arg",
+            "-t",
+            "--rpc-arg",
+            "4",
+        ])
+        .expect("worker args");
+
+        let Command::Worker {
+            rpc_args, rpc_port, ..
+        } = cli.command
+        else {
+            panic!("expected worker, got {:?}", cli.command);
+        };
+        assert_eq!(rpc_args, ["-t", "4"]);
+        assert_eq!(rpc_port, rpc_bridge::DEFAULT_RPC_PORT);
+    }
+
+    #[test]
+    fn leader_and_prompt_use_loopback_api_defaults() {
+        let leader = Cli::try_parse_from([
+            "meshthing",
+            "leader",
+            "--plan",
+            "plan.json",
+            "--profile",
+            "profile.json",
+            "--llama-server",
+            "llama-server",
+            "--worker-wait",
+            "5s",
+        ])
+        .expect("leader args");
+        let prompt = Cli::try_parse_from(["meshthing", "prompt", "hello there"]).expect("prompt");
+
+        let Command::Leader {
+            api,
+            llama_port,
+            worker_wait,
+            ..
+        } = leader.command
+        else {
+            panic!("expected leader, got {:?}", leader.command);
+        };
+        assert_eq!(api, leader::DEFAULT_API_ADDR);
+        assert_eq!(llama_port, leader::DEFAULT_LLAMA_PORT);
+        assert_eq!(worker_wait, Duration::from_secs(5));
+        let Command::Prompt { api, text } = prompt.command else {
+            panic!("expected prompt, got {:?}", prompt.command);
+        };
+        assert_eq!(api, leader::DEFAULT_API_ADDR);
+        assert_eq!(text, "hello there");
+    }
 }
