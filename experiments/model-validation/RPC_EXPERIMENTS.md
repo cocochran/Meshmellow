@@ -96,3 +96,34 @@ network overhead.
 
 The patched variants were measured over SSH. The earlier successful Iroh run
 used the original RPC runtime; no patched-Iroh throughput result is claimed.
+
+## Zstd response compression (2026-10-24)
+
+Real synthetic-prompt activations compressed by about 7% at zstd level 1.
+Across 78 decode buffers of 10,240 bytes, median compressed size was 9,511
+bytes and local compression plus decompression took about 25 microseconds.
+All 316 sample/mode combinations reconstructed bit exactly. Raw tensors are
+kept private; published capture timings include file I/O and are not throughput evidence.
+
+The two-Mac experiment used four runs per mode in order 0,1,1,0,1,0,0,1,
+with one warmup excluded and the same model loaded throughout. Median decode
+throughput was **13.83 tok/s uncompressed vs 13.62 tok/s compressed** (-1.5%).
+Activation response payload bytes fell from 4,587,520 to 4,257,720 (7.2%).
+All eight generations produced identical text; all eight native sync/async
+tensor checks passed. Compression showed no throughput benefit in this sample
+and remains disabled in the normal demo. These byte totals exclude framing,
+SSH and other protocol traffic. Neither latency nor remote compute is isolated.
+
+The private prototype statically links zstd 1.5.7 and negotiates experimental
+protocol major 9 when GGML_RPC_ZSTD=1, rejecting stock major-8 peers. It
+compresses bounded responses only when saving more than 64 bytes, validates
+frame size, and decompresses to the exact expected output size. The test uses
+a separate loopback worker on port 50054. GGML_RPC_ZSTD_TEST_FILE toggles
+compression while preserving protocol version. Earlier packing/batching features
+in the full patch were disabled for this comparison. The patch is against
+llama.cpp 71255fefc092b0344f2acddb891388814ae961be; SHA256:
+`2ae09562f74320e04971ed6263a74b036eafc9b66a167e247dfea9a71b6fa984`.
+This is an experimental private fork, not an upstream submission.
+
+Scripts: `capture_activations.py`, `zstd_samples.py`, and `zstd_live.py`.
+Evidence: [results/zstd-2026-10-24](results/zstd-2026-10-24).
