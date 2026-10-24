@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::protocol::Hello;
+use crate::protocol::{Heartbeat, Hello};
 
 /// Identifies a node everywhere in the crate: its Iroh endpoint ID (an Ed25519 public key).
 pub type NodeId = iroh::EndpointId;
@@ -19,6 +19,12 @@ pub struct PeerInfo {
     /// Wall-clock UTC time (Unix ms) of this peer's most recent connection; overwritten on reconnect.
     /// Logging only — never use for leader ordering (architecture §9). Requested by connor-claude-003.
     pub connected_at_unix_ms: u64,
+    /// Wall-clock UTC time (Unix ms) the latest accepted heartbeat arrived; `None` until one does.
+    /// Reset on reconnect. Logging and diagnostics only; liveness tracking is M-11.
+    pub last_heartbeat_unix_ms: Option<u64>,
+    /// Sequence number of the latest accepted heartbeat; `None` until one arrives. Reset on reconnect,
+    /// so a restarted peer may start counting from 1 again after its new hello.
+    pub last_heartbeat_sequence: Option<u64>,
 }
 
 /// Peers this node currently has a control connection with, keyed by node ID.
@@ -45,10 +51,15 @@ impl PeerTable {
         hello: &Hello,
         connected_at_unix_ms: u64,
     ) -> &PeerInfo {
+    /// Records a connection at an explicit Unix-ms timestamp, replacing any earlier entry for that peer
+    /// (including its heartbeat state).
+    pub fn record_connection_at(&mut self, hello: &Hello, connected_at_unix_ms: u64) -> &PeerInfo {
         let info = PeerInfo {
             node_id,
             protocol_version: hello.protocol_version,
             connected_at_unix_ms,
+            last_heartbeat_unix_ms: None,
+            last_heartbeat_sequence: None,
         };
         match self.peers.entry(node_id) {
             Entry::Occupied(mut existing) => {
@@ -71,6 +82,30 @@ impl PeerTable {
             }
             _ => false,
         }
+    /// Records `heartbeat`, stamped with the current wall-clock time.
+    ///
+    /// Returns `false`, leaving the table unchanged, if the sender has not said hello or the
+    /// sequence is not greater than the last accepted one.
+    pub fn record_heartbeat(&mut self, heartbeat: &Heartbeat) -> bool {
+        self.record_heartbeat_at(heartbeat, now_unix_ms())
+    }
+
+    /// Like [`Self::record_heartbeat`] with an explicit Unix-ms arrival time.
+    ///
+    /// Only the sequence is compared; epoch-aware ordering belongs to the heartbeat tracker (M-11).
+    pub fn record_heartbeat_at(&mut self, heartbeat: &Heartbeat, received_at_unix_ms: u64) -> bool {
+        let Some(info) = self.peers.get_mut(&heartbeat.node_id) else {
+            return false;
+        };
+        if info
+            .last_heartbeat_sequence
+            .is_some_and(|last| heartbeat.sequence <= last)
+        {
+            return false;
+        }
+        info.last_heartbeat_sequence = Some(heartbeat.sequence);
+        info.last_heartbeat_unix_ms = Some(received_at_unix_ms);
+        true
     }
 
     /// Looks up a peer by node ID.
@@ -107,6 +142,15 @@ mod tests {
     }
 
     fn hello(node_id: NodeId) -> Hello {
+    fn heartbeat(node_id: &str, sequence: u64) -> Heartbeat {
+        Heartbeat {
+            node_id: node_id.to_owned(),
+            epoch: 0,
+            sequence,
+        }
+    }
+
+    fn hello(node_id: &str) -> Hello {
         Hello {
             node_id: node_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
@@ -184,5 +228,68 @@ mod tests {
 
         assert!(!table.remove_connection(&a, 1_000));
         assert_eq!(table.get(&a).map(|p| p.connected_at_unix_ms), Some(2_000));
+    }
+
+    #[test]
+    fn heartbeat_from_unknown_peer_is_rejected() {
+        let mut table = PeerTable::new();
+
+        assert!(!table.record_heartbeat_at(&heartbeat("a", 1), 1_000));
+        assert!(table.get("a").is_none());
+    }
+
+    #[test]
+    fn heartbeat_updates_sequence_and_time() {
+        let mut table = PeerTable::new();
+        table.record_connection_at(&hello("a"), 1_000);
+
+        assert!(table.record_heartbeat_at(&heartbeat("a", 1), 1_100));
+        assert!(table.record_heartbeat_at(&heartbeat("a", 5), 1_200));
+
+        let info = table.get("a").expect("peer recorded");
+        assert_eq!(info.last_heartbeat_sequence, Some(5));
+        assert_eq!(info.last_heartbeat_unix_ms, Some(1_200));
+    }
+
+    #[test]
+    fn repeated_or_older_sequence_is_rejected() {
+        let mut table = PeerTable::new();
+        table.record_connection_at(&hello("a"), 1_000);
+        assert!(table.record_heartbeat_at(&heartbeat("a", 3), 1_100));
+
+        assert!(!table.record_heartbeat_at(&heartbeat("a", 3), 1_200));
+        assert!(!table.record_heartbeat_at(&heartbeat("a", 2), 1_300));
+
+        let info = table.get("a").expect("peer recorded");
+        assert_eq!(info.last_heartbeat_sequence, Some(3));
+        assert_eq!(info.last_heartbeat_unix_ms, Some(1_100));
+    }
+
+    #[test]
+    fn reconnect_resets_heartbeat_state() {
+        let mut table = PeerTable::new();
+        table.record_connection_at(&hello("a"), 1_000);
+        assert!(table.record_heartbeat_at(&heartbeat("a", 7), 1_100));
+
+        table.record_connection_at(&hello("a"), 2_000);
+        let info = table.get("a").expect("peer recorded");
+        assert_eq!(info.last_heartbeat_sequence, None);
+        assert_eq!(info.last_heartbeat_unix_ms, None);
+        assert!(table.record_heartbeat_at(&heartbeat("a", 1), 2_100));
+    }
+
+    #[test]
+    fn record_heartbeat_uses_current_time() {
+        let mut table = PeerTable::new();
+        table.record_connection(&hello("a"));
+        let before = now_unix_ms();
+
+        assert!(table.record_heartbeat(&heartbeat("a", 1)));
+        let stamped = table
+            .get("a")
+            .and_then(|info| info.last_heartbeat_unix_ms)
+            .expect("heartbeat stamped");
+        assert!(stamped >= before);
+        assert!(stamped <= now_unix_ms());
     }
 }

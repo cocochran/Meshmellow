@@ -47,6 +47,18 @@ Because history is synced after each task, at most the in-progress task is lost 
  
 Early development.
 
+For the test suite, build the fake runtime helper executables before running
+integration tests:
+
+```sh
+cargo build --examples
+cargo test --all-targets
+```
+
+The API, worker and leader tests launch these helper programs. `cargo test`
+alone builds their test harnesses but does not provide the standalone helper
+executables on a fresh checkout.
+
 The compute placement library selects contiguous model blocks using explicit
 contribution budgets and measured compute/link costs. It can require multiple
 contributors, produce advisory llama.cpp RPC arguments, and validate collected
