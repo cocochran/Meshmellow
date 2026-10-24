@@ -40,6 +40,16 @@ pub fn verify_output(
     evidence: &RunEvidence,
     min_peers: usize,
 ) -> Result<(), VerificationError> {
+    validate_output(request, output, min_peers)?;
+    verification::verify_run(&output.placement, &request.peers, evidence, min_peers)
+}
+
+/// Validate a saved plan before launch, without asserting runtime execution.
+pub fn validate_output(
+    request: &PlanningRequest,
+    output: &PlanningOutput,
+    min_peers: usize,
+) -> Result<(), VerificationError> {
     use VerificationError::{IdentityMismatch, InvalidPlan};
     let placement = &output.placement;
     if placement.model_hash != request.model.model_hash
@@ -60,7 +70,25 @@ pub fn verify_output(
     {
         return Err(InvalidPlan);
     }
-    verification::verify_run(placement, &request.peers, evidence, min_peers)?;
+    verification::validate_placement(placement, &request.peers, min_peers)?;
+    let mut previous: Option<(usize, &str)> = None;
+    for assignment in &placement.assignments {
+        let index = request
+            .peers
+            .iter()
+            .position(|p| p.id == assignment.peer_id)
+            .ok_or(InvalidPlan)?;
+        if let Some((last_index, last_id)) = previous
+            && (index <= last_index
+                || !request
+                    .links
+                    .iter()
+                    .any(|link| link.from == last_id && link.to == assignment.peer_id))
+        {
+            return Err(InvalidPlan);
+        }
+        previous = Some((index, &assignment.peer_id));
+    }
     let mut devices = Vec::new();
     for assignment in &placement.assignments {
         let peer = request

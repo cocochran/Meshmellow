@@ -71,6 +71,25 @@ Runtime identity must include applied patches/library hashes when the base
 commit alone does not identify the executed runtime. Actual layer/output
 ownership still requires runtime allocation evidence.
 
+Before starting child processes, use
+`planning::validate_output(&request, &output, min_peers)` to check the saved
+plan against current inputs without requiring runtime evidence. It validates
+eligibility, topology and allowed peer order as well as coverage, memory and
+launch mappings. `verify_output` performs the same preflight and then validates
+fresh evidence; do not fabricate telemetry to call it before inference.
+
+The launcher fixture pair `examples/launcher-profile.json` and
+`examples/launcher-plan.json` uses one remote node ID in valid Iroh format and a
+local Metal device. All model/cost/budget values are synthetic. The remote
+identity is an example with no running worker: replace it with the enrolled
+worker's real ID and regenerate before a live launch.
+
+```sh
+cargo run --example check_plan -- examples/launcher-plan.json examples/launcher-profile.json
+```
+
+This checks the fixture and prints the bridge mapping without starting services.
+
 ## Inputs and integration
 
 1. Supply `ModelProfile`: exact model hash, pinned runtime ID, context tokens,

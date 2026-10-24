@@ -1,5 +1,21 @@
 use llm_cluster::{planning::*, verification::*};
 
+#[test]
+fn launcher_fixture_passes_preflight_with_parseable_remote_identity() {
+    let request: PlanningRequest =
+        serde_json::from_str(include_str!("../examples/launcher-profile.json")).unwrap();
+    let output: PlanningOutput =
+        serde_json::from_str(include_str!("../examples/launcher-plan.json")).unwrap();
+    assert_eq!(validate_output(&request, &output, 2), Ok(()));
+    for device in output
+        .runtime_devices
+        .iter()
+        .filter(|d| d.rpc_endpoint.is_some())
+    {
+        assert!(llm_cluster::network::parse_node_id(&device.peer_id).is_ok());
+    }
+}
+
 fn fixture() -> (PlanningRequest, PlanningOutput, RunEvidence) {
     let request: PlanningRequest =
         serde_json::from_str(include_str!("../examples/placement-profile.json")).unwrap();
@@ -25,6 +41,34 @@ fn fixture() -> (PlanningRequest, PlanningOutput, RunEvidence) {
 fn verifies_saved_plan_against_current_inputs() {
     let (request, output, evidence) = fixture();
     assert_eq!(verify_output(&request, &output, &evidence, 2), Ok(()));
+}
+
+#[test]
+fn preflight_needs_no_runtime_evidence() {
+    let (request, output, _) = fixture();
+    assert_eq!(validate_output(&request, &output, 2), Ok(()));
+    let mut request = request;
+    request.peers[0].healthy = false;
+    assert_eq!(
+        validate_output(&request, &output, 2),
+        Err(VerificationError::IneligiblePeer("worker".into()))
+    );
+}
+
+#[test]
+fn preflight_rejects_stale_topology_and_peer_order() {
+    let (mut request, output, _) = fixture();
+    request.links.clear();
+    assert_eq!(
+        validate_output(&request, &output, 2),
+        Err(VerificationError::InvalidPlan)
+    );
+    let (mut request, output, _) = fixture();
+    request.peers.reverse();
+    assert_eq!(
+        validate_output(&request, &output, 2),
+        Err(VerificationError::InvalidPlan)
+    );
 }
 
 #[test]
