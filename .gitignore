@@ -1,0 +1,2 @@
+# Agent run state (plan, coordination log, change log, outbox)
+.agent-work/
