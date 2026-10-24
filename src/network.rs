@@ -19,7 +19,7 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
-use crate::node::PeerTable;
+use crate::node::{NodeId, PeerTable};
 use crate::protocol::{self, CONTROL_ALPN, Heartbeat, Hello, Message, PROTOCOL_VERSION};
 
 /// Peer table shared between the accept loop and the code that dials out.
@@ -87,7 +87,7 @@ pub async fn dial_peer(
         .await
         .context("failed to connect to peer")?;
     let hello = finish_handshake(&connection, dialer_handshake(&connection, local)).await?;
-    record_peer(peers, &hello)?;
+    record_peer(peers, connection.remote_id(), &hello)?;
     Ok((connection, hello))
 }
 
@@ -126,21 +126,52 @@ pub async fn serve_control(
     Ok(())
 }
 
-/// Handles one incoming control connection from hello to disconnect, logging the outcome.
+/// Handles one incoming control connection from hello to disconnect, recording the peer's
+/// heartbeats while it is open and logging the outcome.
+///
+/// When the connection closes the peer is removed from `peers`, unless it has already
+/// reconnected on a newer connection.
 async fn run_control_session(incoming: Incoming, local: &Hello, peers: &SharedPeerTable) {
     match accept_peer(incoming, local, peers).await {
         Ok((connection, hello)) => {
-            let reason = receive_control_streams(&connection, &hello.node_id, peers).await;
+            let remote = connection.remote_id();
+            let connected_at = connected_at(peers, &remote);
+            let reason = receive_control_streams(&connection, remote, peers).await;
             info!(peer = %hello.node_id, %reason, "peer disconnected");
+            if let Some(connected_at) = connected_at {
+                forget_peer(peers, &remote, connected_at);
+            }
         }
         Err(error) => warn!("rejected incoming connection: {error:#}"),
     }
 }
 
+/// Removes `node_id` from `peers` once its connection that started at `connected_at_unix_ms`
+/// has closed; a newer connection from the same peer is kept.
+///
+/// [`serve_control`] does this for incoming connections. Code that keeps a connection from
+/// [`dial_peer`] open should call it when that connection closes.
+pub fn forget_peer(peers: &SharedPeerTable, node_id: &NodeId, connected_at_unix_ms: u64) {
+    match peers.lock() {
+        Ok(mut table) => {
+            if table.remove_connection(node_id, connected_at_unix_ms) {
+                info!(peer = %node_id, "peer removed from table");
+            }
+        }
+        Err(_) => warn!(peer = %node_id, "peer table lock poisoned; peer not removed"),
+    }
+}
+
+/// The recorded connection time for `node_id`, if it is in the table.
+fn connected_at(peers: &SharedPeerTable, node_id: &NodeId) -> Option<u64> {
+    let table = peers.lock().ok()?;
+    table.get(node_id).map(|info| info.connected_at_unix_ms)
+}
+
 /// Reads every unidirectional stream `peer` opens on `connection` until it closes; returns why it closed.
 async fn receive_control_streams(
     connection: &Connection,
-    peer: &str,
+    peer: NodeId,
     peers: &SharedPeerTable,
 ) -> ConnectionError {
     let mut streams = JoinSet::new();
@@ -148,7 +179,7 @@ async fn receive_control_streams(
         tokio::select! {
             accepted = connection.accept_uni() => match accepted {
                 Ok(recv) => {
-                    streams.spawn(read_control_stream(recv, peer.to_owned(), Arc::clone(peers)));
+                    streams.spawn(read_control_stream(recv, peer, Arc::clone(peers)));
                 }
                 Err(reason) => return reason,
             },
@@ -158,10 +189,10 @@ async fn receive_control_streams(
 }
 
 /// Reads framed messages from one stream until it ends, recording heartbeats and ignoring the rest.
-async fn read_control_stream(mut recv: RecvStream, peer: String, peers: SharedPeerTable) {
+async fn read_control_stream(mut recv: RecvStream, peer: NodeId, peers: SharedPeerTable) {
     loop {
         match protocol::read_frame(&mut recv).await {
-            Ok(Some(Message::Heartbeat(heartbeat))) => record_heartbeat(&peers, &peer, &heartbeat),
+            Ok(Some(Message::Heartbeat(heartbeat))) => record_heartbeat(&peers, peer, &heartbeat),
             Ok(Some(other)) => {
                 warn!(%peer, kind = message_kind(&other), "ignoring unexpected control message");
             }
@@ -175,8 +206,8 @@ async fn read_control_stream(mut recv: RecvStream, peer: String, peers: SharedPe
 }
 
 /// Records a heartbeat from `peer`, dropping it if it names another node or is stale.
-fn record_heartbeat(peers: &SharedPeerTable, peer: &str, heartbeat: &Heartbeat) {
-    if heartbeat.node_id != peer {
+fn record_heartbeat(peers: &SharedPeerTable, peer: NodeId, heartbeat: &Heartbeat) {
+    if parse_node_id(&heartbeat.node_id).ok() != Some(peer) {
         warn!(%peer, claimed = %heartbeat.node_id, "ignoring heartbeat sent for another node");
         return;
     }
@@ -184,7 +215,7 @@ fn record_heartbeat(peers: &SharedPeerTable, peer: &str, heartbeat: &Heartbeat) 
         warn!(%peer, "peer table lock poisoned; dropping heartbeat");
         return;
     };
-    if table.record_heartbeat(heartbeat) {
+    if table.record_heartbeat(&peer, heartbeat) {
         debug!(%peer, epoch = heartbeat.epoch, sequence = heartbeat.sequence, "heartbeat");
     } else {
         warn!(%peer, sequence = heartbeat.sequence, "ignoring stale heartbeat");
@@ -247,7 +278,7 @@ async fn acceptor_handshake(
         .context("peer never opened the hello stream")?;
     let hello = read_hello(&mut recv).await?;
     validate_hello(&hello, connection.remote_id(), local)?;
-    record_peer(peers, &hello)?;
+    record_peer(peers, connection.remote_id(), &hello)?;
     protocol::write_frame(&mut send, &Message::Hello(local.clone())).await?;
     finish_stream(&mut send)?;
     Ok(hello)
@@ -284,11 +315,12 @@ fn validate_hello(hello: &Hello, remote: EndpointId, local: &Hello) -> anyhow::R
     Ok(())
 }
 
-fn record_peer(peers: &SharedPeerTable, hello: &Hello) -> anyhow::Result<()> {
+/// Records the validated peer under its authenticated node ID.
+fn record_peer(peers: &SharedPeerTable, remote: NodeId, hello: &Hello) -> anyhow::Result<()> {
     let mut table = peers
         .lock()
         .map_err(|_| anyhow!("peer table lock poisoned"))?;
-    let info = table.record_connection(hello);
+    let info = table.record_connection(remote, hello);
     info!(
         peer = %info.node_id,
         protocol_version = info.protocol_version,

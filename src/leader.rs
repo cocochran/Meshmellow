@@ -335,10 +335,7 @@ fn missing_workers(
     let table = peers
         .lock()
         .map_err(|_| anyhow!("peer table lock poisoned"))?;
-    let connected = table
-        .peers()
-        .filter_map(|peer| network::parse_node_id(&peer.node_id).ok())
-        .collect::<Vec<_>>();
+    let connected = table.ids().collect::<Vec<_>>();
     Ok(workers
         .iter()
         .map(|worker| worker.id)
@@ -510,12 +507,15 @@ mod tests {
     fn table_with(ids: &[EndpointId]) -> SharedPeerTable {
         let mut table = PeerTable::new();
         for id in ids {
-            table.record_connection(&Hello {
-                node_id: id.to_string(),
-                protocol_version: PROTOCOL_VERSION,
-                cluster_id: "test".to_owned(),
-                last_log_index: 0,
-            });
+            table.record_connection(
+                *id,
+                &Hello {
+                    node_id: id.to_string(),
+                    protocol_version: PROTOCOL_VERSION,
+                    cluster_id: "test".to_owned(),
+                    last_log_index: 0,
+                },
+            );
         }
         Arc::new(Mutex::new(table))
     }
