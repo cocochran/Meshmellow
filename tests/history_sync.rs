@@ -35,8 +35,8 @@ fn syncs_any_number_of_nodes() {
         let mut cluster = Cluster::new(n);
         run_tasks(&mut cluster, id(0), 0..5);
         assert!(cluster.converged(), "{n} nodes did not converge");
-        // Three events per job: started, output, completed.
-        assert_eq!(cluster.node(id(0)).history().len(), 15);
+        // The session's EpochAdvanced, then three events per job.
+        assert_eq!(cluster.node(id(0)).history().len(), 16);
     }
 }
 
@@ -57,7 +57,7 @@ fn sends_deltas_after_first_snapshot() {
     let out = leader.complete_task("job-1", "c", "d");
     match &out[0].1 {
         SyncMessage::Append { start, entries, .. } => {
-            assert_eq!(*start, 3);
+            assert_eq!(*start, 4);
             assert_eq!(entries.len(), 3);
         }
         other => panic!("expected append, got {other:?}"),
@@ -126,8 +126,8 @@ fn failover_continues_session_from_replica_history() {
     assert_eq!(elected.id, id(1));
     cluster.run();
     assert!(cluster.converged());
-    // Nine job events plus the EpochAdvanced the new leader records.
-    assert_eq!(cluster.node(elected.id).history().len(), 10);
+    // Epoch 1's EpochAdvanced, nine job events, and the new leader's EpochAdvanced.
+    assert_eq!(cluster.node(elected.id).history().len(), 11);
     assert!(matches!(
         cluster.node(elected.id).history().entries().last(),
         Some(Entry::EpochAdvanced { epoch: 2, leader }) if *leader == id(1)
@@ -135,7 +135,7 @@ fn failover_continues_session_from_replica_history() {
 
     run_tasks(&mut cluster, elected.id, 3..5);
     assert!(cluster.converged());
-    assert_eq!(cluster.node(elected.id).history().len(), 16);
+    assert_eq!(cluster.node(elected.id).history().len(), 17);
 }
 
 #[test]
@@ -152,7 +152,7 @@ fn election_prefers_most_complete_history() {
     assert_eq!(elected.id, id(3));
     cluster.run();
     assert!(cluster.converged());
-    assert_eq!(cluster.node(id(1)).history().len(), 10);
+    assert_eq!(cluster.node(id(1)).history().len(), 11);
 }
 
 #[test]
@@ -197,12 +197,12 @@ fn disconnected_peer_stops_syncing_and_catches_up_on_rejoin() {
     let peers: Vec<NodeId> = cluster.leader_mut(id(0)).peers().collect();
     assert_eq!(peers, vec![id(1)]);
     run_tasks(&mut cluster, id(0), 1..3);
-    assert_eq!(cluster.node(id(2)).history().len(), 3);
+    assert_eq!(cluster.node(id(2)).history().len(), 4);
 
     cluster.rejoin(id(2));
     cluster.run();
     assert!(cluster.converged());
-    assert_eq!(cluster.node(id(2)).history().len(), 9);
+    assert_eq!(cluster.node(id(2)).history().len(), 10);
 }
 
 #[test]
@@ -245,6 +245,7 @@ fn election_is_deterministic() {
     let c = |n, epoch, len| Candidate {
         id: id(n),
         epoch,
+        history_epoch: epoch,
         len,
         connected_at_unix_ms: 0,
     };
@@ -271,6 +272,7 @@ fn election_prefers_longest_connected_among_equal_histories() {
     let c = |n, len, connected_at_unix_ms| Candidate {
         id: id(n),
         epoch: 1,
+        history_epoch: 1,
         len,
         connected_at_unix_ms,
     };
@@ -282,4 +284,34 @@ fn election_prefers_longest_connected_among_equal_histories() {
     // Same history and connection time: lowest ID wins.
     let lower = id(4).min(id(2));
     assert_eq!(elect(&[c(4, 6, 1_000), c(2, 6, 1_000)]).unwrap().id, lower);
+}
+
+#[test]
+fn election_ranks_by_history_epoch_not_heard_epoch() {
+    let c = |n, epoch, history_epoch, len| Candidate {
+        id: id(n),
+        epoch,
+        history_epoch,
+        len,
+        connected_at_unix_ms: 0,
+    };
+    // Node 1 heard of epoch 3 but only holds epoch-1 history; node 2 holds epoch-2 history.
+    let elected = elect(&[c(1, 3, 1, 20), c(2, 2, 2, 5)]).unwrap();
+    assert_eq!(
+        elected.id,
+        id(2),
+        "a newer history beats a longer, older one"
+    );
+    // The new epoch is above every epoch anyone has heard of, not just the winner's.
+    assert_eq!(elected.epoch, 4);
+}
+
+#[test]
+fn every_session_records_its_epoch() {
+    let leader = Leader::new(id(0), 1, Default::default(), [id(1)]);
+    assert!(matches!(
+        leader.history().entries(),
+        [Entry::EpochAdvanced { epoch: 1, leader }] if *leader == id(0)
+    ));
+    assert_eq!(leader.history().last_epoch(), 1);
 }

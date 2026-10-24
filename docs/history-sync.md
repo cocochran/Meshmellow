@@ -2,7 +2,7 @@
 
 The `history_sync` module (`src/history_sync/`) keeps one conversation's history identical on every node in the mesh and saved on each node's disk. When the main process (the device that took the prompt) disappears, another node can take over from its own copy.
 
-**Status:** works in the in-memory simulator and in tests (24 tests). It is **not yet wired into a running `llm-cluster` node**: nothing reads `History` frames off control connections, so a live node doesn't sync or save history yet. Takeover is a ranking, not consensus, and there is no restore-from-export command yet.
+**Status:** works in the in-memory simulator and in tests (31 tests). It is **not yet wired into a running `llm-cluster` node**: nothing reads `History` frames off control connections, so a live node doesn't sync or save history yet. Takeover is a ranking, not consensus, and there is no restore-from-export command yet.
 
 ## Contents
 
@@ -23,13 +23,13 @@ The `history_sync` module (`src/history_sync/`) keeps one conversation's history
 | File | Lines | Holds |
 |---|---:|---|
 | `src/history_sync.rs` | 16 | Module root; declares the submodules below |
-| `history.rs` | 80 | `Entry` (job events), `History`, the `NodeId` / `Epoch` / `Seq` types |
+| `history.rs` | 96 | `Entry` (job events), `History`, the `NodeId` / `Epoch` / `Seq` types |
 | `message.rs` | 53 | `SyncMessage`, the wire messages between main process and workers |
-| `leader.rs` | 217 | `Leader`: the main process's side of sync |
-| `replica.rs` | 139 | `Replica`: a worker's side of sync, and promotion to leader |
-| `node.rs` | 142 | `Node`: one peer's role (leader or replica), step-down, and disk hooks |
-| `election.rs` | 44 | `Candidate`, `Elected`, `elect()`: choosing a new main process |
-| `store.rs` | 558 | `HistoryStore`: saving to disk, loading, and `ConversationExport` |
+| `leader.rs` | 223 | `Leader`: the main process's side of sync |
+| `replica.rs` | 136 | `Replica`: a worker's side of sync, and promotion to leader |
+| `node.rs` | 138 | `Node`: one peer's role (leader or replica), step-down, and disk hooks |
+| `election.rs` | 54 | `Candidate`, `Elected`, `elect()`: choosing a new main process |
+| `store.rs` | 622 | `HistoryStore`: saving to disk, loading, and `ConversationExport` |
 | `sim.rs` | 256 | `Cluster`: an in-memory mesh for tests and the demo |
 
 Outside the module: `tests/history_sync.rs` and `tests/history_store.rs` (tests), `examples/history_sync.rs` (demo), and `llm-cluster history …` in `src/main.rs` (CLI). It also relies on two pieces of the networking layer in `src/node.rs`: `NodeId` and `PeerTable`.
@@ -69,8 +69,8 @@ Workers that are caught up get only new entries (`Append`). New workers, workers
 
 1. The main process goes away; its peers drop it from their `PeerTable`.
 2. Each surviving worker reports a `Candidate` (epoch, history length, connection time).
-3. `elect()` ranks them: **most complete history, then connected longest, then lowest ID**. It returns the winner and **epoch + 1**.
-4. The winner calls `Replica::promote`. That records an `EpochAdvanced` event and makes every peer start with a `Snapshot`, so all copies converge on the winner's history.
+3. `elect()` ranks them: **newest history (the epoch its history was written under, then its length), then connected longest, then lowest ID**. It returns the winner and an epoch one above the highest any candidate has heard of.
+4. The winner calls `Replica::promote`. The new leader records an `EpochAdvanced` event and makes every peer start with a `Snapshot`, so all copies converge on the winner's history.
 
 ### A stale main process comes back
 
@@ -99,7 +99,9 @@ New main adds it back → Snapshot{2} → its unsynced entries are discarded
 | `JobStarted { request_id, prompt }` | A prompt was accepted |
 | `OutputCommitted { request_id, offset, text }` | Part of the response, starting at byte `offset` |
 | `JobCompleted { request_id }` | The response is complete |
-| `EpochAdvanced { epoch, leader }` | A failover made `leader` the main process |
+| `EpochAdvanced { epoch, leader }` | `leader` became the main process in `epoch`. Every session starts with one (epoch 1), and every takeover adds one |
+
+`History::last_epoch()` is the newest `EpochAdvanced`: the epoch the history was written under. Elections compare it, not the highest epoch a node has heard of (see `election.rs`).
 
 A job with `JobStarted` but no `JobCompleted` was **interrupted**. This is how recovery tells finished answers from cut-off ones. The model's KV cache is never copied; a new main process rebuilds it by re-reading (re-prefilling) the text.
 
@@ -173,7 +175,7 @@ Holds the authoritative history and how far each peer has confirmed (`NeedsSnaps
 | `new(id)` / `with_history(id, epoch, history)` | Empty worker, or one restored from disk or a stepped-down leader |
 | `handle(msg)` | Applies a main-process message and returns the reply |
 | `candidate(connected_at_unix_ms)` | This worker's election entry |
-| `promote(new_epoch, peers)` | Becomes the main process; refuses an epoch that isn't newer, records `EpochAdvanced` |
+| `promote(new_epoch, peers)` | Becomes the main process; refuses an epoch that isn't newer. `Leader::new` records the `EpochAdvanced` |
 
 `handle` rules, in order:
 1. Older epoch → `Reject`.
@@ -206,7 +208,9 @@ The `in_sync_epoch` flag is what makes rule 3 safe after failover: the new main 
 
 ### `election.rs`
 
-`Candidate { id, epoch, len, connected_at_unix_ms }`. `elect(&[Candidate]) -> Option<Elected { id, epoch }>` ranks by `(epoch, len)`, then the **earliest** `connected_at_unix_ms`, then the lowest `id`. It returns `max epoch + 1`.
+`Candidate { id, epoch, history_epoch, len, connected_at_unix_ms }`, built by `Replica::candidate`. `epoch` is the highest epoch the node has heard of; `history_epoch` is `History::last_epoch()`. `elect(&[Candidate]) -> Option<Elected { id, epoch }>` ranks by `(history_epoch, len)`, then the **earliest** `connected_at_unix_ms`, then the lowest `id`. It returns an epoch one above the highest `epoch` or `history_epoch` among the candidates.
+
+**Why the history's epoch, not the heard one:** a node can learn of a newer epoch (through a `Reject`, or an append it refused) without receiving any of that leader's entries. Ranking by what it heard would make its older history look current. This is Raft's "last log term" rule. The new epoch still has to be above everything anyone heard, so two leaders never share one.
 
 **Why this order:** history first, so the winner never has fewer entries than a node that could have won instead. Its snapshot would erase them. Connection time comes second because device clocks can differ, so it only breaks ties. Every node that sees the same candidates picks the same winner.
 
@@ -223,9 +227,9 @@ The `in_sync_epoch` flag is what makes rule 3 safe after failover: the new main 
 |---|---|
 | `open(data_dir, StoreMeta)` | Opens a conversation, creating it if absent. An existing one must match the cluster ID and model hash (`StoreError::Mismatch`) |
 | `load(data_dir, conversation_id)` | Opens an existing one only (`NotFound` otherwise) |
-| `append(entries)` | Adds entries; on disk when it returns |
-| `replace(history, epoch)` | Swaps in a whole history, e.g. from a snapshot |
-| `set_epoch(epoch)` | Records a newer epoch |
+| `record(epoch, entries)` | Raises the epoch (if newer) and appends entries in one write, epoch line first; on disk when it returns |
+| `append(entries)` / `set_epoch(epoch)` | `record` with only entries, or only an epoch. The epoch never goes down |
+| `replace(history, epoch)` | Swaps in a whole history and its epoch in one atomic snapshot write, e.g. from a `Snapshot` |
 | `export()` | Returns a `ConversationExport` |
 | `history` / `epoch` / `len` / `meta` / `dir` | Accessors |
 
@@ -236,7 +240,7 @@ Supporting types:
 - `job_states(&History)`: rebuilds each job's state from the event log.
 - `StoreError`: what can go wrong (bad I/O or JSON, corruption, unsafe ID, mismatch, not found, unsupported version).
 
-Constants: `FORMAT_VERSION = 1`, `SNAPSHOT_EVERY = 100`, `DEFAULT_DATA_DIR = "meshthing-data"`.
+Constants: `FORMAT_VERSION = 2` (on disk; version 1 kept the epoch in `meta.json` and is refused), `EXPORT_FORMAT_VERSION = 1`, `SNAPSHOT_EVERY = 100`, `DEFAULT_DATA_DIR = "meshthing-data"`.
 
 **As the project evolves**
 - Restore: start a main process from an export.
@@ -263,12 +267,13 @@ Controls:
 
 ```text
 <data-dir>/history/<conversation_id>/
-├── meta.json       StoreMeta (replaced atomically)
-├── snapshot.json   { generation, entries[] }: the first entries (replaced atomically)
-└── log.jsonl       one { generation, index, entry } line per later entry
+├── meta.json       StoreMeta: identity only, written once at creation
+├── snapshot.json   { generation, epoch, entries[] }: the first entries (replaced atomically)
+└── log.jsonl       later changes, one per line: { generation, index, entry } or { generation, epoch }
 ```
 
-- **Appends** are one write per call, flushed with `sync_data` before `append` returns.
+- **The epoch lives with the history.** It's in `snapshot.json`, and changes after the snapshot are `{generation, epoch}` log lines. On load, the epoch is the highest of the snapshot's, the log's and the newest `EpochAdvanced` in the history. No crash can leave new history paired with an old epoch.
+- **Writes** (`record`) are one write per call, epoch line first, flushed with `sync_data` before returning.
 - **Atomic replacement:** write a temporary file, flush it, rename it over the old one, then flush the directory (Unix).
 - **Compaction:** every 100 log entries, the log is folded into a new snapshot and truncated.
 - **Conversation IDs** become folder names, so only 1–128 letters, digits, `-`, `_`, `.` are allowed (not `.` or `..`).
@@ -277,7 +282,7 @@ Controls:
 
 | Crash during… | What load does |
 |---|---|
-| A log write | The last line has no newline: it's dropped and cut from the file |
+| A log write | The last line has no newline: it's dropped and cut from the file. Because the epoch line comes first, any entries that survive come with their epoch |
 | Compaction, after the snapshot but before the log is cut | Log lines with `index` below the snapshot length are skipped |
 | `replace`, before the log is cut | Old lines carry the previous `generation` and are ignored |
 
@@ -341,14 +346,15 @@ The demo runs three jobs with one dropped message and a retransmit. Then the mai
 
 ## 8. Tests
 
-`tests/history_sync.rs` (13): sync, failover and election.
+`tests/history_sync.rs` (15): sync, failover and election.
 - **Sync:** any number of nodes from 1 to 50; deltas after the first snapshot; repeated appends are harmless; dropped messages recovered; a gap triggers a snapshot.
 - **Failover:** continues from a worker's history (`EpochAdvanced` recorded); the most complete history wins; a stale main process is refused and resynced.
 - **Peers:** a disconnected peer stops being synced and catches up on rejoin; the leader's peer list follows `PeerTable`.
-- **Election and wire format:** the ranking is deterministic; longest-connected wins among equal histories; messages survive a round trip.
+- **Election and wire format:** the ranking is deterministic; longest-connected wins among equal histories; a newer history beats a longer, older one and the new epoch is above every epoch heard; every session records its epoch; messages survive a round trip.
 
-`tests/history_store.rs` (11): storage and export.
+`tests/history_store.rs` (16): storage and export.
 - **Reload:** history and epoch survive a restart.
+- **Epoch durability:** the epoch is stored with the history and `meta.json` is never rewritten; the epoch never goes down; a torn write keeps its epoch; the epoch is never below the newest `EpochAdvanced`; version-1 stores are refused.
 - **Crashes:** torn last line dropped; corrupt complete line reported; compaction and the crash after it; `replace` and the crash during it.
 - **Refusals:** a different model or cluster; unsafe or missing conversation IDs.
 - **Export:** completed vs interrupted jobs, including chunk joining.
@@ -358,10 +364,9 @@ Run them with `cargo test --test history_sync --test history_store`.
 
 ## 9. Limits and next steps
 
-**Known issues** (found in david-codex's review of `6114f93`, not fixed yet):
-- **Epoch saved separately from history.** `HistoryStore::replace` writes the snapshot and then `meta.json`, and `Node::persist` appends and then sets the epoch. A crash between the two writes reloads the new history with the old epoch. Fix: keep the epoch in `snapshot.json` so both are written in one atomic replace.
+**Known issues** (from david-codex's review of `6114f93`; the first, epoch saved separately from history, is fixed):
 - **Connection identity is a millisecond timestamp.** `PeerTable::remove_connection` matches on `connected_at_unix_ms`. Two reconnects in the same millisecond, or a clock going backwards, let an old connection's close remove the new entry. `run_control_session` also reads that timestamp after the handshake, so a concurrent reconnect can replace it first. Fix: a unique connection token returned by `record_connection`, separate from the logged time. Being handled with the PR #10 reconcile (M-21).
-- **Dialed connections need manual cleanup.** Callers of `dial_peer` must call `forget_peer` themselves; a handle that does it on drop would be safer.
+- **Dialed connections need manual cleanup.** Callers of `dial_peer` must call `forget_peer` themselves. Proposed to yash-claude (REF connor-claude-005): a `PeerSession` returned by dialing and accepting, holding the connection token and removing the peer when the connection closes (via a `WeakConnectionHandle` watch) or the session is dropped.
 
 In priority order:
 1. **Control loop:** read `History` frames, `handle_durable` on workers, `persist` before sending on the main process, `set_peers` when the peer table changes.

@@ -44,7 +44,7 @@ impl Node {
         ))
     }
 
-    /// Saves any new entries and a newer epoch to `store`.
+    /// Saves any new entries and a newer epoch to `store`, in one write with the epoch first.
     ///
     /// On the main process, call this after recording a job (e.g. `complete_task`) and
     /// before sending the returned messages, so workers never hold entries the leader lost.
@@ -53,11 +53,7 @@ impl Node {
         if history.len() < store.len() {
             return store.replace(history, self.epoch());
         }
-        store.append(history.since(store.len()))?;
-        if self.epoch() > store.epoch() {
-            store.set_epoch(self.epoch())?;
-        }
-        Ok(())
+        store.record(self.epoch(), history.since(store.len()))
     }
 
     /// Like [`Node::handle`], but saves the result to `store` before returning the replies,

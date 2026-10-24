@@ -77,4 +77,20 @@ impl History {
     pub fn extend(&mut self, entries: impl IntoIterator<Item = Entry>) {
         self.entries.extend(entries);
     }
+
+    /// The epoch this history was written under: the newest `EpochAdvanced`, or 0 if none.
+    ///
+    /// Elections compare this, not the highest epoch a node has heard of, so a node
+    /// that learned of a new epoch but never received that leader's entries doesn't
+    /// look more up to date than it is.
+    pub fn last_epoch(&self) -> Epoch {
+        self.entries
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                Entry::EpochAdvanced { epoch, .. } => Some(*epoch),
+                _ => None,
+            })
+            .unwrap_or(0)
+    }
 }

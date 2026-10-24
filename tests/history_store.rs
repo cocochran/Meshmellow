@@ -288,7 +288,7 @@ fn replica_acks_only_what_is_on_disk() {
     leader.start_job("job-0", "prompt");
     for (_, msg) in leader.complete_job("job-0", "response") {
         for (_, reply) in replica.handle_durable(leader_id, msg, &mut store).unwrap() {
-            assert!(matches!(reply, SyncMessage::Ack { len: 3, .. }));
+            assert!(matches!(reply, SyncMessage::Ack { len: 4, .. }));
             // At the moment the Ack exists, the entries are already on disk.
             let on_disk = HistoryStore::load(&dir.0, CONVERSATION).unwrap();
             assert_eq!(on_disk.history(), leader.history());
@@ -321,7 +321,7 @@ fn restarted_replica_reloads_and_catches_up() {
     // The replica process restarts while the leader keeps going.
     leader.complete_task("job-1", "c", "d");
     let mut store = HistoryStore::load(&dir.0, CONVERSATION).unwrap();
-    assert_eq!(store.len(), 3);
+    assert_eq!(store.len(), 4);
     let mut replica = Node::from_store(replica_id, &store);
     deliver(&mut leader, &mut replica, &mut store);
 
@@ -346,4 +346,108 @@ fn leader_persists_before_sending() {
     let on_disk = HistoryStore::load(&dir.0, CONVERSATION).unwrap();
     assert_eq!(on_disk.history(), node.history());
     assert_eq!(on_disk.epoch(), 1);
+}
+
+fn meta_path(dir: &DataDir) -> PathBuf {
+    dir.0.join("history").join(CONVERSATION).join("meta.json")
+}
+
+#[test]
+fn epoch_is_saved_with_the_history_not_in_meta() {
+    let dir = DataDir::new("epoch-with-history");
+    let mut store = HistoryStore::open(&dir.0, meta()).unwrap();
+    let meta_before = fs::read(meta_path(&dir)).unwrap();
+
+    store.append(&job(0)).unwrap();
+    store.set_epoch(2).unwrap();
+    store.replace(&History::from_entries(job(1)), 3).unwrap();
+    store.set_epoch(4).unwrap();
+    drop(store);
+
+    assert_eq!(
+        fs::read(meta_path(&dir)).unwrap(),
+        meta_before,
+        "meta.json holds identity only and is never rewritten"
+    );
+    let store = HistoryStore::load(&dir.0, CONVERSATION).unwrap();
+    assert_eq!(store.epoch(), 4);
+    assert_eq!(store.history(), &History::from_entries(job(1)));
+}
+
+#[test]
+fn epoch_never_goes_down() {
+    let dir = DataDir::new("epoch-monotonic");
+    let mut store = HistoryStore::open(&dir.0, meta()).unwrap();
+    store.set_epoch(5).unwrap();
+    store.set_epoch(3).unwrap();
+    assert_eq!(store.epoch(), 5);
+    store.replace(&History::from_entries(job(0)), 2).unwrap();
+    assert_eq!(store.epoch(), 5);
+    drop(store);
+    assert_eq!(HistoryStore::load(&dir.0, CONVERSATION).unwrap().epoch(), 5);
+}
+
+#[test]
+fn torn_write_keeps_the_epoch_it_was_written_under() {
+    let dir = DataDir::new("torn-epoch");
+    let mut store = HistoryStore::open(&dir.0, meta()).unwrap();
+    store.append(&job(0)).unwrap();
+    drop(store);
+    // A record(epoch 6, entries) cut off after the epoch line, mid-way through the entries.
+    append_raw(
+        &dir.log_path(),
+        br#"{"generation":0,"epoch":6}
+{"generation":0,"index":3,"entry":{"type":"JobStarted","request_id":"job-1","prompt":"p"}}
+{"generation":0,"index":4,"entry":{"ty"#,
+    );
+
+    let store = HistoryStore::load(&dir.0, CONVERSATION).unwrap();
+    assert_eq!(store.epoch(), 6);
+    assert_eq!(
+        store.len(),
+        4,
+        "complete lines are kept, the torn one dropped"
+    );
+}
+
+#[test]
+fn epoch_covers_every_epoch_advanced_in_the_history() {
+    let dir = DataDir::new("epoch-from-history");
+    let mut store = HistoryStore::open(&dir.0, meta()).unwrap();
+    let advanced = Entry::EpochAdvanced {
+        epoch: 7,
+        leader: id(0),
+    };
+    store.append(std::slice::from_ref(&advanced)).unwrap();
+    assert_eq!(store.epoch(), 7);
+    drop(store);
+    assert_eq!(HistoryStore::load(&dir.0, CONVERSATION).unwrap().epoch(), 7);
+
+    // Even if a log only has the entry (no epoch line), loading never reports a lower epoch.
+    let dir = DataDir::new("epoch-from-history-raw");
+    drop(HistoryStore::open(&dir.0, meta()).unwrap());
+    let line = format!(
+        "{}\n",
+        serde_json::json!({"generation": 0, "index": 0, "entry": advanced})
+    );
+    append_raw(&dir.log_path(), line.as_bytes());
+    assert_eq!(HistoryStore::load(&dir.0, CONVERSATION).unwrap().epoch(), 7);
+}
+
+#[test]
+fn version_1_stores_are_refused() {
+    let dir = DataDir::new("v1");
+    drop(HistoryStore::open(&dir.0, meta()).unwrap());
+    let v1 = serde_json::json!({
+        "format_version": 1,
+        "conversation_id": CONVERSATION,
+        "cluster_id": "cluster-a",
+        "model": {"model_hash": "sha256:abc", "generation": {}},
+        "epoch": 2
+    });
+    fs::write(meta_path(&dir), v1.to_string()).unwrap();
+    assert!(matches!(
+        HistoryStore::load(&dir.0, CONVERSATION),
+        Err(StoreError::UnsupportedVersion { found: 1, .. })
+    ));
 }

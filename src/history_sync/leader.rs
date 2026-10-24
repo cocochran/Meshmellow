@@ -26,12 +26,18 @@ pub struct Leader {
 }
 
 impl Leader {
+    /// Starts leading in `epoch` with `history` (empty for a new session, or a promoted
+    /// replica's). Records `EpochAdvanced { epoch, leader: id }` unless the history
+    /// already has it, so every epoch's leadership is in the log.
     pub fn new(
         id: NodeId,
         epoch: Epoch,
-        history: History,
+        mut history: History,
         peers: impl IntoIterator<Item = NodeId>,
     ) -> Self {
+        if history.last_epoch() < epoch {
+            history.extend([Entry::EpochAdvanced { epoch, leader: id }]);
+        }
         let mut leader = Self {
             id,
             epoch,

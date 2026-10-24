@@ -1,15 +1,16 @@
 //! Durable, per-conversation history on disk, and the export format used for recovery.
 //!
 //! Layout under `<data_dir>/history/<conversation_id>/`:
-//! - `meta.json`: format version, conversation and cluster IDs, model manifest and current
-//!   epoch; replaced atomically.
-//! - `snapshot.json`: the first entries of the history; replaced atomically.
-//! - `log.jsonl`: one `{"generation", "index", "entry"}` line per entry after the snapshot.
+//! - `meta.json`: format version, conversation and cluster IDs, model manifest; written once.
+//! - `snapshot.json`: the epoch and the first entries of the history; replaced atomically.
+//! - `log.jsonl`: one line per change after the snapshot, either
+//!   `{"generation", "index", "entry"}` or `{"generation", "epoch"}`.
 //!
-//! Appends reach the disk before [`HistoryStore::append`] returns. A crash at any point
-//! leaves a loadable prefix of the history: a torn final log line is dropped, log lines the
-//! snapshot already covers are skipped, and lines from before a [`HistoryStore::replace`]
-//! carry an older generation and are ignored.
+//! The epoch lives with the history, never in a separate file, so a crash can't leave new
+//! history with an old epoch. Writes reach the disk before [`HistoryStore::record`]
+//! returns. A crash at any point leaves a loadable prefix: a torn final log line is
+//! dropped, log lines the snapshot already covers are skipped, and lines from before a
+//! [`HistoryStore::replace`] carry an older generation and are ignored.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -21,8 +22,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::history_sync::history::{Entry, Epoch, History, Seq};
 
-/// Version of the on-disk layout and of [`ConversationExport`].
-pub const FORMAT_VERSION: u32 = 1;
+/// Version of the on-disk layout. Version 1 kept the epoch in `meta.json`.
+pub const FORMAT_VERSION: u32 = 2;
+
+/// Version of [`ConversationExport`].
+pub const EXPORT_FORMAT_VERSION: u32 = 1;
 
 /// The log is folded into a new snapshot once it holds this many entries.
 pub const SNAPSHOT_EVERY: Seq = 100;
@@ -47,26 +51,22 @@ pub struct ModelManifest {
     pub generation: BTreeMap<String, String>,
 }
 
-/// Identity and leadership state of a stored conversation (`meta.json`).
+/// Identity of a stored conversation (`meta.json`); never changes after creation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoreMeta {
     pub format_version: u32,
     pub conversation_id: String,
     pub cluster_id: String,
     pub model: ModelManifest,
-    /// Highest leadership epoch this node has accepted for the conversation.
-    pub epoch: Epoch,
 }
 
 impl StoreMeta {
-    /// Metadata for a new conversation in epoch 0.
     pub fn new(conversation_id: &str, cluster_id: &str, model: ModelManifest) -> Self {
         Self {
             format_version: FORMAT_VERSION,
             conversation_id: conversation_id.to_owned(),
             cluster_id: cluster_id.to_owned(),
             model,
-            epoch: 0,
         }
     }
 }
@@ -75,23 +75,38 @@ impl StoreMeta {
 #[derive(Serialize, Deserialize)]
 struct Snapshot {
     generation: u64,
+    epoch: Epoch,
     entries: Vec<Entry>,
 }
 
 /// One line of `log.jsonl`, as read.
 #[derive(Deserialize)]
-struct LogLine {
-    generation: u64,
-    index: Seq,
-    entry: Entry,
+#[serde(untagged)]
+enum LogLine {
+    Entry {
+        generation: u64,
+        index: Seq,
+        entry: Entry,
+    },
+    Epoch {
+        generation: u64,
+        epoch: Epoch,
+    },
 }
 
-/// One line of `log.jsonl`, as written.
+/// An entry line of `log.jsonl`, as written.
 #[derive(Serialize)]
-struct LogLineRef<'a> {
+struct EntryLineRef<'a> {
     generation: u64,
     index: Seq,
     entry: &'a Entry,
+}
+
+/// An epoch line of `log.jsonl`, as written.
+#[derive(Serialize)]
+struct EpochLine {
+    generation: u64,
+    epoch: Epoch,
 }
 
 /// Errors from reading or writing a stored conversation.
@@ -134,6 +149,8 @@ pub struct HistoryStore {
     dir: PathBuf,
     meta: StoreMeta,
     history: History,
+    /// Highest leadership epoch this node has accepted for the conversation.
+    epoch: Epoch,
     generation: u64,
     /// How many entries of `history` are in `snapshot.json`; the rest are in the log.
     snapshot_len: Seq,
@@ -144,7 +161,7 @@ impl HistoryStore {
     /// Opens the stored conversation `meta.conversation_id`, creating it from `meta` if absent.
     ///
     /// An existing conversation must belong to the same cluster and model; its stored epoch
-    /// and history are kept.
+    /// and history are kept. A new one starts empty in epoch 0.
     pub fn open(data_dir: &Path, meta: StoreMeta) -> Result<Self, StoreError> {
         let dir = conversation_dir(data_dir, &meta.conversation_id)?;
         if dir.join(META_FILE).exists() {
@@ -171,6 +188,7 @@ impl HistoryStore {
         };
         let snapshot = Snapshot {
             generation: 0,
+            epoch: 0,
             entries: Vec::new(),
         };
         write_json_atomic(&dir.join(SNAPSHOT_FILE), &snapshot)?;
@@ -181,6 +199,7 @@ impl HistoryStore {
             dir,
             meta,
             history: History::new(),
+            epoch: 0,
             generation: 0,
             snapshot_len: 0,
             log,
@@ -211,28 +230,41 @@ impl HistoryStore {
         let snapshot: Snapshot = read_json(&dir.join(SNAPSHOT_FILE))?;
         let snapshot_len = snapshot.entries.len() as Seq;
         let mut history = History::from_entries(snapshot.entries);
+        let mut epoch = snapshot.epoch;
         let log_path = dir.join(LOG_FILE);
         for line in read_log(&log_path)? {
-            if line.generation != snapshot.generation || line.index < snapshot_len {
-                continue;
+            match line {
+                LogLine::Epoch {
+                    generation,
+                    epoch: logged,
+                } if generation == snapshot.generation => epoch = epoch.max(logged),
+                LogLine::Entry {
+                    generation,
+                    index,
+                    entry,
+                } if generation == snapshot.generation && index >= snapshot_len => {
+                    if index != history.len() {
+                        return Err(StoreError::Corrupt {
+                            path: log_path,
+                            reason: format!(
+                                "expected entry {} but found entry {index}",
+                                history.len()
+                            ),
+                        });
+                    }
+                    history.extend([entry]);
+                }
+                _ => {}
             }
-            if line.index != history.len() {
-                return Err(StoreError::Corrupt {
-                    path: log_path,
-                    reason: format!(
-                        "expected entry {} but found entry {}",
-                        history.len(),
-                        line.index
-                    ),
-                });
-            }
-            history.extend([line.entry]);
         }
+        // A history is never newer than the epoch that wrote it.
+        epoch = epoch.max(history.last_epoch());
         let log = open_log(&log_path)?;
         Ok(Self {
             dir,
             meta,
             history,
+            epoch,
             generation: snapshot.generation,
             snapshot_len,
             log,
@@ -252,7 +284,7 @@ impl HistoryStore {
     }
 
     pub fn epoch(&self) -> Epoch {
-        self.meta.epoch
+        self.epoch
     }
 
     pub fn len(&self) -> Seq {
@@ -265,26 +297,53 @@ impl HistoryStore {
 
     /// Appends entries to the end of the history; they are on disk when this returns.
     pub fn append(&mut self, entries: &[Entry]) -> Result<(), StoreError> {
-        if entries.is_empty() {
+        self.record(self.epoch, entries)
+    }
+
+    /// Records a newer leadership epoch. An epoch at or below the stored one is ignored.
+    pub fn set_epoch(&mut self, epoch: Epoch) -> Result<(), StoreError> {
+        self.record(epoch, &[])
+    }
+
+    /// Records a newer epoch (if `epoch` is above the stored one) and appends `entries`,
+    /// in one write that is on disk when this returns.
+    ///
+    /// The epoch line comes first, so a crash part-way through keeps the epoch and a
+    /// prefix of the entries, never entries without the epoch they were written under.
+    pub fn record(&mut self, epoch: Epoch, entries: &[Entry]) -> Result<(), StoreError> {
+        // Entries can't be newer than the epoch stored with them.
+        let epoch = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::EpochAdvanced { epoch, .. } => Some(*epoch),
+                _ => None,
+            })
+            .fold(epoch, Epoch::max);
+        let raise_epoch = epoch > self.epoch;
+        if !raise_epoch && entries.is_empty() {
             return Ok(());
         }
         let log_path = self.dir.join(LOG_FILE);
         let mut buffer = Vec::new();
+        if raise_epoch {
+            let line = EpochLine {
+                generation: self.generation,
+                epoch,
+            };
+            push_line(&mut buffer, &line, &log_path)?;
+        }
         for (offset, entry) in entries.iter().enumerate() {
-            let line = LogLineRef {
+            let line = EntryLineRef {
                 generation: self.generation,
                 index: self.history.len() + offset as Seq,
                 entry,
             };
-            serde_json::to_writer(&mut buffer, &line).map_err(|source| StoreError::Json {
-                path: log_path.clone(),
-                source,
-            })?;
-            buffer.push(b'\n');
+            push_line(&mut buffer, &line, &log_path)?;
         }
         // One write per call, so a crash tears at most the last line.
         self.log.write_all(&buffer).map_err(io_at(&log_path))?;
         self.log.sync_data().map_err(io_at(&log_path))?;
+        self.epoch = self.epoch.max(epoch);
         self.history.extend(entries.iter().cloned());
         if self.history.len() - self.snapshot_len >= SNAPSHOT_EVERY {
             self.compact()?;
@@ -292,41 +351,30 @@ impl HistoryStore {
         Ok(())
     }
 
-    /// Replaces the whole history, e.g. with a snapshot from a new leader, and records `epoch`.
+    /// Replaces the whole history, e.g. with a snapshot from a new leader, together with
+    /// its epoch, in one atomic write. The epoch never goes down.
     pub fn replace(&mut self, history: &History, epoch: Epoch) -> Result<(), StoreError> {
         // Write the new snapshot under a new generation first: until the log is truncated,
         // its old lines carry the previous generation and are ignored on load.
         let generation = self.generation + 1;
-        self.write_snapshot(generation, history)?;
+        let epoch = epoch.max(self.epoch);
+        self.write_snapshot(generation, epoch, history)?;
         self.truncate_log()?;
         self.generation = generation;
+        self.epoch = epoch;
         self.history = history.clone();
         self.snapshot_len = self.history.len();
-        self.set_epoch(epoch)
-    }
-
-    /// Records a new leadership epoch.
-    pub fn set_epoch(&mut self, epoch: Epoch) -> Result<(), StoreError> {
-        if epoch == self.meta.epoch {
-            return Ok(());
-        }
-        let meta = StoreMeta {
-            epoch,
-            ..self.meta.clone()
-        };
-        write_json_atomic(&self.dir.join(META_FILE), &meta)?;
-        self.meta = meta;
         Ok(())
     }
 
     /// Everything this node has stored for the conversation, in the export format.
     pub fn export(&self) -> ConversationExport {
         ConversationExport {
-            format_version: FORMAT_VERSION,
+            format_version: EXPORT_FORMAT_VERSION,
             conversation_id: self.meta.conversation_id.clone(),
             cluster_id: self.meta.cluster_id.clone(),
             model: self.meta.model.clone(),
-            epoch: self.meta.epoch,
+            epoch: self.epoch,
             committed_len: self.history.len(),
             jobs: job_states(&self.history),
             entries: self.history.entries().to_vec(),
@@ -336,15 +384,21 @@ impl HistoryStore {
     /// Folds the log into the snapshot so loading stays fast and the log stays short.
     fn compact(&mut self) -> Result<(), StoreError> {
         let history = self.history.clone();
-        self.write_snapshot(self.generation, &history)?;
+        self.write_snapshot(self.generation, self.epoch, &history)?;
         self.truncate_log()?;
         self.snapshot_len = self.history.len();
         Ok(())
     }
 
-    fn write_snapshot(&self, generation: u64, history: &History) -> Result<(), StoreError> {
+    fn write_snapshot(
+        &self,
+        generation: u64,
+        epoch: Epoch,
+        history: &History,
+    ) -> Result<(), StoreError> {
         let snapshot = Snapshot {
             generation,
+            epoch,
             entries: history.entries().to_vec(),
         };
         write_json_atomic(&self.dir.join(SNAPSHOT_FILE), &snapshot)
@@ -478,6 +532,16 @@ fn io_at(path: &Path) -> impl FnOnce(io::Error) -> StoreError + '_ {
         path: path.to_owned(),
         source,
     }
+}
+
+/// Serializes `line` as one JSON line onto `buffer`.
+fn push_line<T: Serialize>(buffer: &mut Vec<u8>, line: &T, path: &Path) -> Result<(), StoreError> {
+    serde_json::to_writer(&mut *buffer, line).map_err(|source| StoreError::Json {
+        path: path.to_owned(),
+        source,
+    })?;
+    buffer.push(b'\n');
+    Ok(())
 }
 
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, StoreError> {
