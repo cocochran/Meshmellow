@@ -147,6 +147,7 @@ impl Cluster {
             rpc_port: self.worker_rpc_port,
             rpc_args: Vec::new(),
             leader: None,
+            allowed_peers: Vec::new(),
             heartbeat_interval: HEARTBEAT_INTERVAL,
         };
         tokio::spawn(async move { run_worker_on(endpoint, Some(leader), &config).await })

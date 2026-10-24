@@ -90,6 +90,9 @@ enum Command {
         /// Local RPC server to forward bridge streams to.
         #[arg(long, default_value = "127.0.0.1:50052")]
         target: SocketAddr,
+        /// Node ID allowed to use this bridge (the leader's); repeatable, at least one required.
+        #[arg(long = "allow-peer", required = true)]
+        allow_peers: Vec<String>,
     },
     /// Leader side of the RPC bridge: expose a remote worker's RPC server on a local port.
     BridgeConnect {
@@ -111,8 +114,13 @@ enum Command {
         #[arg(long = "rpc-arg", allow_hyphen_values = true)]
         rpc_args: Vec<String>,
         /// Node ID printed by the leader; omit to run the bridge without a control link.
+        /// The leader is always allowed to use this worker's RPC bridge.
         #[arg(long)]
         leader: Option<String>,
+        /// Extra node ID allowed to use this worker's RPC bridge; repeatable. Without `--leader`
+        /// at least one is required.
+        #[arg(long = "allow-peer")]
+        allow_peers: Vec<String>,
         /// Time between heartbeats to the leader, e.g. `2s` or `500ms`.
         #[arg(long, default_value = DEFAULT_HEARTBEAT_INTERVAL_ARG, value_parser = parse_duration)]
         heartbeat_interval: Duration,
@@ -182,7 +190,10 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Listen => listen(&cli.key, &cli.cluster).await,
         Command::Connect { ref node_id } => connect(&cli.key, &cli.cluster, node_id).await,
-        Command::BridgeServe { target } => bridge_serve(&cli.key, target).await,
+        Command::BridgeServe {
+            target,
+            ref allow_peers,
+        } => bridge_serve(&cli.key, target, &parse_node_ids(allow_peers)?).await,
         Command::BridgeConnect {
             ref node_id,
             listen,
@@ -192,6 +203,7 @@ async fn main() -> anyhow::Result<()> {
             rpc_port,
             rpc_args,
             leader,
+            allow_peers,
             heartbeat_interval,
         } => {
             let config = WorkerConfig {
@@ -201,6 +213,7 @@ async fn main() -> anyhow::Result<()> {
                 rpc_port,
                 rpc_args,
                 leader: leader.as_deref().map(network::parse_node_id).transpose()?,
+                allowed_peers: parse_node_ids(&allow_peers)?,
                 heartbeat_interval,
             };
             until_ctrl_c(worker::run_worker(config)).await
@@ -265,11 +278,21 @@ async fn connect(key: &Path, cluster: &str, node_id: &str) -> anyhow::Result<()>
     Ok(())
 }
 
-async fn bridge_serve(key: &Path, target: SocketAddr) -> anyhow::Result<()> {
+async fn bridge_serve(
+    key: &Path,
+    target: SocketAddr,
+    allow_peers: &[iroh::EndpointId],
+) -> anyhow::Result<()> {
+    let allowed = rpc_bridge::PeerAllowlist::new(allow_peers.iter().copied())?;
     let endpoint = network::bind_endpoint(key, vec![RPC_BRIDGE_ALPN.to_vec()]).await?;
     print_node_id(&endpoint);
-    let serve = rpc_bridge::serve_worker(endpoint.clone(), target);
+    let serve = rpc_bridge::serve_worker(endpoint.clone(), target, allowed);
     run_until_ctrl_c(&endpoint, serve).await
+}
+
+/// Parses every `--allow-peer` value, naming the first invalid one.
+fn parse_node_ids(ids: &[String]) -> anyhow::Result<Vec<iroh::EndpointId>> {
+    ids.iter().map(|id| network::parse_node_id(id)).collect()
 }
 
 async fn bridge_connect(key: &Path, node_id: &str, listen: SocketAddr) -> anyhow::Result<()> {
@@ -390,6 +413,37 @@ mod tests {
         };
         assert_eq!(rpc_args, ["-t", "4"]);
         assert_eq!(rpc_port, rpc_bridge::DEFAULT_RPC_PORT);
+    }
+
+    #[test]
+    fn bridge_serve_requires_an_allowed_peer() {
+        let missing = Cli::try_parse_from(["meshthing", "bridge-serve"]);
+        assert!(
+            missing.is_err(),
+            "bridge-serve without --allow-peer must be refused"
+        );
+
+        let cli = Cli::try_parse_from([
+            "meshthing",
+            "bridge-serve",
+            "--allow-peer",
+            "a",
+            "--allow-peer",
+            "b",
+        ])
+        .expect("bridge-serve args");
+        let Command::BridgeServe { allow_peers, .. } = cli.command else {
+            panic!("expected bridge-serve, got {:?}", cli.command);
+        };
+        assert_eq!(allow_peers, ["a", "b"]);
+    }
+
+    #[test]
+    fn allow_peer_values_must_be_node_ids() {
+        let valid = iroh::SecretKey::generate().public();
+        let parsed = parse_node_ids(&[valid.to_string()]).expect("valid node id");
+        assert_eq!(parsed, [valid]);
+        assert!(parse_node_ids(&["not-a-node-id".to_owned()]).is_err());
     }
 
     #[test]

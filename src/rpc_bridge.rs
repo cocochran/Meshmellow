@@ -5,9 +5,14 @@
 //! to the worker. There [`serve_worker`] dials the local `ggml-rpc-server` for each stream.
 //! Bytes are forwarded untouched: the bridge never frames or inspects RPC traffic.
 //!
+//! `ggml-rpc-server` has no authentication of its own, so the worker only serves peers on a
+//! [`PeerAllowlist`]: an authenticated Iroh identity proves who a peer is, not that it may use
+//! this machine. Unapproved peers are closed before any byte reaches the RPC server.
+//!
 //! Both entry points are cancel-safe: dropping their future stops accepting and aborts every
 //! in-flight stream, and both return `Ok(())` once their endpoint is closed.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -34,6 +39,12 @@ const STREAM_ABORTED: VarInt = VarInt::from_u32(1);
 
 /// Application error code used to close a connection that negotiated another protocol.
 const WRONG_ALPN: VarInt = VarInt::from_u32(2);
+
+/// Application error code used to close a connection from a peer that is not on the allowlist.
+pub const PEER_NOT_APPROVED: VarInt = VarInt::from_u32(3);
+
+/// Close reason sent with [`PEER_NOT_APPROVED`].
+pub const PEER_NOT_APPROVED_REASON: &[u8] = b"peer not approved";
 
 /// Pause after a failed TCP accept so a persistent error (such as fd exhaustion) cannot spin.
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -80,13 +91,42 @@ pub async fn run_leader(
     }
 }
 
-/// Worker: accept [`RPC_BRIDGE_ALPN`] connections on `endpoint`; for each incoming bi-stream,
-/// dial `target` (loopback only) and copy both ways.
+/// Iroh node IDs allowed to use a worker's RPC bridge.
 ///
-/// Connections that negotiated any other ALPN are closed. Returns once the endpoint is closed.
-pub async fn serve_worker(endpoint: Endpoint, target: SocketAddr) -> anyhow::Result<()> {
+/// Never empty: a bridge with no approved peers must not serve anyone, so construction fails
+/// instead (fail closed).
+#[derive(Clone, Debug)]
+pub struct PeerAllowlist(Arc<HashSet<EndpointId>>);
+
+impl PeerAllowlist {
+    /// Builds an allowlist from `peers`, refusing an empty one.
+    pub fn new(peers: impl IntoIterator<Item = EndpointId>) -> anyhow::Result<Self> {
+        let peers: HashSet<EndpointId> = peers.into_iter().collect();
+        if peers.is_empty() {
+            bail!("no approved peers: the rpc bridge refuses to serve without an allowlist");
+        }
+        Ok(Self(Arc::new(peers)))
+    }
+
+    /// Whether `peer` may use the bridge.
+    pub fn contains(&self, peer: &EndpointId) -> bool {
+        self.0.contains(peer)
+    }
+}
+
+/// Worker: accept [`RPC_BRIDGE_ALPN`] connections on `endpoint` from peers on `allowed`; for each
+/// incoming bi-stream, dial `target` (loopback only) and copy both ways.
+///
+/// Connections that negotiated any other ALPN are closed, and so are peers missing from `allowed`
+/// (with [`PEER_NOT_APPROVED`]) before any stream reaches `target`. Returns once the endpoint is
+/// closed.
+pub async fn serve_worker(
+    endpoint: Endpoint,
+    target: SocketAddr,
+    allowed: PeerAllowlist,
+) -> anyhow::Result<()> {
     ensure_loopback(target, "target")?;
-    info!(id = %endpoint.id(), %target, "rpc bridge worker serving");
+    info!(id = %endpoint.id(), %target, approved_peers = allowed.0.len(), "rpc bridge worker serving");
 
     let mut connections = JoinSet::new();
     loop {
@@ -96,7 +136,7 @@ pub async fn serve_worker(endpoint: Endpoint, target: SocketAddr) -> anyhow::Res
                     info!("endpoint closed; rpc bridge worker stopping");
                     return Ok(());
                 };
-                connections.spawn(serve_connection(incoming, target));
+                connections.spawn(serve_connection(incoming, target, allowed.clone()));
             }
             Some(joined) = connections.join_next(), if !connections.is_empty() => {
                 log_task_panic(joined);
@@ -168,8 +208,9 @@ async fn forward_to_worker(link: Arc<WorkerLink>, tcp: TcpStream, client: Socket
     }
 }
 
-/// Worker side of one Iroh connection: bridge each incoming stream to `target`.
-async fn serve_connection(incoming: Incoming, target: SocketAddr) {
+/// Worker side of one Iroh connection: bridge each incoming stream to `target`, but only for
+/// peers on `allowed`.
+async fn serve_connection(incoming: Incoming, target: SocketAddr, allowed: PeerAllowlist) {
     let connection = match incoming.await {
         Ok(connection) => connection,
         Err(error) => {
@@ -177,10 +218,17 @@ async fn serve_connection(incoming: Incoming, target: SocketAddr) {
             return;
         }
     };
-    let remote = connection.remote_id().fmt_short();
+    let remote_id = connection.remote_id();
+    let remote = remote_id.fmt_short();
     if connection.alpn() != RPC_BRIDGE_ALPN {
         warn!(%remote, alpn = %String::from_utf8_lossy(connection.alpn()), "rejecting connection");
         connection.close(WRONG_ALPN, b"unexpected alpn");
+        return;
+    }
+    // Checked before accepting any stream, so an unapproved peer never reaches the RPC server.
+    if !allowed.contains(&remote_id) {
+        warn!(peer = %remote_id, "rejecting rpc bridge peer that is not on the allowlist");
+        connection.close(PEER_NOT_APPROVED, PEER_NOT_APPROVED_REASON);
         return;
     }
     info!(%remote, path = path_kind(&connection), "rpc bridge leader connected");
@@ -378,10 +426,26 @@ mod tests {
             .await
             .expect("bind endpoint");
         let exposed = SocketAddr::from((Ipv4Addr::UNSPECIFIED, DEFAULT_RPC_PORT));
+        let allowed = PeerAllowlist::new([endpoint.id()]).expect("allowlist");
         let leader = run_leader(endpoint.clone(), endpoint.id(), exposed).await;
-        let worker = serve_worker(endpoint.clone(), exposed).await;
+        let worker = serve_worker(endpoint.clone(), exposed, allowed).await;
         assert!(leader.is_err_and(|error| error.to_string().contains("non-loopback")));
         assert!(worker.is_err_and(|error| error.to_string().contains("non-loopback")));
         endpoint.close().await;
+    }
+
+    #[test]
+    fn empty_allowlist_fails_closed() {
+        let error = PeerAllowlist::new([]).expect_err("an empty allowlist must be refused");
+        assert!(error.to_string().contains("no approved peers"), "{error}");
+    }
+
+    #[test]
+    fn allowlist_contains_only_listed_peers() {
+        let approved = iroh::SecretKey::generate().public();
+        let stranger = iroh::SecretKey::generate().public();
+        let allowed = PeerAllowlist::new([approved, approved]).expect("allowlist");
+        assert!(allowed.contains(&approved));
+        assert!(!allowed.contains(&stranger));
     }
 }
