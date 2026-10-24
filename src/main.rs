@@ -44,6 +44,14 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Read measured profiles from JSON and print an advisory plan; never launches inference.
+    Plan {
+        /// JSON file containing model, peers, links, devices, and model_path.
+        profile: PathBuf,
+        /// Require at least this many contributors.
+        #[arg(long, default_value_t = 2)]
+        min_peers: usize,
+    },
     /// Print this node's ID and accept control connections from peers.
     Listen,
     /// Connect to a listening node, exchange hellos, and print the peer's hello.
@@ -72,6 +80,14 @@ async fn main() -> anyhow::Result<()> {
     init_logging();
     let cli = Cli::parse();
     match cli.command {
+        Command::Plan { profile, min_peers } => {
+            let input = std::fs::read_to_string(profile)?;
+            let request = serde_json::from_str(&input)?;
+            let output = llm_cluster::planning::build_plan(&request, min_peers)
+                .map_err(|error| anyhow::anyhow!("planning failed: {error:?}"))?;
+            println!("{}", serde_json::to_string_pretty(&output)?);
+            Ok(())
+        }
         Command::Listen => listen(&cli.key, &cli.cluster).await,
         Command::Connect { ref node_id } => connect(&cli.key, &cli.cluster, node_id).await,
         Command::BridgeServe { target } => bridge_serve(&cli.key, target).await,

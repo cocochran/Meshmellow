@@ -12,6 +12,22 @@ cargo run --example placement
 
 The example uses synthetic numbers and prints a plan; it performs no inference.
 
+For file-driven planning, run:
+
+```sh
+cargo run -- plan examples/placement-profile.json --min-peers 2
+```
+
+Copy the synthetic JSON profile and replace its identities, memory budgets,
+measured costs, model path, and discovered device names with actual inputs.
+Unknown JSON fields are rejected to catch misspelled budget or cost fields.
+Provide exactly one device mapping per candidate peer; mappings may be in any
+order, and only selected contributors appear in the output. Stdout contains JSON
+with `advisory`, placement assignments and `server_args` as an argv array.
+Errors exit unsuccessfully without printing a plan. The command neither binds
+network endpoints nor creates a node key, and does not launch inference or
+verify model file contents. Pass argv elements individually when launching.
+
 ## Inputs and integration
 
 1. Supply `ModelProfile`: exact model hash, pinned runtime ID, context tokens,
