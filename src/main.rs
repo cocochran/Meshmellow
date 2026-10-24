@@ -44,6 +44,25 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Check caller-collected memory and compute evidence for an advisory plan.
+    Verify {
+        /// JSON produced by the plan command.
+        plan: PathBuf,
+        /// Original planning profile JSON, containing current peer profiles.
+        profile: PathBuf,
+        /// JSON RunEvidence collected over model load and fresh inference.
+        evidence: PathBuf,
+        #[arg(long, default_value_t = 2)]
+        min_peers: usize,
+    },
+    /// Read measured profiles from JSON and print an advisory plan; never launches inference.
+    Plan {
+        /// JSON file containing model, peers, links, devices, and model_path.
+        profile: PathBuf,
+        /// Require at least this many contributors.
+        #[arg(long, default_value_t = 2)]
+        min_peers: usize,
+    },
     /// Print this node's ID and accept control connections from peers.
     Listen,
     /// Connect to a listening node, exchange hellos, and print the peer's hello.
@@ -72,6 +91,30 @@ async fn main() -> anyhow::Result<()> {
     init_logging();
     let cli = Cli::parse();
     match cli.command {
+        Command::Verify {
+            plan,
+            profile,
+            evidence,
+            min_peers,
+        } => {
+            let output: llm_cluster::planning::PlanningOutput =
+                serde_json::from_str(&std::fs::read_to_string(plan)?)?;
+            let request: llm_cluster::planning::PlanningRequest =
+                serde_json::from_str(&std::fs::read_to_string(profile)?)?;
+            let evidence = serde_json::from_str(&std::fs::read_to_string(evidence)?)?;
+            llm_cluster::planning::verify_output(&request, &output, &evidence, min_peers)
+                .map_err(|error| anyhow::anyhow!("verification failed: {error:?}"))?;
+            println!("{{\"verified\":true}}");
+            Ok(())
+        }
+        Command::Plan { profile, min_peers } => {
+            let input = std::fs::read_to_string(profile)?;
+            let request = serde_json::from_str(&input)?;
+            let output = llm_cluster::planning::build_plan(&request, min_peers)
+                .map_err(|error| anyhow::anyhow!("planning failed: {error:?}"))?;
+            println!("{}", serde_json::to_string_pretty(&output)?);
+            Ok(())
+        }
         Command::Listen => listen(&cli.key, &cli.cluster).await,
         Command::Connect { ref node_id } => connect(&cli.key, &cli.cluster, node_id).await,
         Command::BridgeServe { target } => bridge_serve(&cli.key, target).await,

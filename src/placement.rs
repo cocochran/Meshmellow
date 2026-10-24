@@ -1,9 +1,11 @@
 //! Plan contiguous layers across an explicitly ordered set of trusted devices.
 //! All costs must come from measurements for the same model/runtime/context.
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::ops::Range;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelProfile {
     pub model_hash: String,
     pub runtime_id: String,
@@ -11,13 +13,15 @@ pub struct ModelProfile {
     pub layers: Vec<LayerMemory>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LayerMemory {
     pub weight_bytes: u64,
     pub kv_bytes_per_token: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PeerProfile {
     pub id: String,
     pub model_hash: String,
@@ -33,7 +37,8 @@ pub struct PeerProfile {
     pub decode_us_per_layer: Vec<u64>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LinkProfile {
     pub from: String,
     pub to: String,
@@ -42,14 +47,16 @@ pub struct LinkProfile {
     pub transfer_us: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Assignment {
     pub peer_id: String,
     pub layers: Range<usize>,
     pub estimated_bytes: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Placement {
     pub model_hash: String,
     pub runtime_id: String,
@@ -81,7 +88,25 @@ pub fn plan(
     links: &[LinkProfile],
     min_peers: usize,
 ) -> Result<Placement, PlanError> {
+    plan_with_final_peer(model, peers, links, min_peers, None)
+}
+
+/// Like `plan`, but optionally require the final block group on a specific peer.
+/// This constrains the advisory placement; runtime output tensor ownership still
+/// requires post-load verification.
+pub fn plan_with_final_peer(
+    model: &ModelProfile,
+    peers: &[PeerProfile],
+    links: &[LinkProfile],
+    min_peers: usize,
+    final_peer_id: Option<&str>,
+) -> Result<Placement, PlanError> {
     let invalid = |s: &str| PlanError::InvalidInput(s.to_owned());
+    if let Some(id) = final_peer_id
+        && !peers.iter().any(|peer| peer.id == id)
+    {
+        return Err(invalid("required final peer must be a known candidate"));
+    }
     let n = model.layers.len();
     if n == 0
         || model.model_hash.is_empty()
@@ -198,7 +223,9 @@ pub fn plan(
     }
     let best = states
         .iter()
-        .filter_map(|s| s[n][min_peers].as_ref())
+        .enumerate()
+        .filter(|(index, _)| final_peer_id.is_none_or(|id| peers[*index].id == id))
+        .filter_map(|(_, s)| s[n][min_peers].as_ref())
         .min_by_key(|c| c.cost)
         .ok_or(PlanError::NoFeasiblePlacement)?;
     Ok(Placement {
