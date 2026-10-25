@@ -490,7 +490,7 @@ async fn start(
         Prepared::Llama(llama) => start_llama(endpoint, config, llama, peers).await?,
         Prepared::Shard(manifest) => start_shard(endpoint, config, manifest.clone(), ring).await?,
     };
-    let (api_stop, api) = start_api(config);
+    let (api_stop, api) = start_api(config, peers);
     Ok(Running {
         api_stop,
         api,
@@ -917,11 +917,15 @@ fn probe_request() -> Value {
 }
 
 /// Starts the job API in the background; sending on (or dropping) the returned sender stops it.
-fn start_api(config: &LeaderConfig) -> (oneshot::Sender<()>, JoinSet<anyhow::Result<()>>) {
+fn start_api(
+    config: &LeaderConfig,
+    peers: &SharedPeerTable,
+) -> (oneshot::Sender<()>, JoinSet<anyhow::Result<()>>) {
     let (stop, stopped) = oneshot::channel::<()>();
     let api_config = ApiConfig {
         listen: config.api_addr,
         upstream: upstream_addr(config.upstream_port),
+        peers: Arc::clone(peers),
     };
     let mut api = JoinSet::new();
     api.spawn(api::serve_api(

@@ -90,7 +90,21 @@ const OWNER_ONLY_MODE: u32 = 0o600;
 ///
 /// Uses the n0 defaults: public relays plus DNS address lookup, so peers can dial by node ID alone.
 pub async fn bind_endpoint(key_path: &Path, alpns: Vec<Vec<u8>>) -> anyhow::Result<Endpoint> {
-    bind_with_preset(key_path, alpns, presets::N0).await
+    bind_endpoint_with_key(load_or_create_secret_key(key_path)?, alpns).await
+}
+
+/// Shares the core's Internet-capable endpoint configuration with embedded apps
+/// that already own a persisted identity. Does not replace or migrate that key.
+pub async fn bind_endpoint_with_key(
+    key: SecretKey,
+    alpns: Vec<Vec<u8>>,
+) -> anyhow::Result<Endpoint> {
+    Ok(endpoint_builder_with_key(key, alpns).bind().await?)
+}
+
+/// The core transport defaults, also used by mobile embeddings and relay tests.
+pub fn endpoint_builder_with_key(key: SecretKey, alpns: Vec<Vec<u8>>) -> iroh::endpoint::Builder {
+    Endpoint::builder(presets::N0).secret_key(key).alpns(alpns)
 }
 
 /// Like [`bind_endpoint`] but with no relays and no address lookup, for tests and isolated LANs.
@@ -229,8 +243,9 @@ pub async fn accept_peer(
     accept_peer_connection(connection, local, peers).await
 }
 
-/// Like [`accept_peer`], for a connection already accepted on [`CONTROL_ALPN`].
-async fn accept_peer_connection(
+/// Completes the core hello after a protocol router has authenticated and admitted
+/// a connection. The caller must enforce its membership policy before calling.
+pub async fn accept_peer_connection(
     connection: Connection,
     local: &Hello,
     peers: &SharedPeerTable,
@@ -327,21 +342,30 @@ async fn run_accepted_session(
 ) {
     match accepted {
         Ok(session) => {
-            let watchdog = HeartbeatWatchdog::new(options.heartbeat_timeout, Arming::AtStart);
-            let sender = send_heartbeats(
-                session.connection(),
-                &local.node_id,
-                options.heartbeat_interval,
-            );
-            // The sender never completes, so the session ends exactly when receiving does, and
-            // the sender is dropped with it.
-            let reason = tokio::select! {
-                reason = receive_control_streams(&session, peers, watchdog) => reason,
-                never = sender => match never {},
-            };
+            let reason = maintain_peer_session(&session, &local.node_id, peers, options).await;
             info!(peer = %session.hello().node_id, %reason, "peer disconnected");
         }
         Err(error) => warn!("rejected incoming connection: {error:#}"),
+    }
+}
+
+/// Maintains an already admitted core session with bidirectional heartbeats.
+/// Used by the mesh protocol router after the membership-gated hello.
+pub async fn maintain_peer_session(
+    session: &PeerSession,
+    local_node_id: &str,
+    peers: &SharedPeerTable,
+    options: ControlOptions,
+) -> ConnectionError {
+    let watchdog = HeartbeatWatchdog::new(nonzero(options.heartbeat_timeout), Arming::AtStart);
+    let sender = send_heartbeats(
+        session.connection(),
+        local_node_id,
+        nonzero(options.heartbeat_interval),
+    );
+    tokio::select! {
+        reason = receive_control_streams(session, peers, watchdog) => reason,
+        never = sender => match never {},
     }
 }
 

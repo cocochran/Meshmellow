@@ -88,6 +88,14 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Run the mesh core, local OpenAI API, and browser UI in this process.
+    Ui(llm_cluster::ui::Options),
+    /// Run a persistent mesh node. Send create/invite/join/decide/snapshot JSON commands on stdin.
+    Mesh {
+        /// Private identity and signed membership directory, one per running device.
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
     /// Check caller-collected memory and compute evidence for an advisory plan.
     Verify {
         /// JSON produced by the plan command.
@@ -106,6 +114,18 @@ enum Command {
         /// Require at least this many contributors.
         #[arg(long, default_value_t = 2)]
         min_peers: usize,
+    },
+    /// Search exact measured shard ranges and directed links; advisory JSON only.
+    MeasuredPlan {
+        /// Versioned JSON with fresh range, link and memory observations.
+        profile: PathBuf,
+    },
+    /// Recheck a saved measured plan against refreshed observations; no runtime verification.
+    ValidateMeasured {
+        /// JSON produced by `measured-plan`.
+        plan: PathBuf,
+        /// Versioned measured profile with current capacity and time.
+        profile: PathBuf,
     },
     /// Print this node's ID and accept control connections from peers.
     Listen,
@@ -432,6 +452,8 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_logging(cli.debug);
     match cli.command {
+        Command::Ui(options) => llm_cluster::ui::run(options).await,
+        Command::Mesh { state_dir } => llm_cluster::mesh::cli::run(state_dir).await,
         Command::Verify {
             plan,
             profile,
@@ -465,6 +487,24 @@ async fn main() -> anyhow::Result<()> {
                 "placement plan ready"
             );
             println!("{}", serde_json::to_string_pretty(&output)?);
+            Ok(())
+        }
+        Command::MeasuredPlan { profile } => {
+            let request: llm_cluster::measured_placement::MeasuredRequest =
+                serde_json::from_str(&std::fs::read_to_string(profile)?)?;
+            let output = llm_cluster::measured_placement::plan(&request)
+                .map_err(|error| anyhow::anyhow!("measured planning failed: {error:?}"))?;
+            println!("{}", serde_json::to_string_pretty(&output)?);
+            Ok(())
+        }
+        Command::ValidateMeasured { plan, profile } => {
+            let request: llm_cluster::measured_placement::MeasuredRequest =
+                serde_json::from_str(&std::fs::read_to_string(profile)?)?;
+            let output: llm_cluster::measured_placement::MeasuredPlacement =
+                serde_json::from_str(&std::fs::read_to_string(plan)?)?;
+            llm_cluster::measured_placement::validate_output(&request, &output)
+                .map_err(|error| anyhow::anyhow!("measured plan validation failed: {error:?}"))?;
+            println!("{{\"validated\":true}}");
             Ok(())
         }
         Command::Listen => listen(&cli.key, &cli.cluster).await,
