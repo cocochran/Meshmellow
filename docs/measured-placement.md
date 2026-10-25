@@ -5,6 +5,11 @@ observations and prints an **advisory** sequential decode placement. It does
 not launch a worker, write a shard manifest, reserve memory, or verify a run.
 The existing `plan` command and llama RPC launch path remain separate.
 
+`prepare-ring PROFILE.json REGISTRY.json --output-dir NEW_DIRECTORY` adds a
+ring-constrained search and generates validated leader/worker configurations.
+See [measured ring deployment](measured-ring-deployment.md). It preserves the
+advisory/evidence boundary and does not reserve or start devices.
+
 Run the synthetic fixture:
 
 ```sh

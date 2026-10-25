@@ -2,6 +2,7 @@
 
 pub mod admission;
 pub mod api;
+pub mod artifact;
 pub mod config;
 pub mod evidence;
 pub mod history;
@@ -18,10 +19,12 @@ pub mod planning;
 pub mod process;
 pub mod profiling;
 pub mod protocol;
+pub mod ring_deployment;
 pub mod rpc_bridge;
 pub mod rpc_plan;
 pub mod shard;
 pub mod verification;
 pub mod worker;
+pub mod worker_profile;
 
 pub mod ui;
