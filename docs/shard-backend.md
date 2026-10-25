@@ -115,71 +115,49 @@ so it exists only on the llama backend.
 | `local.budget_bytes` | Runtime buffer budget passed to the runner; must be positive. |
 | `local.artifact_sha256` | Optional SHA-256 of `local.model`, checked once at startup. It establishes the stage's identity when the runner reports no `source_sha256` (a plain GGUF). |
 | `local.env` | Optional extra environment variables for the runner, such as `CUDA_VISIBLE_DEVICES`. |
+| `fallbacks` | Optional, on any stage but the final one: other locations that serve the same range, tried in order when the stage's node fails. Each is written like a stage's location, `{"remote": {...}}` or `{"local": {...}}`. See [Failover](#failover). |
 
 Unknown fields are refused everywhere, so a typo cannot silently drop a setting.
 
-### Chat templates
+## Failover
 
-The front end renders a request's `messages` into the prompt the tokenizing stage tokenizes
-(the local final stage, or stage 0 in a ring). `chat_template` takes one of two forms.
-
-`"chatml"` writes `<|im_start|>{role}\n{content}<|im_end|>\n` for each message, then
-`<|im_start|>assistant\n`.
-
-A pinned Jinja template renders the model's official chat template:
+A stage can list `fallbacks` that serve the same layer range:
 
 ```json
-"chat_template": {
-  "jinja": {"path": "qwen3-chat-template.jinja", "sha256": "<64 hex digits: SHA-256 of the file>"},
-  "enable_thinking": false
-}
+{"begin": 0, "end": 32, "remote": {"worker": "<M1 node id>"},
+ "fallbacks": [
+   {"remote": {"worker": "<standby node id>"}},
+   {"local": {"model": "/path/to/prefix-0-32.gguf", "gpu_layers": 99, "budget_bytes": 11811160064}}
+ ]}
 ```
 
-| Field | Meaning |
-| --- | --- |
-| `jinja.path` | The template file, for example a GGUF's `tokenizer.chat_template` metadata saved as text. A relative path is resolved against the manifest file's directory. (A manifest built in memory rather than loaded from a file keeps it relative to the working directory, as model paths are.) |
-| `jinja.sha256` | SHA-256 of the file's bytes (64 hex digits). |
-| `enable_thinking` | Optional, default `false`. Passed to the template as `enable_thinking`. |
+- A remote fallback is another worker running `shard-serve` with the same `--range` and model
+  identity (and `--allow-peer` for the leader). Nothing is copied over the network, so the
+  standby needs the shard file on its own disk.
+- A local fallback runs the range on the leader too, next to its final stage, so the leader
+  needs memory for both.
 
-When the front end starts, it reads at most 1 MiB of the file once, checks its SHA-256 and
-compiles it. A missing or oversized file, a hash mismatch or a template that does not compile
-stops startup, as an `artifact_sha256` mismatch does. Each request then renders the template with
-[minijinja](https://docs.rs/minijinja) set up the way Hugging Face's `apply_chat_template` and
-david-codex's demo (`experiments/model-validation/live_demo.py`) set up Jinja:
+When a job starts, each stage opens on the first of its locations that answers, starting from
+the one that last worked. A worker that can't be reached within 20 s is skipped for the next
+location. If a stage's node fails partway through a reply, the front end sets that location
+aside for the rest of the job and restarts the prompt on the stage's next location. Decoding
+is greedy and deterministic, so the restart regenerates the same text: a streamed reply picks
+up where it stopped instead of repeating what was already sent. If the restarted text differs
+from what was sent, the job fails rather than splicing two answers together.
 
-- `trim_blocks` and `lstrip_blocks` are on.
-- Python string methods such as `.strip()`, `.startswith()` and `.split()` work, through
-  `minijinja-contrib`'s pycompat.
-- The context is `messages` (each with `role` and `content`; text parts are joined),
-  `add_generation_prompt = true`, `enable_thinking` from the manifest, `tools = none`, and a
-  `raise_exception(msg)` function.
-
-Requests are validated the same way as with `chatml`. A template error, including a
-`raise_exception` call, answers HTTP 400 with the template's message; it never reaches a stage.
-
-The pinned template is what david-codex's experimental ring demo uses, and he asked for it in
-place of generic ChatML. His demo renders the GGUF's official Qwen template with
-`add_generation_prompt=True, enable_thinking=False, tools=None`. With `enable_thinking: false`,
-a system message `You are a helpful assistant.` and a user message `<q>` render exactly as in
-his run record (`experiments/model-validation/results/qwen38-three-device-2026-10-24/manifest.json`):
-
-```text
-<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n<q><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n
-```
-
-With `enable_thinking: true`, the official Qwen3 template leaves out the empty
-`<think>\n\n</think>\n\n` block and the prompt ends at `<|im_start|>assistant\n`.
-`tests/fixtures/qwen3-chat-template.jinja` is the official Qwen3 template, copied byte for byte
-from `Qwen/Qwen3-8B`'s `tokenizer_config.json` (SHA-256
-`a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8`). For a real model, pin the
-template embedded in that model's own GGUF.
+The job fails as before when the failed stage has no location left, or when the failure isn't
+the stage's node going away (the leader's own final stage, a stage refusing the prompt, a
+model hash mismatch). The final stage takes no fallbacks: it runs on the leader, which
+tokenizes and samples. A restart pays prefill and model load again, and the generation is
+silent while it catches up to the text already sent.
 
 ## v1 limits
 
 - Topology: one remote prefix plus a local final stage, or a single local stage that runs the
-  whole model. Chained remote stages and a remote final stage need ring forwarding: see
-  [Experimental: ring execution](#experimental-ring-execution-shard-ring1) below. Hidden states
-  never take an extra hop through the leader ("hub forwarding"); that design was rejected.
+  whole model. The prefix may fail over to fallbacks with the same range; layer ranges are never
+  re-split among the remaining nodes. Chained remote stages and a remote final stage need ring forwarding over
+  david-codex's `meshthing/shard-ring/1` (M-27). Hidden states never take an extra hop through
+  the leader ("hub forwarding"); that design was rejected.
 - Greedy decoding only. `temperature`, `top_p`, `seed` and similar fields are accepted and
   ignored.
 - Chat templates: `chatml` or a pinned Jinja template (see [Chat templates](#chat-templates)).

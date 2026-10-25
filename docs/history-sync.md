@@ -2,7 +2,7 @@
 
 The `history_sync` module (`src/history_sync/`) keeps one conversation's history identical on every node in the mesh and saved on each node's disk. When the main process (the device that took the prompt) disappears, another node can take over from its own copy.
 
-**Status:** works in the in-memory simulator and in tests (31 tests). It is **not yet wired into a running `llm-cluster` node**: nothing reads `History` frames off control connections, so a live node doesn't sync or save history yet. Takeover is a ranking, not consensus, and there is no restore-from-export command yet.
+**Status:** wired into running nodes. `llm-cluster leader` saves every completed turn and replicates it to its workers over their control links, workers save their copy, and a worker started as a standby takes over when the leader is lost (see [Failover in a running cluster](#10-failover-in-a-running-cluster)). Takeover is a ranking, not consensus, and there is no restore-from-export command yet.
 
 ## Contents
 
@@ -15,6 +15,7 @@ The `history_sync` module (`src/history_sync/`) keeps one conversation's history
 7. [CLI and demo](#7-cli-and-demo)
 8. [Tests](#8-tests)
 9. [Limits and next steps](#9-limits-and-next-steps)
+10. [Failover in a running cluster](#10-failover-in-a-running-cluster)
 
 ---
 
@@ -331,11 +332,7 @@ for (to, reply) in node.handle_durable(from, msg, &mut store)? {
 
 On peer-table changes, the main process calls `node.set_peers(&peer_table)` and then sends `sync()`.
 
-**Missing pieces:**
-- **No control loop:** nothing yet reads `History` frames from control connections and calls the code above.
-- **HistorySink:** `src/history.rs` has `HistorySink { started(&StartedTurn), record(CompletedTurn), ended(request_id, TurnOutcome) }`: every job that gets the run slot reports `started` once, then exactly one of `record` or `ended(Failed | Canceled)` (M-24). It would sit on `start_job` / `complete_job` + `persist`, with `ended` marking the job interrupted.
-- **PR #10 conflicts:** it adds heartbeats to `PeerTable` and conflicts with the `NodeId`-keyed table here. Reconciling them is task M-21.
-- **Heartbeat timeout (M-11):** the leader now drops a worker whose heartbeats stop, not only one whose connection closes (section 9), but nothing calls `set_peers` on a live node yet.
+`src/replication.rs` does exactly this on live nodes: `LeaderReplication` on the leader (fed by the job API's `HistorySink`) and `ReplicaState` on each worker. See section 10.
 
 ## 7. CLI and demo
 
@@ -372,13 +369,44 @@ Run them with `cargo test --test history_sync --test history_store`.
 - **Connections clean up after themselves (M-21).** `dial_peer` and `accept_peer` return a `PeerSession` that holds the connection token. The peer is removed when the connection closes from either side (via a `WeakConnectionHandle` watch) or when the session is dropped, so callers never remove peers by hand.
 
 In priority order:
-1. **Control loop:** read `History` frames, `handle_durable` on workers, `persist` before sending on the main process, `set_peers` when the peer table changes.
+1. **Done: control loop.** Workers apply `History` frames with `handle_durable`, the leader persists before sending and follows its `PeerTable` with `set_peers` every second (section 10).
 2. **Restore from export:** start a main process from a `ConversationExport` for manual takeover (david-codex's M-16 test needs this).
 3. **Reconcile with PR #10 (M-21):** heartbeat fields on the `NodeId`-keyed `PeerTable`; then hook up `HistorySink`.
 4. **Failure detection (M-11):** partly done.
    - **Done:** the leader's control acceptor (`network::serve_control_with`) closes a worker's connection with close code `HEARTBEAT_TIMEOUT_CODE` (4, reason `heartbeat timeout`) when no heartbeat arrives within the timeout. `PeerSession`'s token-matched cleanup then removes it from the `PeerTable`, and the worker reconnects with backoff and rejoins with a fresh hello. `llm-cluster leader` enables this by default with `--heartbeat-timeout 7s` (three missed beats at the workers' 2s default, plus 1s slack; `0s` disables it), and the leader logs a warning when a planned worker leaves the peer table while serving, and again when it rejoins.
    - **Done:** leader-to-worker heartbeats. With `ControlOptions::heartbeat_interval` set, the acceptor heartbeats to each worker on its own uni stream (same `Heartbeat` message, epoch 0, sequence from 1 per connection). The worker watches them with `network::watch_heartbeats`, and when they stop it closes the link with code 4 and redials with backoff ("leader stopped heartbeating"), instead of waiting ~30s for QUIC's idle timeout. The worker's watchdog arms only after the first leader heartbeat on a link, so a worker connected to an older leader that never heartbeats is never timed out. Defaults: `leader --heartbeat-interval 2s` and `worker --leader-heartbeat-timeout 7s`; `0s` disables either.
-   - **Remaining:** run `elect()` when the main process dies; call `set_peers` on a live node when the peer table changes, after the M-9 live wiring.
+   - **Done:** workers run `elect()` when the main process stays unreachable, and the winner takes over (section 10).
 5. **Majority commit:** report a job as committed only once a majority of voters have acked it. Needs 3+ voters, and is also the path to safe automatic failover.
 6. **Protocol fields:** `cluster_id`, `prev_hash`, and postcard encoding.
 7. **Size and privacy:** output chunks while generating, chunked snapshots, encryption at rest (every node holds the full chat).
+
+## 10. Failover in a running cluster
+
+`src/replication.rs` runs history sync over the same control links the heartbeats use, and `src/worker.rs` runs the election.
+
+**Replication.** `llm-cluster leader` keeps the conversation `--conversation` (default `main`) under `--data-dir` (default `meshthing-data`). Each completed job is recorded with `complete_task`, saved, then sent to the workers. Every second the leader also sends each connected worker a **roster** and any history it lacks. The roster lists the connected workers, which of them are standbys, and how far each has synced. Workers save their copy under their own `--data-dir`; `llm-cluster history inspect main` reads it on any machine.
+
+**Standbys.** A worker started with `--takeover-manifest <manifest>` offers to take over. The manifest is a shard manifest written from that machine's point of view: its own local stages, and remote `shard-serve` stages that allow its node ID. A standby runs no `--rpc-server` (the two are refused together, because the standby leads on the same endpoint), so on a machine that already serves layers with `shard-serve` it runs next to it under its own key. Only the shard backend can take over, because a llama plan is tied to the original leader's devices.
+
+```sh
+llm-cluster --key standby.key worker --leader <leader node id> \
+  --takeover-manifest standby-manifest.json --takeover-api 127.0.0.1:8080
+```
+
+**Election.** When a worker's link to the leader drops (closed, or 7 s without a leader heartbeat), it keeps redialling. Once the leader has been unreachable for `--failover-after` (default 10 s), it runs `elect()` over the last roster's standbys, leaving out the lost leader. Every worker ranks the same roster, so they agree:
+- **The winner** stops being a worker and starts the leader on its own endpoint, so its node ID doesn't change. It accepts control connections, but does nothing else until a **majority** has joined it. The cluster is the lost leader plus every worker in the roster, the winner counts itself, and a majority is more than half; with a leader and two workers, one follower must join. Then it records the new epoch, starts the shard backend from its takeover manifest and its copy of the conversation, and serves the job API on `--takeover-api`.
+- **Without a majority** within 30 s, the winner stands down. It hasn't written anything, and it goes back to being a worker.
+- **Tiebreak.** Once an election has failed (its winner never came up, or stood down), every later one picks the reachable standby with the **lowest node ID** instead of ranking by sync progress, until a leader takes over and sends its own roster. Split votes come from rosters disagreeing on sync progress; node IDs are the same in every copy, so the next round converges. Only replacements a worker couldn't reach are left out. A winner that stood down is alive and stays eligible, so two of them don't end up each following the other.
+- **Everyone else** redials the winner. Its first message is a snapshot in the new epoch, so every copy converges on the winner's history.
+- **If the winner never comes up** within another `--failover-after`, workers leave it out and elect again. With no standby left, they go back to redialling the original leader.
+
+**Why a majority.** Workers can disagree about the winner when their last rosters differ, and a standby cut off from a leader that is still running sees it as lost. The majority rule turns both into a safe outcome: two nodes can't each collect more than half of the same cluster, and a cut-off standby can't collect any, so at most one leader ever serves.
+
+**Limits.**
+- **A split vote costs time.** The tiebreak settles it in one more round, about a failover window plus the 30 s quorum wait. It can still stall if workers disagree on who is in the roster at all (not just on sync progress), or if a cut-off standby keeps retrying; neither ever lets two leaders serve. A real voting round (or Raft) would close this.
+- **The tiebreak may pick a shorter history.** Lowest node ID ignores sync progress, so after a split vote the new leader may lack the last turn some workers had.
+- **A leader and one worker can't fail over.** The worker alone is half of a two-node cluster, not a majority. Automatic failover needs a leader and at least two workers.
+- **Histories can still differ.** A majority must *join* the new leader, but the history it serves is the winner's own copy. Turns only some workers had acknowledged can be lost; majority commit (item 5 above) would fix that.
+- **Interrupted jobs are lost.** Only completed jobs are recorded, so a job in flight when the leader died isn't in anyone's history, and its client must resend it.
+- **The old leader must rejoin as a worker.** Restart it as `worker --leader <new leader id>`, not as `leader`: it would start one epoch above its own stored one, which may tie the new leader's.
+- **The election is untested on real hardware.** `tests/failover.rs` covers it end to end on loopback.

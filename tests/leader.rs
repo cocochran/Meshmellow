@@ -17,7 +17,7 @@ use llm_cluster::evidence::EvidenceConfig;
 use llm_cluster::leader::{BackendConfig, LeaderConfig, LlamaBackendConfig, run_leader_on};
 use llm_cluster::planning::{self, PlanningRequest};
 use llm_cluster::protocol::{CONTROL_ALPN, RPC_BRIDGE_ALPN};
-use llm_cluster::worker::{WorkerConfig, run_worker_on};
+use llm_cluster::worker::{DEFAULT_FAILOVER_AFTER, WorkerConfig, run_worker_on};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -128,6 +128,8 @@ impl Cluster {
             worker_wait: WORKER_WAIT,
             heartbeat_timeout: Some(HEARTBEAT_TIMEOUT),
             heartbeat_interval: Some(HEARTBEAT_INTERVAL),
+            replication: None,
+            quorum: None,
         };
         Self {
             dir,
@@ -202,13 +204,16 @@ impl Cluster {
         let config = WorkerConfig {
             key_path: self.dir.join("worker.key"),
             cluster_id: CLUSTER_ID.to_owned(),
-            rpc_server: example_bin("fake_rpc_server"),
+            rpc_server: Some(example_bin("fake_rpc_server")),
             rpc_port: self.worker_rpc_port,
             rpc_args: Vec::new(),
             leader: None,
             allowed_peers: Vec::new(),
             heartbeat_interval: HEARTBEAT_INTERVAL,
             leader_heartbeat_timeout: Some(HEARTBEAT_TIMEOUT),
+            data_dir: None,
+            takeover: None,
+            failover_after: DEFAULT_FAILOVER_AFTER,
         };
         tokio::spawn(async move { run_worker_on(endpoint, Some(leader), &config).await })
     }

@@ -19,7 +19,7 @@ pub mod planning;
 pub mod process;
 pub mod profiling;
 pub mod protocol;
-pub mod ring_deployment;
+pub mod replication;
 pub mod rpc_bridge;
 pub mod rpc_plan;
 pub mod shard;

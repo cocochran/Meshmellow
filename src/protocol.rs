@@ -38,6 +38,10 @@ pub enum Message {
     Activations(Activations),
     /// Conversation history synchronisation.
     History(History),
+    /// Leader to workers: who is connected and how far each has synced, for failover elections.
+    Roster(Roster),
+    /// Worker to leader: this worker can take over as leader if the current one is lost.
+    Standby(Standby),
 }
 
 /// Handshake identifying a node and how far its log has progressed.
@@ -93,6 +97,45 @@ pub struct History {
     pub conversation_id: String,
     /// Opaque payload; its format is owned by the history-sync component.
     pub payload: Vec<u8>,
+}
+
+/// The leader's view of the cluster, sent to every worker whenever it changes. Workers that lose
+/// the leader elect a replacement from the last roster they received, so every worker that saw
+/// the same roster picks the same one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Roster {
+    /// Sender's (the leader's) Iroh node ID as text.
+    pub leader: String,
+    /// The leader's epoch.
+    pub epoch: u64,
+    /// Conversation the cluster replicates; workers store their copy under this ID.
+    pub conversation_id: String,
+    /// Model the conversation was generated with; a replacement leader must serve the same one.
+    pub model_hash: String,
+    /// Every connected worker.
+    pub members: Vec<RosterMember>,
+}
+
+/// One connected worker in a [`Roster`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RosterMember {
+    /// The worker's Iroh node ID as text.
+    pub node_id: String,
+    /// When its current control connection was accepted, in Unix milliseconds.
+    pub connected_at_unix_ms: u64,
+    /// Whether it offered to take over ([`Standby`]); only standbys are elected.
+    pub standby: bool,
+    /// Epoch of the history it holds: the leader's epoch once it has synced, else 0.
+    pub history_epoch: u64,
+    /// History entries it has acknowledged.
+    pub history_len: u64,
+}
+
+/// A worker's offer to take over as leader.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Standby {
+    /// Sender's Iroh node ID as text.
+    pub node_id: String,
 }
 
 /// Errors from encoding, decoding, or framing messages.
@@ -243,7 +286,33 @@ mod tests {
                 conversation_id: "conv-1".into(),
                 payload: vec![],
             }),
+            Message::Roster(Roster {
+                leader: "node-a".into(),
+                epoch: 2,
+                conversation_id: "conv-1".into(),
+                model_hash: "sha256:abc".into(),
+                members: vec![RosterMember {
+                    node_id: "node-b".into(),
+                    connected_at_unix_ms: 1_700_000_000_000,
+                    standby: true,
+                    history_epoch: 2,
+                    history_len: 9,
+                }],
+            }),
+            Message::Standby(Standby {
+                node_id: "node-b".into(),
+            }),
         ]
+    }
+
+    #[test]
+    fn existing_variants_keep_their_wire_tags() {
+        // Postcard tags variants by position, so new variants must only ever be appended.
+        let tags: Vec<u8> = sample_messages()
+            .iter()
+            .map(|message| encode(message).unwrap()[0])
+            .collect();
+        assert_eq!(tags, [0, 1, 2, 3, 4, 5, 6]);
     }
 
     #[test]

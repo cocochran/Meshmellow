@@ -15,7 +15,7 @@ use llm_cluster::network::{self, HEARTBEAT_TIMEOUT_CODE, PeerSession, SharedPeer
 use llm_cluster::node::PeerTable;
 use llm_cluster::protocol::{self, CONTROL_ALPN, Heartbeat, Message, RPC_BRIDGE_ALPN};
 use llm_cluster::rpc_bridge;
-use llm_cluster::worker::{WorkerConfig, run_worker_on};
+use llm_cluster::worker::{DEFAULT_FAILOVER_AFTER, WorkerConfig, run_worker_on};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -86,7 +86,7 @@ fn worker_config(rpc_server: PathBuf, rpc_port: u16, leader: EndpointId) -> Work
     WorkerConfig {
         key_path: std::env::temp_dir().join("meshthing-worker-test-unused.key"),
         cluster_id: CLUSTER_ID.to_owned(),
-        rpc_server,
+        rpc_server: Some(rpc_server),
         rpc_port,
         rpc_args: Vec::new(),
         leader: Some(leader),
@@ -94,6 +94,9 @@ fn worker_config(rpc_server: PathBuf, rpc_port: u16, leader: EndpointId) -> Work
         heartbeat_interval: HEARTBEAT_INTERVAL,
         // On in every test: leaders that never heartbeat must not trip it.
         leader_heartbeat_timeout: Some(LEADER_HEARTBEAT_TIMEOUT),
+        data_dir: None,
+        takeover: None,
+        failover_after: DEFAULT_FAILOVER_AFTER,
     }
 }
 

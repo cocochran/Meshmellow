@@ -36,7 +36,20 @@
 //!    or closed connection) is logged, as is its rejoin; jobs and the queue are unaffected.
 //! 6. On shutdown or failure, stop the API, then the backend (`llama-server` and the bridges, or
 //!    the shard front end), then the endpoint, in that order.
+//!
+//! With [`LeaderConfig::replication`] set, the leader also keeps the conversation on disk and
+//! replicates every completed turn to its workers over their control links, sending them the
+//! roster they elect a replacement from if this leader is lost ([`crate::replication`]). The
+//! stored conversation is opened before the backend starts, so a conversation that belongs to
+//! another cluster or model fails startup.
+//!
+//! A worker that takes over runs the leader with a [`Quorum`]: after accepting control
+//! connections it waits for a majority of the cluster it was elected in to join it, and only
+//! then records the new epoch, starts the backend and serves jobs. Without a majority it fails
+//! with [`NoQuorum`] having changed nothing, so two workers that each think they won can never
+//! both serve, and neither can a worker cut off from the rest of the cluster.
 
+use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -54,14 +67,15 @@ use tracing::{info, warn};
 
 use crate::api::{self, ApiConfig};
 use crate::evidence::{self, EvidenceConfig};
-use crate::history::LoggingHistorySink;
+use crate::history::{HistorySink, LoggingHistorySink};
 use crate::jobs::JobQueue;
 use crate::launch::{LaunchPlan, RemoteWorker};
-use crate::network::{self, ControlOptions, SharedPeerTable};
-use crate::node::PeerTable;
+use crate::network::{self, ControlOptions, Mailbox, Outboxes, SharedPeerTable};
+use crate::node::{NodeId, PeerTable};
 use crate::process::{self, ChildSpec, Readiness, RestartPolicy, Supervised};
-use crate::protocol::{CONTROL_ALPN, Hello};
-use crate::rpc_bridge::{BridgeMapping, LeaderBridges, PEER_NOT_APPROVED};
+use crate::protocol::{CONTROL_ALPN, Message};
+use crate::replication::{LeaderReplication, ReplicatingSink, ReplicationConfig};
+use crate::rpc_bridge::{BridgeMapping, LeaderBridges};
 use crate::shard::frontend::{FrontendConfig, serve_frontend};
 use crate::shard::manifest::ShardManifest;
 use crate::shard::ring::RING_ALPN;
@@ -181,6 +195,35 @@ pub struct LeaderConfig {
     /// `leader_heartbeat_timeout` instead of QUIC's idle timeout. Must be shorter than that
     /// timeout and must not be zero; `None` sends no heartbeats.
     pub heartbeat_interval: Option<Duration>,
+    /// Where to keep and replicate the conversation; `None` only logs completed turns.
+    pub replication: Option<ReplicationConfig>,
+    /// Workers that must join before this leader does anything, as when a worker takes over;
+    /// `None` starts at once.
+    pub quorum: Option<Quorum>,
+}
+
+/// The workers a new leader must gather before it serves: a majority of the cluster it was
+/// elected in, counting itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Quorum {
+    /// Workers whose control connections count; anyone else connecting does not.
+    pub members: BTreeSet<NodeId>,
+    /// How many of them must be connected at the same time.
+    pub needed: usize,
+    /// How long to wait for them.
+    pub wait: Duration,
+}
+
+/// A new leader gave up because not enough of its cluster joined it in time.
+#[derive(Debug, thiserror::Error)]
+#[error("only {joined} of the {needed} workers needed for a majority joined within {wait:?}")]
+pub struct NoQuorum {
+    /// Members connected when the wait ran out.
+    pub joined: usize,
+    /// Members needed.
+    pub needed: usize,
+    /// How long it waited.
+    pub wait: Duration,
 }
 
 /// Which execution backend the leader runs, with its backend-specific settings.
@@ -245,12 +288,21 @@ pub async fn run_leader_on(
     config: &LeaderConfig,
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<()> {
-    let result = match prepare(&config.backend) {
-        Ok(prepared) => lead(&endpoint, config, &prepared, shutdown).await,
-        Err(error) => Err(error),
-    };
+    let result = lead_on(&endpoint, config, shutdown).await;
     endpoint.close().await;
     result
+}
+
+/// Like [`run_leader_on`], but leaves `endpoint` open, so a worker whose takeover failed with
+/// [`NoQuorum`] can carry on as a worker on it. Every control connection the leader accepted
+/// is closed when this returns.
+pub async fn lead_on(
+    endpoint: &Endpoint,
+    config: &LeaderConfig,
+    shutdown: impl Future<Output = ()>,
+) -> anyhow::Result<()> {
+    let prepared = prepare(&config.backend)?;
+    lead(endpoint, config, &prepared, shutdown).await
 }
 
 /// Resolves on Ctrl-C; if the signal handler cannot be installed, logs it and never resolves.
@@ -301,41 +353,38 @@ async fn lead(
 ) -> anyhow::Result<()> {
     let peers: SharedPeerTable = Arc::new(Mutex::new(PeerTable::new()));
     let local = network::local_hello(endpoint, &config.cluster_id, EMPTY_LOG_INDEX);
-    let ring = ring_settings(config, prepared);
-    // Dropping the set aborts the accept loop and the worker watch, so neither outlives this
-    // function.
+    // Dropping the set aborts the accept loop, the worker watch and replication, so none of them
+    // outlives this function.
     let mut control = JoinSet::new();
+    let wiring = config
+        .replication
+        .as_ref()
+        .map(|_| ReplicationWiring::new());
     let options = ControlOptions {
         heartbeat_timeout: config.heartbeat_timeout,
         heartbeat_interval: config.heartbeat_interval,
     };
-    match &ring {
-        None => control.spawn(network::serve_control_with(
-            endpoint.clone(),
-            local,
-            Arc::clone(&peers),
-            options,
-        )),
-        Some(ring) => {
-            endpoint.set_alpns(vec![CONTROL_ALPN.to_vec(), RING_ALPN.to_vec()]);
-            info!(
-                "ring manifest: the leader also accepts shard-ring result channels (experimental)"
-            );
-            control.spawn(serve_control_and_ring(
-                endpoint.clone(),
-                ControlSessions {
-                    local,
-                    peers: Arc::clone(&peers),
-                    options,
-                },
-                Arc::clone(&ring.channels),
-            ))
-        }
-    };
+    control.spawn(network::serve_control_routed(
+        endpoint.clone(),
+        local,
+        Arc::clone(&peers),
+        options,
+        wiring.as_ref().map(|wiring| wiring.mailbox.clone()),
+    ));
 
     tokio::pin!(shutdown);
+    if let Some(quorum) = &config.quorum {
+        tokio::select! {
+            gathered = wait_for_quorum(&peers, quorum) => gathered?,
+            () = &mut shutdown => {
+                info!("shutdown requested while waiting for a majority");
+                return Ok(());
+            }
+        }
+    }
+    let sink = start_replication(endpoint, config, prepared, &peers, wiring, &mut control)?;
     let running = tokio::select! {
-        started = start(endpoint, config, prepared, &peers, ring) => started?,
+        started = start(endpoint, config, prepared, &peers, sink) => started?,
         () = &mut shutdown => {
             info!("shutdown requested during startup");
             return Ok(());
@@ -351,78 +400,98 @@ async fn lead(
     running.serve_until(shutdown, failed_verification).await
 }
 
-/// The ring settings when the backend is shard with a ring manifest; `None` otherwise.
-fn ring_settings(config: &LeaderConfig, prepared: &Prepared<'_>) -> Option<RingSettings> {
-    match (prepared, &config.backend) {
-        (Prepared::Shard(manifest), BackendConfig::Shard(shard)) if manifest.is_ring() => {
-            Some(shard.ring.clone())
+/// The channels between control connections and replication. They exist from the start, so
+/// messages workers send before replication begins (such as standby offers) wait for it.
+struct ReplicationWiring {
+    mailbox: Mailbox,
+    inbox: tokio::sync::mpsc::UnboundedReceiver<(NodeId, Message)>,
+}
+
+impl ReplicationWiring {
+    fn new() -> Self {
+        let (inbox, received) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            mailbox: Mailbox {
+                inbox,
+                outboxes: Outboxes::default(),
+            },
+            inbox: received,
         }
-        _ => None,
     }
 }
 
-/// What every control session of the dispatching accept loop shares: the leader's hello, the
-/// peer table and the heartbeat options, exactly as [`network::serve_control_with`] gets them.
-struct ControlSessions {
-    local: Hello,
-    peers: SharedPeerTable,
-    options: ControlOptions,
-}
-
-/// The accept loop for a ring manifest: like [`network::serve_control_with`], but dispatching
-/// each connection by ALPN. Control connections get the same heartbeat-capable control session,
-/// shard-ring connections go to `channels`, and anything else is closed. Runs until the endpoint
-/// closes.
-async fn serve_control_and_ring(
-    endpoint: Endpoint,
-    control: ControlSessions,
-    channels: Arc<ResultChannels>,
-) -> anyhow::Result<()> {
-    let control = Arc::new(control);
-    let mut sessions = JoinSet::new();
-    while let Some(incoming) = endpoint.accept().await {
-        sessions.spawn(dispatch_connection(
-            incoming,
-            Arc::clone(&control),
-            Arc::clone(&channels),
-        ));
-        // Reap finished sessions so a long-running listener does not accumulate them.
-        while sessions.try_join_next().is_some() {}
-    }
-    sessions.shutdown().await;
-    Ok(())
-}
-
-/// Accepts one connection and hands it to the handler for its ALPN.
-async fn dispatch_connection(
-    incoming: Incoming,
-    control: Arc<ControlSessions>,
-    channels: Arc<ResultChannels>,
-) {
-    let connection: Connection = match incoming.await {
-        Ok(connection) => connection,
-        Err(error) => {
-            warn!(%error, "incoming connection failed");
-            return;
+/// Waits until `quorum.needed` of its members are connected at once, or fails with
+/// [`NoQuorum`] after `quorum.wait`.
+async fn wait_for_quorum(peers: &SharedPeerTable, quorum: &Quorum) -> anyhow::Result<()> {
+    let deadline = Instant::now() + quorum.wait;
+    info!(
+        needed = quorum.needed,
+        members = quorum.members.len(),
+        "waiting for a majority to join"
+    );
+    loop {
+        let joined = joined_members(peers, &quorum.members)?;
+        if joined >= quorum.needed {
+            info!(joined, "a majority joined");
+            return Ok(());
         }
+        if Instant::now() >= deadline {
+            return Err(NoQuorum {
+                joined,
+                needed: quorum.needed,
+                wait: quorum.wait,
+            }
+            .into());
+        }
+        tokio::time::sleep(WORKER_POLL_INTERVAL).await;
+    }
+}
+
+/// How many of `members` are connected now.
+fn joined_members(peers: &SharedPeerTable, members: &BTreeSet<NodeId>) -> anyhow::Result<usize> {
+    let table = peers
+        .lock()
+        .map_err(|_| anyhow!("peer table lock poisoned"))?;
+    Ok(table.ids().filter(|id| members.contains(id)).count())
+}
+
+/// Opens the replicated conversation and starts replicating it in `control` over `wiring`,
+/// returning the job API's history sink. Without replication configured, the sink only logs.
+fn start_replication(
+    endpoint: &Endpoint,
+    config: &LeaderConfig,
+    prepared: &Prepared<'_>,
+    peers: &SharedPeerTable,
+    wiring: Option<ReplicationWiring>,
+    control: &mut JoinSet<anyhow::Result<()>>,
+) -> anyhow::Result<Arc<dyn HistorySink>> {
+    let (Some(replication), Some(wiring)) = (&config.replication, wiring) else {
+        return Ok(Arc::new(LoggingHistorySink));
     };
-    match connection.alpn() {
-        alpn if alpn == CONTROL_ALPN => {
-            let ControlSessions {
-                local,
-                peers,
-                options,
-            } = &*control;
-            network::serve_control_connection(connection, local, peers, *options).await;
-        }
-        alpn if alpn == RING_ALPN => channels.handle_connection(connection).await,
-        alpn => {
-            warn!(
-                peer = %connection.remote_id(),
-                alpn = %String::from_utf8_lossy(alpn),
-                "closing a connection on an unsupported protocol"
-            );
-            connection.close(PEER_NOT_APPROVED, UNSUPPORTED_PROTOCOL_REASON);
+    let state = LeaderReplication::open(
+        endpoint.id(),
+        replication,
+        &config.cluster_id,
+        &model_hash(prepared),
+        Arc::clone(peers),
+        wiring.mailbox.outboxes,
+    )?;
+    let (turns, turns_received) = tokio::sync::mpsc::unbounded_channel();
+    let inbox = wiring.inbox;
+    control.spawn(async move {
+        state.run(turns_received, inbox).await;
+        Ok(())
+    });
+    Ok(Arc::new(ReplicatingSink::new(turns)))
+}
+
+/// The identity of the model the backend serves, recorded with the conversation so that a
+/// replacement leader must serve the same model.
+fn model_hash(prepared: &Prepared<'_>) -> String {
+    match prepared {
+        Prepared::Llama(llama) => llama.launch.profile.model.model_hash.clone(),
+        Prepared::Shard(manifest) => {
+            format!("sha256:{}", manifest.model_sha256.to_ascii_lowercase())
         }
     }
 }
@@ -487,13 +556,13 @@ async fn start(
     config: &LeaderConfig,
     prepared: &Prepared<'_>,
     peers: &SharedPeerTable,
-    ring: Option<RingSettings>,
+    sink: Arc<dyn HistorySink>,
 ) -> anyhow::Result<Running> {
     let backend = match prepared {
         Prepared::Llama(llama) => start_llama(endpoint, config, llama, peers).await?,
         Prepared::Shard(manifest) => start_shard(endpoint, config, manifest.clone(), ring).await?,
     };
-    let (api_stop, api) = start_api(config, peers);
+    let (api_stop, api) = start_api(config, sink);
     Ok(Running {
         api_stop,
         api,
@@ -946,7 +1015,7 @@ fn probe_request() -> Value {
 /// Starts the job API in the background; sending on (or dropping) the returned sender stops it.
 fn start_api(
     config: &LeaderConfig,
-    peers: &SharedPeerTable,
+    sink: Arc<dyn HistorySink>,
 ) -> (oneshot::Sender<()>, JoinSet<anyhow::Result<()>>) {
     let (stop, stopped) = oneshot::channel::<()>();
     let api_config = ApiConfig {
@@ -958,7 +1027,7 @@ fn start_api(
     api.spawn(api::serve_api(
         api_config,
         Arc::new(JobQueue::new()),
-        Arc::new(LoggingHistorySink),
+        sink,
         async move {
             // Resolves on an explicit stop or when the sender is dropped; both mean stop.
             let _ = stopped.await;
@@ -1003,6 +1072,33 @@ mod tests {
             );
         }
         Arc::new(Mutex::new(table))
+    }
+
+    /// Short enough to keep the test fast; the wait is real time.
+    const QUORUM_TEST_WAIT: Duration = Duration::from_millis(300);
+
+    #[tokio::test]
+    async fn a_quorum_counts_only_members_and_gives_up_after_its_wait() {
+        let (member, other_member, stranger) = (
+            SecretKey::generate().public(),
+            SecretKey::generate().public(),
+            SecretKey::generate().public(),
+        );
+        let quorum = Quorum {
+            members: BTreeSet::from([member, other_member]),
+            needed: 2,
+            wait: QUORUM_TEST_WAIT,
+        };
+
+        let short = table_with(&[member, stranger]);
+        let error = wait_for_quorum(&short, &quorum).await.unwrap_err();
+        let no_quorum = error.downcast_ref::<NoQuorum>().expect("NoQuorum");
+        assert_eq!((no_quorum.joined, no_quorum.needed), (1, 2));
+
+        let majority = table_with(&[member, other_member]);
+        wait_for_quorum(&majority, &quorum)
+            .await
+            .expect("both members joined");
     }
 
     fn worker(id: EndpointId) -> RemoteWorker {

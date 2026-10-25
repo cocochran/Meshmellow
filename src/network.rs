@@ -21,7 +21,13 @@
 //! Unlike the acceptor's watchdog, which is armed from the hello, the dialer's arms only at the
 //! first heartbeat it accepts, so a dialer connected to an acceptor that never heartbeats (an
 //! older build, or one without an interval) is never timed out.
+//!
+//! Other messages (history sync, rosters) are dropped unless the side has an [`Inbox`]. With a
+//! [`Mailbox`], [`serve_control_routed`] hands them to its inbox and also opens one more
+//! unidirectional stream per peer for whatever the caller queues in [`Outboxes`]. A dialer does
+//! the same with [`watch_control`] and [`write_messages`].
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -31,7 +37,8 @@ use anyhow::{Context, anyhow, bail, ensure};
 use iroh::endpoint::presets::{self, Preset};
 use iroh::endpoint::{Connection, ConnectionError, Incoming, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::Notify;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, info, warn};
@@ -70,7 +77,8 @@ pub const HEARTBEAT_TIMEOUT_CODE: u32 = 4;
 /// QUIC close reason sent with [`HEARTBEAT_TIMEOUT_CODE`].
 const HEARTBEAT_TIMEOUT_REASON: &[u8] = b"heartbeat timeout";
 
-/// Leadership epoch carried in heartbeats; elections (and real epochs) do not exist yet.
+/// Leadership epoch carried in heartbeats. Heartbeats only signal liveness; the real epoch
+/// travels in history sync messages and rosters ([`crate::replication`]).
 pub const HEARTBEAT_EPOCH: u64 = 0;
 
 /// Options for [`serve_control_with`].
@@ -90,6 +98,73 @@ pub struct ControlOptions {
     /// that connection's sender; receiving the peer's streams and the timeout are unaffected.
     /// `Some(Duration::ZERO)` is treated as `None`.
     pub heartbeat_interval: Option<Duration>,
+}
+
+/// Receives control messages other than heartbeats, tagged with the peer that sent them.
+pub type Inbox = UnboundedSender<(NodeId, Message)>;
+
+/// Queues of messages for each connected peer, written on its current control connection.
+///
+/// Only the newest connection from a peer has a queue; a message for a peer that is not
+/// connected is dropped, so senders resend what matters once it reconnects.
+#[derive(Clone, Debug, Default)]
+pub struct Outboxes {
+    queues: Arc<Mutex<HashMap<NodeId, Outbox>>>,
+}
+
+/// One connection's queue.
+#[derive(Debug)]
+struct Outbox {
+    connection_token: u64,
+    sender: UnboundedSender<Message>,
+}
+
+impl Outboxes {
+    /// Queues `message` for `peer`'s current connection; returns whether it has one.
+    pub fn send(&self, peer: &NodeId, message: Message) -> bool {
+        let Ok(queues) = self.queues.lock() else {
+            warn!(%peer, "outbox lock poisoned; dropping message");
+            return false;
+        };
+        queues
+            .get(peer)
+            .is_some_and(|outbox| outbox.sender.send(message).is_ok())
+    }
+
+    /// Gives the connection with `connection_token` a fresh queue, replacing an older one.
+    fn open(&self, peer: NodeId, connection_token: u64) -> UnboundedReceiver<Message> {
+        let (sender, receiver) = unbounded_channel();
+        if let Ok(mut queues) = self.queues.lock() {
+            queues.insert(
+                peer,
+                Outbox {
+                    connection_token,
+                    sender,
+                },
+            );
+        }
+        receiver
+    }
+
+    /// Drops the queue of the connection with `connection_token`, unless a newer one replaced it.
+    fn close(&self, peer: &NodeId, connection_token: u64) {
+        if let Ok(mut queues) = self.queues.lock()
+            && queues
+                .get(peer)
+                .is_some_and(|outbox| outbox.connection_token == connection_token)
+        {
+            queues.remove(peer);
+        }
+    }
+}
+
+/// Where an acceptor routes control traffic other than heartbeats.
+#[derive(Clone, Debug)]
+pub struct Mailbox {
+    /// Receives every other message peers send.
+    pub inbox: Inbox,
+    /// Holds what to send each connected peer.
+    pub outboxes: Outboxes,
 }
 
 /// Length of an Ed25519 secret key in bytes.
@@ -291,6 +366,18 @@ pub async fn serve_control_with(
     peers: SharedPeerTable,
     options: ControlOptions,
 ) -> anyhow::Result<()> {
+    serve_control_routed(endpoint, local, peers, options, None).await
+}
+
+/// Like [`serve_control_with`], but with a `mailbox` that receives every non-heartbeat message
+/// and supplies what to send each peer, on one extra unidirectional stream per connection.
+pub async fn serve_control_routed(
+    endpoint: Endpoint,
+    local: Hello,
+    peers: SharedPeerTable,
+    options: ControlOptions,
+    mailbox: Option<Mailbox>,
+) -> anyhow::Result<()> {
     let local = Arc::new(local);
     let options = ControlOptions {
         heartbeat_timeout: nonzero(options.heartbeat_timeout),
@@ -298,30 +385,15 @@ pub async fn serve_control_with(
     };
     let session_slots = Arc::new(Semaphore::new(MAX_CONTROL_SESSIONS));
     let mut sessions = JoinSet::new();
-    loop {
-        tokio::select! {
-            incoming = endpoint.accept() => match incoming {
-                Some(incoming) => {
-                    let Ok(permit) = session_slots.clone().try_acquire_owned() else {
-                        incoming.refuse();
-                        debug!(limit = MAX_CONTROL_SESSIONS, "control session limit reached; refusing connection");
-                        continue;
-                    };
-                    let local = Arc::clone(&local);
-                    let peers = Arc::clone(&peers);
-                    sessions.spawn(async move {
-                        let _permit = permit;
-                        run_control_session(incoming, &local, &peers, options).await;
-                    });
-                }
-                None => break,
-            },
-            Some(result) = sessions.join_next(), if !sessions.is_empty() => {
-                if let Err(error) = result {
-                    warn!(%error, "control session task failed");
-                }
-            }
-        }
+    while let Some(incoming) = endpoint.accept().await {
+        let local = Arc::clone(&local);
+        let peers = Arc::clone(&peers);
+        let mailbox = mailbox.clone();
+        sessions.spawn(async move {
+            run_control_session(incoming, &local, &peers, options, mailbox.as_ref()).await;
+        });
+        // Reap finished sessions so a long-running listener does not accumulate them.
+        while sessions.try_join_next().is_some() {}
     }
     sessions.shutdown().await;
     Ok(())
@@ -344,6 +416,7 @@ async fn run_control_session(
     local: &Hello,
     peers: &SharedPeerTable,
     options: ControlOptions,
+    mailbox: Option<&Mailbox>,
 ) {
     let accepted = accept_peer(incoming, local, peers).await;
     run_accepted_session(accepted, local, peers, options).await;
@@ -375,31 +448,71 @@ async fn run_accepted_session(
 ) {
     match accepted {
         Ok(session) => {
-            let reason = maintain_peer_session(&session, &local.node_id, peers, options).await;
+            let watchdog = HeartbeatWatchdog::new(options.heartbeat_timeout, Arming::AtStart);
+            let sender = send_heartbeats(
+                session.connection(),
+                &local.node_id,
+                options.heartbeat_interval,
+            );
+            let (node_id, token) = (session.node_id(), session.connection_token());
+            let queue = mailbox.map(|mailbox| mailbox.outboxes.open(node_id, token));
+            let inbox = mailbox.map(|mailbox| &mailbox.inbox);
+            // The senders never complete, so the session ends exactly when receiving does, and
+            // the senders are dropped with it.
+            let reason = tokio::select! {
+                reason = receive_control_streams(&session, peers, watchdog, inbox) => reason,
+                never = sender => match never {},
+                never = send_queued(session.connection(), queue) => match never {},
+            };
+            if let Some(mailbox) = mailbox {
+                mailbox.outboxes.close(&node_id, token);
+            }
             info!(peer = %session.hello().node_id, %reason, "peer disconnected");
         }
         Err(error) => warn!("rejected incoming connection: {error:#}"),
     }
 }
 
-/// Maintains an already admitted core session with bidirectional heartbeats.
-/// Used by the mesh protocol router after the membership-gated hello.
-pub async fn maintain_peer_session(
-    session: &PeerSession,
-    local_node_id: &str,
-    peers: &SharedPeerTable,
-    options: ControlOptions,
-) -> ConnectionError {
-    let watchdog = HeartbeatWatchdog::new(nonzero(options.heartbeat_timeout), Arming::AtStart);
-    let sender = send_heartbeats(
-        session.connection(),
-        local_node_id,
-        nonzero(options.heartbeat_interval),
-    );
-    tokio::select! {
-        reason = receive_control_streams(session, peers, watchdog) => reason,
-        never = sender => match never {},
+/// Writes everything queued for this connection on one unidirectional stream; without a queue,
+/// or once writing fails, waits forever so only the caller decides when the session ends.
+async fn send_queued(
+    connection: &Connection,
+    queue: Option<UnboundedReceiver<Message>>,
+) -> Infallible {
+    if let Some(mut queue) = queue {
+        let Err(error) = write_messages(connection, &mut queue).await;
+        debug!(
+            peer = %connection.remote_id(),
+            error = %format!("{error:#}"),
+            "stopped sending control messages to peer"
+        );
     }
+    std::future::pending().await
+}
+
+/// Writes every message from `queue` on one unidirectional stream of `connection`, in order. The
+/// stream opens with the first message, so a peer that never gets one never sees an empty
+/// stream ahead of its heartbeats. Returns only when opening the stream or a write fails, or the
+/// queue's senders are all gone.
+pub async fn write_messages(
+    connection: &Connection,
+    queue: &mut UnboundedReceiver<Message>,
+) -> anyhow::Result<Infallible> {
+    let Some(first) = queue.recv().await else {
+        bail!("control message queue closed");
+    };
+    let mut stream = connection
+        .open_uni()
+        .await
+        .context("failed to open control message stream")?;
+    let mut next = Some(first);
+    while let Some(message) = next.take() {
+        protocol::write_frame(&mut stream, &message)
+            .await
+            .with_context(|| format!("failed to send {}", message_kind(&message)))?;
+        next = queue.recv().await;
+    }
+    bail!("control message queue closed")
 }
 
 /// Writes a [`Heartbeat`] from `node_id` every `interval` on one new unidirectional stream of
@@ -470,8 +583,19 @@ pub async fn watch_heartbeats(
     peers: &SharedPeerTable,
     timeout: Option<Duration>,
 ) -> ConnectionError {
+    watch_control(session, peers, timeout, None).await
+}
+
+/// Like [`watch_heartbeats`], but hands every other message the peer sends to `inbox` instead
+/// of dropping it.
+pub async fn watch_control(
+    session: &PeerSession,
+    peers: &SharedPeerTable,
+    timeout: Option<Duration>,
+    inbox: Option<&Inbox>,
+) -> ConnectionError {
     let watchdog = HeartbeatWatchdog::new(nonzero(timeout), Arming::AtFirstHeartbeat);
-    receive_control_streams(session, peers, watchdog).await
+    receive_control_streams(session, peers, watchdog, inbox).await
 }
 
 /// Removes `node_id` from `peers` if its entry still belongs to the connection with
@@ -536,6 +660,7 @@ async fn receive_control_streams(
     session: &PeerSession,
     peers: &SharedPeerTable,
     mut watchdog: HeartbeatWatchdog,
+    inbox: Option<&Inbox>,
 ) -> ConnectionError {
     let accepted_heartbeat = Arc::new(Notify::new());
     let stream_slots = Arc::new(Semaphore::new(MAX_CONTROL_STREAM_READERS));
@@ -558,6 +683,7 @@ async fn receive_control_streams(
                         connection_token: session.connection_token(),
                         peers: Arc::clone(peers),
                         accepted_heartbeat: Arc::clone(&accepted_heartbeat),
+                        inbox: inbox.cloned(),
                     };
                     streams.spawn(async move {
                         let _permit = permit;
@@ -594,24 +720,24 @@ async fn close_for_heartbeat_timeout(
 }
 
 /// Reads one control stream from `peer`, signalling `accepted_heartbeat` for each heartbeat the
-/// peer table accepts.
+/// peer table accepts and passing other messages to `inbox`.
 struct StreamReader {
     peer: NodeId,
     connection_token: u64,
     peers: SharedPeerTable,
     accepted_heartbeat: Arc<Notify>,
+    inbox: Option<Inbox>,
 }
 
 impl StreamReader {
-    /// Reads framed messages until the stream ends, recording heartbeats and ignoring the rest.
+    /// Reads framed messages until the stream ends, recording heartbeats and routing the rest to
+    /// the inbox, or ignoring them without one.
     async fn run(self, mut recv: RecvStream) {
         let peer = self.peer;
         loop {
             match protocol::read_frame_with_limit(&mut recv, MAX_HEARTBEAT_FRAME_LEN).await {
                 Ok(Some(Message::Heartbeat(heartbeat))) => self.on_heartbeat(&heartbeat),
-                Ok(Some(other)) => {
-                    warn!(%peer, kind = message_kind(&other), "ignoring unexpected control message");
-                }
+                Ok(Some(other)) => self.on_other(other),
                 Ok(None) => return,
                 Err(error) => {
                     warn!(%peer, %error, "control stream failed");
@@ -625,6 +751,20 @@ impl StreamReader {
     fn on_heartbeat(&self, heartbeat: &Heartbeat) {
         if record_heartbeat(&self.peers, self.peer, self.connection_token, heartbeat) {
             self.accepted_heartbeat.notify_one();
+        }
+    }
+
+    /// Hands a non-heartbeat message to the inbox, or logs and drops it.
+    fn on_other(&self, message: Message) {
+        let peer = self.peer;
+        let kind = message_kind(&message);
+        match &self.inbox {
+            Some(inbox) => {
+                if inbox.send((peer, message)).is_err() {
+                    debug!(%peer, kind, "control inbox closed; dropping message");
+                }
+            }
+            None => warn!(%peer, kind, "ignoring unexpected control message"),
         }
     }
 }
@@ -667,6 +807,8 @@ fn message_kind(message: &Message) -> &'static str {
         Message::Prompt(_) => "prompt",
         Message::Activations(_) => "activations",
         Message::History(_) => "history",
+        Message::Roster(_) => "roster",
+        Message::Standby(_) => "standby",
     }
 }
 
