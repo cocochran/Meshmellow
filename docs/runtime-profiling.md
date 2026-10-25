@@ -15,18 +15,19 @@ ineligible for placement.
 
 ## Ownership
 
-- Runtime owns probe execution, bounded cancellation, profile lifecycle, and
-  the admission gate that prevents probes from overlapping active inference.
+- Runtime coordinator owns bounded probe execution/cancellation, profile
+  lifecycle, local admission, reservation orchestration, and evidence handoff.
 - Apps own explicit compute opt-in, progress, and cancellation controls. Mesh
   membership alone never opts a device into compute or profiling.
 - The planner consumes versioned evidence and returns advisory assignments.
 - The runtime integration owns manifest validation and stage readiness.
-- Capacity reservation and survivor replanning still need explicit owners.
-  They are separate from profiling and from the current planner.
+- Survivor replanning still needs explicit confirmation from the recovery
+  owner. It is separate from profiling and from the current planner.
 
 This runtime workstream owns the coordinator contract and local inference
-admission gate. It does not claim that worker-side probe execution, remote
-reservation, or plan activation already exists.
+admission gate. Remote reservation and worker-side probe execution depend on
+the participant lease/readiness contract; neither is implemented yet. Plan
+activation remains with the runtime integration.
 
 The initial runtime interface is `start(request) -> run_id`,
 `status(run_id)`, and `cancel(run_id)`. Transport and app command names remain
