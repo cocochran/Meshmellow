@@ -213,6 +213,12 @@ per-artifact hashes for each exported stage. Buffer, RSS and physical-footprint
 metrics have different accounting scopes and must not be added together. Keep
 these observations provisional until those missing inputs are collected.
 
+The bounded profiling lifecycle, cancellation behavior, admission requirements,
+and ownership boundaries are documented in
+[`runtime-profiling.md`](runtime-profiling.md). That contract does not itself
+implement a candidate-range executor, fleet memory reservation, or deployment
+activation.
+
 The main-branch v1 shard backend currently accepts one remote prefix followed
 by a local final stage. Yash's separate M-27 ring contract instead requires
 stage 0 to be leader-local beginning at layer 0, followed by one or more

@@ -20,12 +20,14 @@
 //!   opcode for its stage, and exits 1 with a message on stderr on any violation.
 //!
 //! Environment: `FAKE_SHARD_FAIL_AT_STEP=<n>` exits 1 on receiving step `n`.
+//! `FAKE_SHARD_DELAY_AT_STEP_MS=<ms>` delays each step before replying.
 //! `FAKE_SHARD_LOG=<path>` appends `<pid> <begin>:<end> step=<s> position=<p> count=<n>` per
 //! received request header.
 
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, bail, ensure};
 use llm_cluster::shard::wire::{
@@ -58,6 +60,7 @@ const NO_TOKEN: i64 = -1;
 
 /// Exits 1 on receiving the step it names.
 const FAIL_AT_STEP_ENV: &str = "FAKE_SHARD_FAIL_AT_STEP";
+const DELAY_AT_STEP_ENV: &str = "FAKE_SHARD_DELAY_AT_STEP_MS";
 
 /// Path to append one line per received request header.
 const LOG_ENV: &str = "FAKE_SHARD_LOG";
@@ -92,6 +95,7 @@ struct Stage {
     context: u32,
     prompt_tokens: Vec<u32>,
     fail_at_step: Option<u32>,
+    delay_at_step: Duration,
     log: Option<PathBuf>,
     expected_step: u32,
     expected_position: u32,
@@ -204,6 +208,10 @@ impl Stage {
             Ok(value) => Some(parse_number(&value, FAIL_AT_STEP_ENV)?),
             Err(_) => None,
         };
+        let delay_at_step = match std::env::var(DELAY_AT_STEP_ENV) {
+            Ok(value) => Duration::from_millis(parse_number(&value, DELAY_AT_STEP_ENV)?),
+            Err(_) => Duration::ZERO,
+        };
         Ok(Self {
             model,
             begin: args.begin,
@@ -211,6 +219,7 @@ impl Stage {
             context: args.context,
             prompt_tokens: tokenize(&args.prompt),
             fail_at_step,
+            delay_at_step,
             log: std::env::var_os(LOG_ENV).map(PathBuf::from),
             expected_step: 0,
             expected_position: 0,
@@ -262,6 +271,9 @@ impl Stage {
         } else {
             self.forward(&header, &tokens)
         };
+        if !self.delay_at_step.is_zero() {
+            tokio::time::sleep(self.delay_at_step).await;
+        }
         wire::write_step(output, &reply, &floats).await?;
         self.expected_step += 1;
         self.expected_position += header.token_count;

@@ -1,0 +1,4 @@
+#!/bin/sh
+# exec preserves a single runtime process and forwards terminal signals directly.
+root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec "${LAYERCAKE_CORE_BIN:-$root/target/debug/llm-cluster}" ui --assets "$root/apps/web/build" "$@"

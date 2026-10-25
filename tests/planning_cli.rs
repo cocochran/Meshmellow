@@ -1,6 +1,28 @@
 use std::process::Command;
 
 #[test]
+fn debug_flag_enables_diagnostics_without_changing_plan_output() {
+    let run = |debug: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_llm-cluster"));
+        command.env("RUST_LOG", "warn");
+        if debug {
+            command.arg("--debug");
+        }
+        command
+            .args(["plan", "examples/placement-profile.json"])
+            .output()
+            .unwrap()
+    };
+    let normal = run(false);
+    let diagnostic = run(true);
+    assert!(normal.status.success());
+    assert!(diagnostic.status.success());
+    assert_eq!(normal.stdout, diagnostic.stdout);
+    assert!(!String::from_utf8_lossy(&normal.stderr).contains("building placement plan"));
+    assert!(String::from_utf8_lossy(&diagnostic.stderr).contains("building placement plan"));
+}
+
+#[test]
 fn final_peer_constraint_prevents_skipping_local_device() {
     let mut request: llm_cluster::planning::PlanningRequest =
         serde_json::from_str(include_str!("../examples/placement-profile.json")).unwrap();

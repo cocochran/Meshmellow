@@ -10,6 +10,10 @@
 //!   `seed` are accepted and ignored; `max_tokens` / `max_completion_tokens` are honoured up to
 //!   the manifest's `max_tokens`.
 //!
+//! With an EXPERIMENTAL ring manifest each request instead starts the local stage 0 and a fresh
+//! shard-ring session ([`RingLink`]); [`FrontendConfig::ring`] must then carry the registry the
+//! leader's endpoint delivers result channels to.
+//!
 //! One generation runs at a time; later requests wait for the lock. A failure before any
 //! response bytes are sent is a JSON error with a 5xx status (400 for a prompt longer than
 //! the context). A failure mid-stream sends an SSE `error` event and ends without `[DONE]`,
@@ -35,18 +39,20 @@ use futures_util::{StreamExt, stream};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::{Receiver, Sender, channel};
+use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::api::CHAT_COMPLETIONS_PATH;
-use crate::shard::manifest::{ChatTemplate, ShardManifest, StageLocation, StageSpec};
+use crate::shard::manifest::{ShardManifest, StageLocation, StageSpec};
 use crate::shard::manifest::{same_sha256, sha256_file};
 use crate::shard::pipeline::{
-    FinishReason, Generation, GenerationLimits, LocalLaunch, METADATA_TIMEOUT, Pipeline,
-    PromptTooLong, StageExpectation, StageIdentity, StageLink,
+    FinishReason, Generation, GenerationCancelled, GenerationLimits, LocalLaunch, METADATA_TIMEOUT,
+    Pipeline, PromptTooLong, StageExpectation, StageIdentity, StageLink,
 };
+use crate::shard::ring_origin::{RingLink, RingPlan, RingSettings};
+use crate::shard::template::{ChatMessage, ChatRenderer};
 
 /// Liveness probe, as llama-server serves it.
 pub const HEALTH_PATH: &str = "/health";
@@ -66,6 +72,9 @@ const EVENT_STREAM: &str = "text/event-stream";
 /// `Cache-Control` for a streamed reply: proxies must pass chunks through as they come.
 const NO_CACHE: &str = "no-cache";
 
+/// Bounds queued text chunks when a client reads more slowly than inference produces.
+const GENERATION_EVENT_BUFFER: usize = 16;
+
 /// Where the frontend listens, what it serves, and the endpoint remote stages are dialled from.
 pub struct FrontendConfig {
     /// Address to serve on; must be loopback, anything else is refused.
@@ -74,24 +83,39 @@ pub struct FrontendConfig {
     pub manifest: ShardManifest,
     /// Iroh endpoint used to dial remote stages.
     pub endpoint: iroh::Endpoint,
+    /// Required for a ring manifest (`"execution": "ring"`) and ignored otherwise: the registry
+    /// the endpoint's accept loop delivers terminals' result channels to, and the readiness wait.
+    pub ring: Option<RingSettings>,
+}
+
+/// What a ring manifest's generations need besides the manifest.
+struct RingRuntime {
+    plan: RingPlan,
+    settings: RingSettings,
 }
 
 /// Serves `GET /health` and `POST /v1/chat/completions` on `config.listen` until `shutdown`
 /// resolves, then finishes in-flight requests and returns.
 ///
 /// Before binding it validates the manifest and hashes every local stage file that has a
-/// configured `artifact_sha256` (once, on a blocking thread), failing on any mismatch.
+/// configured `artifact_sha256` (once, on a blocking thread), failing on any mismatch. It also
+/// loads the chat template once ([`ChatRenderer::load`]), refusing a pinned template that is
+/// missing, does not match its `sha256` or does not compile.
 pub async fn serve_frontend(
     config: FrontendConfig,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     ensure_loopback(config.listen)?;
     config.manifest.validate()?;
+    let ring = ring_runtime(&config.manifest, config.ring)?;
+    let renderer = ChatRenderer::load(&config.manifest.chat_template)?;
     verify_artifacts(&config.manifest).await?;
     let state = Arc::new(FrontendState {
         expectations: stage_expectations(&config.manifest),
         manifest: config.manifest,
         endpoint: config.endpoint,
+        ring,
+        renderer,
         generation_lock: Arc::new(Mutex::new(())),
     });
     let router = Router::new()
@@ -117,8 +141,30 @@ struct FrontendState {
     manifest: ShardManifest,
     endpoint: iroh::Endpoint,
     expectations: Vec<StageExpectation>,
+    /// Set for a ring manifest only.
+    ring: Option<RingRuntime>,
+    /// The manifest's chat template, verified and compiled at startup.
+    renderer: ChatRenderer,
     /// Held for the whole of a generation, so only one runs at a time.
     generation_lock: Arc<Mutex<()>>,
+}
+
+/// The ring runtime of a ring manifest, which needs `settings`; `None` for a pipeline manifest.
+fn ring_runtime(
+    manifest: &ShardManifest,
+    settings: Option<RingSettings>,
+) -> anyhow::Result<Option<RingRuntime>> {
+    if !manifest.is_ring() {
+        return Ok(None);
+    }
+    let settings = settings.context(
+        "a ring manifest (\"execution\": \"ring\") needs the leader's ring settings: \
+         FrontendConfig::ring must carry the result-channel registry its endpoint feeds",
+    )?;
+    Ok(Some(RingRuntime {
+        plan: RingPlan::from_manifest(manifest)?,
+        settings,
+    }))
 }
 
 fn ensure_loopback(listen: SocketAddr) -> anyhow::Result<()> {
@@ -237,7 +283,7 @@ impl MessageContent {
 /// Parses a chat request, renders its prompt, and caps `max_tokens` at `max_tokens_cap`.
 fn parse_chat_request(
     body: &[u8],
-    template: ChatTemplate,
+    renderer: &ChatRenderer,
     max_tokens_cap: u32,
 ) -> Result<ChatRequest, String> {
     let raw: RawChatRequest = serde_json::from_slice(body).map_err(|error| {
@@ -252,31 +298,22 @@ fn parse_chat_request(
     if requested == Some(0) {
         return Err("max_tokens must be at least 1".to_owned());
     }
-    let messages = raw
+    let messages: Vec<ChatMessage> = raw
         .messages
         .into_iter()
-        .map(|message| (message.role, message.content.into_text()));
+        .map(|message| ChatMessage {
+            role: message.role,
+            content: message.content.into_text(),
+        })
+        .collect();
+    let prompt = renderer
+        .render(&messages)
+        .map_err(|error| error.to_string())?;
     Ok(ChatRequest {
-        prompt: render_prompt(template, messages),
+        prompt,
         stream: raw.stream.unwrap_or(false),
         max_tokens: requested.map_or(max_tokens_cap, |asked| asked.min(max_tokens_cap)),
     })
-}
-
-/// Renders `(role, content)` pairs into the prompt string the final stage tokenizes.
-fn render_prompt(
-    template: ChatTemplate,
-    messages: impl Iterator<Item = (String, String)>,
-) -> String {
-    match template {
-        ChatTemplate::Chatml => {
-            let mut prompt: String = messages
-                .map(|(role, content)| format!("<|im_start|>{role}\n{content}<|im_end|>\n"))
-                .collect();
-            prompt.push_str("<|im_start|>assistant\n");
-            prompt
-        }
-    }
 }
 
 /// Progress of one generation, sent from its task to the request handler.
@@ -318,13 +355,17 @@ impl Failure {
     }
 }
 
-/// Aborts the generation task when dropped (the client went away), which drops its stage
-/// links: local runners are killed and remote streams closed.
-struct GenerationTask(JoinHandle<()>);
+/// Signals cancellation when the client goes away; the task remains alive for pipeline cleanup.
+struct GenerationTask {
+    cancel: Option<oneshot::Sender<()>>,
+    _join: JoinHandle<()>,
+}
 
 impl Drop for GenerationTask {
     fn drop(&mut self) {
-        self.0.abort();
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
     }
 }
 
@@ -382,7 +423,7 @@ impl Completion {
 
 async fn chat_completions(State(state): State<Arc<FrontendState>>, body: Bytes) -> Response {
     let manifest = &state.manifest;
-    let request = match parse_chat_request(&body, manifest.chat_template, manifest.max_tokens) {
+    let request = match parse_chat_request(&body, &state.renderer, manifest.max_tokens) {
         Ok(request) => request,
         Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
     };
@@ -391,13 +432,18 @@ async fn chat_completions(State(state): State<Arc<FrontendState>>, body: Bytes) 
         max_tokens = request.max_tokens,
         "shard generation requested"
     );
-    let (events_tx, mut events) = unbounded_channel();
-    let task = GenerationTask(tokio::spawn(run_generation(
-        Arc::clone(&state),
-        request.prompt,
-        request.max_tokens,
-        events_tx,
-    )));
+    let (events_tx, mut events) = channel(GENERATION_EVENT_BUFFER);
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    let task = GenerationTask {
+        cancel: Some(cancel_tx),
+        _join: tokio::spawn(run_generation(
+            Arc::clone(&state),
+            request.prompt,
+            request.max_tokens,
+            events_tx,
+            cancel_rx,
+        )),
+    };
     match events.recv().await {
         Some(Event::Started) => {}
         Some(Event::Failed(failure)) => return failure_response(&failure),
@@ -417,10 +463,20 @@ async fn run_generation(
     state: Arc<FrontendState>,
     prompt: String,
     max_tokens: u32,
-    events: UnboundedSender<Event>,
+    events: Sender<Event>,
+    mut cancel: oneshot::Receiver<()>,
 ) {
-    let _turn = Arc::clone(&state.generation_lock).lock_owned().await;
-    let event = match generate(&state, &prompt, max_tokens, &events).await {
+    let queued_at = std::time::Instant::now();
+    let _turn = tokio::select! {
+        biased;
+        _ = &mut cancel => return,
+        turn = Arc::clone(&state.generation_lock).lock_owned() => turn,
+    };
+    info!(
+        queue_wait_ms = queued_at.elapsed().as_millis(),
+        "shard generation acquired slot"
+    );
+    let event = match generate(&state, &prompt, max_tokens, &events, cancel).await {
         Ok(generation) => {
             info!(
                 finish = generation.finish.as_str(),
@@ -429,21 +485,63 @@ async fn run_generation(
             );
             Event::Finished(generation)
         }
+        Err(error) if error.downcast_ref::<GenerationCancelled>().is_some() => {
+            info!("client disconnected; shard generation canceled after cleanup");
+            return;
+        }
         Err(error) => {
             warn!(error = %format!("{error:#}"), "shard generation failed");
             Event::Failed(Failure::from_error(&error))
         }
     };
     // The handler may be gone (client disconnected); then nobody needs the outcome.
-    let _ = events.send(event);
+    let _ = events.send(event).await;
 }
 
 async fn generate(
     state: &FrontendState,
     prompt: &str,
     max_tokens: u32,
-    events: &UnboundedSender<Event>,
+    events: &Sender<Event>,
+    mut cancel: oneshot::Receiver<()>,
 ) -> anyhow::Result<Generation> {
+    let opened = tokio::select! {
+        biased;
+        _ = &mut cancel => return Err(GenerationCancelled.into()),
+        pipeline = async {
+            match &state.ring {
+                None => open_pipeline(state, prompt).await,
+                Some(ring) => open_ring_pipeline(state, ring, prompt).await,
+            }
+        } => pipeline,
+    };
+    let pipeline = opened?;
+    let context = state.manifest.context;
+    // Checked before `Started` so an oversized prompt is still answered with a 400.
+    if let Err(error) = pipeline.ensure_prompt_fits(context) {
+        pipeline.close(true).await;
+        return Err(error.into());
+    }
+    let _ = events.send(Event::Started).await;
+    let limits = GenerationLimits {
+        max_tokens,
+        context,
+    };
+    pipeline
+        .generate_cancellable(limits, cancel, {
+            let events = events.clone();
+            move |text| {
+                let events = events.clone();
+                async move {
+                    let _ = events.send(Event::Text(text)).await;
+                }
+            }
+        })
+        .await
+}
+
+/// Opens every stage of a pipeline manifest at once and validates them.
+async fn open_pipeline(state: &FrontendState, prompt: &str) -> anyhow::Result<Pipeline> {
     let links = try_join_all(
         state
             .manifest
@@ -452,21 +550,26 @@ async fn generate(
             .map(|stage| open_link(state, stage, prompt)),
     )
     .await?;
-    let pipeline = Pipeline::new(links, &state.expectations)?;
-    let context = state.manifest.context;
-    // Checked before `Started` so an oversized prompt is still answered with a 400.
-    pipeline.ensure_prompt_fits(context)?;
-    // A send fails only once the handler is gone, and then the task is being aborted anyway.
-    let _ = events.send(Event::Started);
-    let limits = GenerationLimits {
-        max_tokens,
-        context,
-    };
-    pipeline
-        .generate(limits, |text| {
-            let _ = events.send(Event::Text(text.to_owned()));
-        })
-        .await
+    Pipeline::new(links, &state.expectations)
+}
+
+/// Starts the local stage 0 and the ring session at once and validates them together.
+async fn open_ring_pipeline(
+    state: &FrontendState,
+    ring: &RingRuntime,
+    prompt: &str,
+) -> anyhow::Result<Pipeline> {
+    let (stage, expected) = state
+        .manifest
+        .stages
+        .first()
+        .zip(state.expectations.first())
+        .context("the ring manifest has no local stage")?;
+    let (local, link) = tokio::try_join!(
+        open_link(state, stage, prompt),
+        RingLink::open(&state.endpoint, &ring.plan, &ring.settings),
+    )?;
+    Pipeline::with_ring(local, link, expected)
 }
 
 async fn open_link(
@@ -502,10 +605,7 @@ async fn open_link(
 }
 
 /// Waits for the whole generation and answers with one completion object.
-async fn buffered_response(
-    mut events: UnboundedReceiver<Event>,
-    _task: GenerationTask,
-) -> Response {
+async fn buffered_response(mut events: Receiver<Event>, _task: GenerationTask) -> Response {
     let completion = Completion::new();
     loop {
         match events.recv().await {
@@ -521,7 +621,7 @@ async fn buffered_response(
 
 /// State of one streamed reply; dropping it (client disconnect) aborts the generation.
 struct SseStream {
-    events: UnboundedReceiver<Event>,
+    events: Receiver<Event>,
     completion: Completion,
     _task: GenerationTask,
     ended: bool,
@@ -559,7 +659,7 @@ impl SseStream {
 
 /// Streams the reply: a role chunk, content chunks, a final chunk with `finish_reason`, then
 /// `[DONE]`; or an `error` event and no `[DONE]` if the generation fails.
-fn stream_response(events: UnboundedReceiver<Event>, task: GenerationTask) -> Response {
+fn stream_response(events: Receiver<Event>, task: GenerationTask) -> Response {
     let completion = Completion::new();
     let role = completion.chunk(json!({"role": "assistant", "content": ""}), None);
     let state = SseStream {
@@ -605,11 +705,13 @@ fn error_response(status: StatusCode, message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shard::manifest::ChatTemplate;
 
     const CAP: u32 = 64;
 
     fn parse(body: Value) -> Result<ChatRequest, String> {
-        parse_chat_request(body.to_string().as_bytes(), ChatTemplate::Chatml, CAP)
+        let renderer = ChatRenderer::load(&ChatTemplate::Chatml).unwrap();
+        parse_chat_request(body.to_string().as_bytes(), &renderer, CAP)
     }
 
     #[test]

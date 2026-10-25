@@ -1,7 +1,27 @@
-# HackOHIO26
+# Layercake
  
 A peer-to-peer mesh VPN client that splits a large language model's layers across the devices in a mesh, so a group of ordinary machines can run a model none of them could hold alone. The P2P layer is built on [Iroh](https://iroh.computer), which handles peer discovery, NAT traversal, and encrypted QUIC connections.
  
+## Downloads
+
+GitHub Actions builds Windows, Linux, Apple Silicon macOS, and Intel macOS
+terminal executables that open the web dashboard in your browser. See [download instructions](docs/downloads.md)
+for artifact locations, platform requirements, and what each package contains.
+
+## Applications and core
+
+Application source is separate from the shared Rust core:
+
+- [`apps/android`](apps/android/README.md): native Android client.
+- [`apps/ios`](apps/ios/README.md): native iPhone and iPad client.
+- [`apps/web`](apps/web/README.md): SvelteKit browser dashboard.
+- [`apps/desktop`](apps/desktop/README.md): desktop terminal launcher and packaging.
+- [`apps/enrollment`](apps/enrollment/README.md): C/JNI bindings to core membership.
+- `src/`: shared networking, membership, planning and execution core.
+
+See [application capabilities and build instructions](apps/README.md). Mobile
+clients support enrollment and dashboard views; native inference is still pending.
+
 ## How it works
  
 ### Layer distribution
@@ -50,6 +70,9 @@ Early development.
 The leader can also run jobs on david-codex's shard runner (`leader --backend shard`); see [shard backend](docs/shard-backend.md).
 
 ## Browser client
+
+For opt-in step and stage timings while debugging a run, use `llm-cluster
+--debug ...`; see [runtime diagnostics](docs/runtime-diagnostics.md).
 
 When the leader is running, open `http://127.0.0.1:8080` for the built-in chat
 client. It streams replies from the leader and shows recent queued, running,

@@ -12,8 +12,14 @@
 //!    legacy plan fails here. The plan's `runtime_devices` say which planned peers are remote
 //!    workers and which leader-local port bridges to each. shard: the manifest
 //!    ([`ShardManifest::load`]), including the v1 topology rules.
-//! 2. Accept control connections. llama: wait until every remote worker has said hello. shard:
-//!    `shard-serve` workers open no control link, so there is nothing to wait for.
+//! 2. Accept control connections, heartbeating to each connected worker every
+//!    `heartbeat_interval` so it can tell when the leader is gone. llama: wait until every remote worker has said hello. shard:
+//!    `shard-serve` workers open no control link, so there is nothing to wait for. With an
+//!    EXPERIMENTAL ring manifest (`"execution": "ring"`) the endpoint also accepts the shard-ring
+//!    ALPN, and one accept loop dispatches by ALPN: control connections get the same
+//!    heartbeat-capable sessions as always, ring connections go to the result-channel registry
+//!    ([`ResultChannels`]) through which the ring's terminal worker returns tokens, and anything
+//!    else is closed.
 //! 3. Start the upstream. llama: one RPC bridge per remote worker, all sharing the leader's
 //!    endpoint, then `llama-server` with the plan's `server_args`, waiting for `/health`. shard:
 //!    the shard front end ([`serve_frontend`]) in-process, dialling remote stages by node ID
@@ -26,6 +32,8 @@
 //! 5. Serve the job API. llama only: with an evidence file configured, verify the externally
 //!    collected run evidence against the plan while serving; a failed verification stops the
 //!    leader. Verification is tied to the planning profile, so the shard backend has none.
+//!    llama only: a planned worker that leaves the peer table while serving (heartbeat timeout
+//!    or closed connection) is logged, as is its rejoin; jobs and the queue are unaffected.
 //! 6. On shutdown or failure, stop the API, then the backend (`llama-server` and the bridges, or
 //!    the shard front end), then the endpoint, in that order.
 
@@ -35,6 +43,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail, ensure};
+use iroh::endpoint::{Connection, Incoming};
 use iroh::{Endpoint, EndpointId};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
@@ -48,13 +57,15 @@ use crate::evidence::{self, EvidenceConfig};
 use crate::history::LoggingHistorySink;
 use crate::jobs::JobQueue;
 use crate::launch::{LaunchPlan, RemoteWorker};
-use crate::network::{self, SharedPeerTable};
+use crate::network::{self, ControlOptions, SharedPeerTable};
 use crate::node::PeerTable;
 use crate::process::{self, ChildSpec, Readiness, RestartPolicy, Supervised};
-use crate::protocol::CONTROL_ALPN;
-use crate::rpc_bridge::{BridgeMapping, LeaderBridges};
+use crate::protocol::{CONTROL_ALPN, Hello};
+use crate::rpc_bridge::{BridgeMapping, LeaderBridges, PEER_NOT_APPROVED};
 use crate::shard::frontend::{FrontendConfig, serve_frontend};
 use crate::shard::manifest::ShardManifest;
+use crate::shard::ring::RING_ALPN;
+use crate::shard::ring_origin::{ResultChannels, RingSettings};
 
 /// Internal loopback port the backend (`llama-server` or the shard front end) listens on unless
 /// configured otherwise.
@@ -66,6 +77,16 @@ pub const DEFAULT_API_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LO
 /// How long to wait for every planned worker to connect (llama), or for the shard pipeline's
 /// readiness probe to pass (shard), unless configured otherwise.
 pub const DEFAULT_WORKER_WAIT: Duration = Duration::from_secs(60);
+
+/// How long a worker may go without a heartbeat before the leader closes its control connection,
+/// unless configured otherwise: three missed beats at [`crate::worker::DEFAULT_HEARTBEAT_INTERVAL`]
+/// plus a second of slack.
+pub const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(7);
+
+/// How often the leader heartbeats to each connected worker unless configured otherwise; the
+/// same as the workers' own [`crate::worker::DEFAULT_HEARTBEAT_INTERVAL`], so their default
+/// [`crate::worker::DEFAULT_LEADER_HEARTBEAT_TIMEOUT`] allows three missed beats plus slack.
+pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = crate::worker::DEFAULT_HEARTBEAT_INTERVAL;
 
 /// How long `llama-server` may take to load the model and answer `/health` unless configured otherwise.
 pub const DEFAULT_LLAMA_READY_TIMEOUT: Duration = Duration::from_secs(300);
@@ -100,6 +121,9 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Longest error body from the upstream quoted in a probe failure.
 const PROBE_ERROR_BODY_CHARS: usize = 512;
 
+/// Maximum bytes read while constructing a probe error message; UTF-8 needs at most four per char.
+const PROBE_ERROR_BODY_BYTES: usize = PROBE_ERROR_BODY_CHARS * 4;
+
 /// Delay before the shard backend's first probe retry; it doubles after every failed attempt.
 const PROBE_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 
@@ -110,8 +134,15 @@ const PROBE_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(2);
 /// that has an `artifact_sha256` first, which takes a while for a multi-gigabyte shard.
 const SHARD_FRONTEND_READY_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Close reason for a connection on an ALPN the leader does not serve; sent with
+/// [`PEER_NOT_APPROVED`], as for any peer the leader will not talk to.
+const UNSUPPORTED_PROTOCOL_REASON: &[u8] = b"unsupported protocol";
+
 /// How often the worker wait re-checks the peer table.
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How often the leader re-checks, while serving, that every planned worker is still connected.
+const PRESENCE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How often to check whether the shard front end listens yet.
 const LISTEN_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -139,6 +170,17 @@ pub struct LeaderConfig {
     /// llama: how long to wait for every planned worker to connect. shard: how long the
     /// readiness probe is retried before startup fails.
     pub worker_wait: Duration,
+    /// How long a connected worker may go without a heartbeat before the leader closes its
+    /// control connection with [`network::HEARTBEAT_TIMEOUT_CODE`], dropping it from the peer
+    /// table until it reconnects. Must exceed the workers' heartbeat interval and must not be
+    /// zero. `None` disables the timeout: a silent worker is then only dropped when QUIC notices
+    /// the connection died.
+    pub heartbeat_timeout: Option<Duration>,
+    /// How often the leader sends its own heartbeat to each connected worker, usually
+    /// [`DEFAULT_HEARTBEAT_INTERVAL`], so workers notice a lost leader within their
+    /// `leader_heartbeat_timeout` instead of QUIC's idle timeout. Must be shorter than that
+    /// timeout and must not be zero; `None` sends no heartbeats.
+    pub heartbeat_interval: Option<Duration>,
 }
 
 /// Which execution backend the leader runs, with its backend-specific settings.
@@ -177,6 +219,9 @@ pub struct LlamaBackendConfig {
 pub struct ShardBackendConfig {
     /// Shard manifest JSON ([`ShardManifest`]): the runner, the model identity and the stages.
     pub manifest_path: PathBuf,
+    /// Used only by an EXPERIMENTAL ring manifest: the result-channel registry the leader's
+    /// accept loop feeds, and how long a ring may take to become ready.
+    pub ring: RingSettings,
 }
 
 /// Runs the leader on a freshly bound endpoint until Ctrl-C, then shuts everything down in order.
@@ -256,24 +301,130 @@ async fn lead(
 ) -> anyhow::Result<()> {
     let peers: SharedPeerTable = Arc::new(Mutex::new(PeerTable::new()));
     let local = network::local_hello(endpoint, &config.cluster_id, EMPTY_LOG_INDEX);
-    // Dropping the set aborts the accept loop, so it never outlives this function.
+    let ring = ring_settings(config, prepared);
+    // Dropping the set aborts the accept loop and the worker watch, so neither outlives this
+    // function.
     let mut control = JoinSet::new();
-    control.spawn(network::serve_control(
-        endpoint.clone(),
-        local,
-        Arc::clone(&peers),
-    ));
+    let options = ControlOptions {
+        heartbeat_timeout: config.heartbeat_timeout,
+        heartbeat_interval: config.heartbeat_interval,
+    };
+    match &ring {
+        None => control.spawn(network::serve_control_with(
+            endpoint.clone(),
+            local,
+            Arc::clone(&peers),
+            options,
+        )),
+        Some(ring) => {
+            endpoint.set_alpns(vec![CONTROL_ALPN.to_vec(), RING_ALPN.to_vec()]);
+            info!(
+                "ring manifest: the leader also accepts shard-ring result channels (experimental)"
+            );
+            control.spawn(serve_control_and_ring(
+                endpoint.clone(),
+                ControlSessions {
+                    local,
+                    peers: Arc::clone(&peers),
+                    options,
+                },
+                Arc::clone(&ring.channels),
+            ))
+        }
+    };
 
     tokio::pin!(shutdown);
     let running = tokio::select! {
-        started = start(endpoint, config, prepared, &peers) => started?,
+        started = start(endpoint, config, prepared, &peers, ring) => started?,
         () = &mut shutdown => {
             info!("shutdown requested during startup");
             return Ok(());
         }
     };
+    if let Prepared::Llama(llama) = prepared {
+        control.spawn(watch_workers(
+            Arc::clone(&peers),
+            llama.launch.workers.clone(),
+        ));
+    }
     let failed_verification = verify_backend_while_serving(prepared);
     running.serve_until(shutdown, failed_verification).await
+}
+
+/// The ring settings when the backend is shard with a ring manifest; `None` otherwise.
+fn ring_settings(config: &LeaderConfig, prepared: &Prepared<'_>) -> Option<RingSettings> {
+    match (prepared, &config.backend) {
+        (Prepared::Shard(manifest), BackendConfig::Shard(shard)) if manifest.is_ring() => {
+            Some(shard.ring.clone())
+        }
+        _ => None,
+    }
+}
+
+/// What every control session of the dispatching accept loop shares: the leader's hello, the
+/// peer table and the heartbeat options, exactly as [`network::serve_control_with`] gets them.
+struct ControlSessions {
+    local: Hello,
+    peers: SharedPeerTable,
+    options: ControlOptions,
+}
+
+/// The accept loop for a ring manifest: like [`network::serve_control_with`], but dispatching
+/// each connection by ALPN. Control connections get the same heartbeat-capable control session,
+/// shard-ring connections go to `channels`, and anything else is closed. Runs until the endpoint
+/// closes.
+async fn serve_control_and_ring(
+    endpoint: Endpoint,
+    control: ControlSessions,
+    channels: Arc<ResultChannels>,
+) -> anyhow::Result<()> {
+    let control = Arc::new(control);
+    let mut sessions = JoinSet::new();
+    while let Some(incoming) = endpoint.accept().await {
+        sessions.spawn(dispatch_connection(
+            incoming,
+            Arc::clone(&control),
+            Arc::clone(&channels),
+        ));
+        // Reap finished sessions so a long-running listener does not accumulate them.
+        while sessions.try_join_next().is_some() {}
+    }
+    sessions.shutdown().await;
+    Ok(())
+}
+
+/// Accepts one connection and hands it to the handler for its ALPN.
+async fn dispatch_connection(
+    incoming: Incoming,
+    control: Arc<ControlSessions>,
+    channels: Arc<ResultChannels>,
+) {
+    let connection: Connection = match incoming.await {
+        Ok(connection) => connection,
+        Err(error) => {
+            warn!(%error, "incoming connection failed");
+            return;
+        }
+    };
+    match connection.alpn() {
+        alpn if alpn == CONTROL_ALPN => {
+            let ControlSessions {
+                local,
+                peers,
+                options,
+            } = &*control;
+            network::serve_control_connection(connection, local, peers, *options).await;
+        }
+        alpn if alpn == RING_ALPN => channels.handle_connection(connection).await,
+        alpn => {
+            warn!(
+                peer = %connection.remote_id(),
+                alpn = %String::from_utf8_lossy(alpn),
+                "closing a connection on an unsupported protocol"
+            );
+            connection.close(PEER_NOT_APPROVED, UNSUPPORTED_PROTOCOL_REASON);
+        }
+    }
 }
 
 /// Runs the backend's post-run verification, if it has any, and resolves only if it fails.
@@ -336,12 +487,13 @@ async fn start(
     config: &LeaderConfig,
     prepared: &Prepared<'_>,
     peers: &SharedPeerTable,
+    ring: Option<RingSettings>,
 ) -> anyhow::Result<Running> {
     let backend = match prepared {
         Prepared::Llama(llama) => start_llama(endpoint, config, llama, peers).await?,
-        Prepared::Shard(manifest) => start_shard(endpoint, config, manifest.clone()).await?,
+        Prepared::Shard(manifest) => start_shard(endpoint, config, manifest.clone(), ring).await?,
     };
-    let (api_stop, api) = start_api(config);
+    let (api_stop, api) = start_api(config, peers);
     Ok(Running {
         api_stop,
         api,
@@ -377,9 +529,10 @@ async fn start_shard(
     endpoint: &Endpoint,
     config: &LeaderConfig,
     manifest: ShardManifest,
+    ring: Option<RingSettings>,
 ) -> anyhow::Result<Backend> {
     let upstream = upstream_addr(config.upstream_port);
-    let (stop, mut frontend) = spawn_frontend(endpoint, upstream, manifest);
+    let (stop, mut frontend) = spawn_frontend(endpoint, upstream, manifest, ring);
     if let Err(error) = shard_ready(&mut frontend, upstream, config.worker_wait).await {
         stop_server(SHARD_FRONTEND_NAME, stop, frontend).await;
         return Err(error);
@@ -388,17 +541,20 @@ async fn start_shard(
 }
 
 /// Starts the shard front end on `listen` in the background, dialling remote stages from
-/// `endpoint`; sending on (or dropping) the returned sender stops it.
+/// `endpoint` (with `ring` for a ring manifest); sending on (or dropping) the returned sender
+/// stops it.
 fn spawn_frontend(
     endpoint: &Endpoint,
     listen: SocketAddr,
     manifest: ShardManifest,
+    ring: Option<RingSettings>,
 ) -> (oneshot::Sender<()>, JoinSet<anyhow::Result<()>>) {
     let (stop, stopped) = oneshot::channel::<()>();
     let config = FrontendConfig {
         listen,
         manifest,
         endpoint: endpoint.clone(),
+        ring,
     };
     let mut frontend = JoinSet::new();
     frontend.spawn(serve_frontend(config, async move {
@@ -602,6 +758,41 @@ fn missing_workers(
         .collect())
 }
 
+/// Logs, until aborted, every planned worker that leaves the peer table (its heartbeats stopped
+/// or its connection closed) and every one that rejoins. Only logs; serving is unaffected. Every
+/// worker is assumed connected at the start, as [`wait_for_workers`] has returned. Fails only if
+/// the peer table lock is poisoned.
+async fn watch_workers(peers: SharedPeerTable, workers: Vec<RemoteWorker>) -> anyhow::Result<()> {
+    let mut missing = Vec::new();
+    let mut ticks = tokio::time::interval(PRESENCE_POLL_INTERVAL);
+    loop {
+        ticks.tick().await;
+        let now_missing = missing_workers(&peers, &workers)?;
+        let (left, rejoined) = presence_changes(&missing, &now_missing);
+        for id in left {
+            warn!(worker = %id, "planned worker left the peer table; waiting for it to reconnect");
+        }
+        for id in rejoined {
+            info!(worker = %id, "planned worker reconnected");
+        }
+        missing = now_missing;
+    }
+}
+
+/// Workers that are missing now but were not `before` (left), and the reverse (rejoined).
+fn presence_changes(
+    before: &[EndpointId],
+    now: &[EndpointId],
+) -> (Vec<EndpointId>, Vec<EndpointId>) {
+    let newly = |from: &[EndpointId], absent_in: &[EndpointId]| {
+        from.iter()
+            .filter(|id| !absent_in.contains(id))
+            .copied()
+            .collect::<Vec<_>>()
+    };
+    (newly(now, before), newly(before, now))
+}
+
 fn join_ids(ids: &[EndpointId]) -> String {
     ids.iter()
         .map(EndpointId::to_string)
@@ -703,8 +894,32 @@ async fn probe_generation(upstream: SocketAddr, server: &str) -> anyhow::Result<
         .with_context(|| format!("readiness probe: request to {server} failed"))?;
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        let body: String = body.chars().take(PROBE_ERROR_BODY_CHARS).collect();
+        let mut response = response;
+        let mut bytes = Vec::with_capacity(PROBE_ERROR_BODY_BYTES);
+        let mut truncated = response
+            .content_length()
+            .is_some_and(|length| length > PROBE_ERROR_BODY_BYTES as u64);
+        while bytes.len() < PROBE_ERROR_BODY_BYTES {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    let remaining = PROBE_ERROR_BODY_BYTES - bytes.len();
+                    let copied = remaining.min(chunk.len());
+                    bytes.extend_from_slice(&chunk[..copied]);
+                    if copied < chunk.len() || bytes.len() == PROBE_ERROR_BODY_BYTES {
+                        truncated = true;
+                        break;
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        let mut body: String = String::from_utf8_lossy(&bytes)
+            .chars()
+            .take(PROBE_ERROR_BODY_CHARS)
+            .collect();
+        if truncated {
+            body.push('…');
+        }
         bail!("readiness probe: {server} answered {status}: {body}");
     }
     let reply: Value = response
@@ -729,11 +944,15 @@ fn probe_request() -> Value {
 }
 
 /// Starts the job API in the background; sending on (or dropping) the returned sender stops it.
-fn start_api(config: &LeaderConfig) -> (oneshot::Sender<()>, JoinSet<anyhow::Result<()>>) {
+fn start_api(
+    config: &LeaderConfig,
+    peers: &SharedPeerTable,
+) -> (oneshot::Sender<()>, JoinSet<anyhow::Result<()>>) {
     let (stop, stopped) = oneshot::channel::<()>();
     let api_config = ApiConfig {
         listen: config.api_addr,
         upstream: upstream_addr(config.upstream_port),
+        peers: Arc::clone(peers),
     };
     let mut api = JoinSet::new();
     api.spawn(api::serve_api(
@@ -850,6 +1069,19 @@ mod tests {
         wait_for_workers(&table_with(&[id]), &[worker(id)], Duration::ZERO)
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn presence_changes_report_departures_and_rejoins() {
+        let stays = SecretKey::generate().public();
+        let leaves = SecretKey::generate().public();
+        let rejoins = SecretKey::generate().public();
+
+        let (left, rejoined) = presence_changes(&[stays, rejoins], &[stays, leaves]);
+
+        assert_eq!(left, [leaves]);
+        assert_eq!(rejoined, [rejoins]);
+        assert_eq!(presence_changes(&[stays], &[stays]), (vec![], vec![]));
     }
 
     #[tokio::test]

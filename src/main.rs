@@ -18,6 +18,8 @@ use llm_cluster::leader::{
 use llm_cluster::network::{self, SharedPeerTable};
 use llm_cluster::node::PeerTable;
 use llm_cluster::protocol::{CONTROL_ALPN, RPC_BRIDGE_ALPN};
+use llm_cluster::shard::ring::{RING_ALPN, RingWorkerConfig, serve_ring_worker};
+use llm_cluster::shard::ring_origin::RingSettings;
 use llm_cluster::shard::serve::{ShardServeConfig, serve_shard};
 use llm_cluster::worker::{self, WorkerConfig};
 use llm_cluster::{api, rpc_bridge};
@@ -36,8 +38,20 @@ const CLOSE_CODE_DONE: u32 = 0;
 /// QUIC close reason sent alongside [`CLOSE_CODE_DONE`].
 const CLOSE_REASON_DONE: &[u8] = b"done";
 
-/// `--heartbeat-interval` default; matches [`worker::DEFAULT_HEARTBEAT_INTERVAL`].
+/// `worker --heartbeat-interval` default; matches [`worker::DEFAULT_HEARTBEAT_INTERVAL`].
 const DEFAULT_HEARTBEAT_INTERVAL_ARG: &str = "2s";
+
+/// `leader --heartbeat-interval` default; matches [`leader::DEFAULT_HEARTBEAT_INTERVAL`].
+const DEFAULT_LEADER_HEARTBEAT_INTERVAL_ARG: &str = "2s";
+
+/// `leader --heartbeat-timeout` default: three missed beats at [`DEFAULT_HEARTBEAT_INTERVAL_ARG`]
+/// plus a second of slack; matches [`leader::DEFAULT_HEARTBEAT_TIMEOUT`].
+const DEFAULT_HEARTBEAT_TIMEOUT_ARG: &str = "7s";
+
+/// `worker --leader-heartbeat-timeout` default: three missed beats at
+/// [`DEFAULT_LEADER_HEARTBEAT_INTERVAL_ARG`] plus a second of slack; matches
+/// [`worker::DEFAULT_LEADER_HEARTBEAT_TIMEOUT`].
+const DEFAULT_LEADER_HEARTBEAT_TIMEOUT_ARG: &str = "7s";
 
 /// `--worker-wait` default; matches [`leader::DEFAULT_WORKER_WAIT`].
 const DEFAULT_WORKER_WAIT_ARG: &str = "60s";
@@ -56,6 +70,10 @@ const SECONDS_PER_MINUTE: u64 = 60;
     about = "Peer-to-peer mesh for splitting one LLM across devices"
 )]
 struct Cli {
+    /// Enable detailed MeshThing diagnostics on stderr (also works with RUST_LOG).
+    #[arg(long, global = true)]
+    debug: bool,
+
     /// File holding this node's secret key; created on first run.
     #[arg(long, global = true, default_value = "meshthing.key")]
     key: PathBuf,
@@ -70,6 +88,14 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Run the mesh core, local OpenAI API, and browser UI in this process.
+    Ui(llm_cluster::ui::Options),
+    /// Run a persistent mesh node. Send create/invite/join/decide/snapshot JSON commands on stdin.
+    Mesh {
+        /// Private identity and signed membership directory, one per running device.
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
     /// Check caller-collected memory and compute evidence for an advisory plan.
     Verify {
         /// JSON produced by the plan command.
@@ -165,6 +191,45 @@ enum Command {
         #[arg(long = "allow-peer", required = true)]
         allow_peers: Vec<String>,
     },
+    /// EXPERIMENTAL: serve one layer range as a `meshthing/shard-ring/1` worker that forwards
+    /// activations straight to the next worker. Without `--next` this worker is the terminal
+    /// and returns tokens directly to the origin.
+    ShardRingWorker {
+        /// The shard_runner binary.
+        #[arg(long)]
+        runner: PathBuf,
+        /// The exported shard file passed to the runner.
+        #[arg(long)]
+        model: PathBuf,
+        /// Half-open layer range served, as `BEGIN:END` (e.g. `28:32`).
+        #[arg(long, value_parser = parse_layer_range)]
+        range: LayerRange,
+        /// Context window passed to the runner.
+        #[arg(long)]
+        context: u32,
+        /// Layers the runner offloads to the GPU.
+        #[arg(long, default_value_t = 0)]
+        gpu_layers: u32,
+        /// Runtime buffer budget passed to the runner, in bytes.
+        #[arg(long)]
+        budget_bytes: u64,
+        /// SHA-256 the model file must have; checked at startup.
+        #[arg(long)]
+        expected_sha256: String,
+        /// Original model identity the runner must report.
+        #[arg(long)]
+        source_sha256: Option<String>,
+        /// Node ID of the only peer allowed to start sessions: the origin for the entry worker,
+        /// else the previous worker.
+        #[arg(long, value_parser = parse_node_id_arg)]
+        upstream: iroh::EndpointId,
+        /// Node ID of the origin (leader) the terminal returns results to.
+        #[arg(long, value_parser = parse_node_id_arg)]
+        origin: iroh::EndpointId,
+        /// Node ID of the next worker; omit on the terminal.
+        #[arg(long, value_parser = parse_node_id_arg)]
+        next: Option<iroh::EndpointId>,
+    },
     /// Contribute this device to a cluster: supervise ggml-rpc-server and bridge it to the leader.
     Worker {
         /// The ggml-rpc-server binary.
@@ -187,6 +252,12 @@ enum Command {
         /// Time between heartbeats to the leader, e.g. `2s` or `500ms`.
         #[arg(long, default_value = DEFAULT_HEARTBEAT_INTERVAL_ARG, value_parser = parse_duration)]
         heartbeat_interval: Duration,
+        /// Drop the control link and redial after this long without a heartbeat from the
+        /// leader, e.g. `7s`. Must exceed the leader's --heartbeat-interval. Applies only once
+        /// the leader has sent one, so leaders that never heartbeat are not timed out. `0s`
+        /// disables it.
+        #[arg(long, default_value = DEFAULT_LEADER_HEARTBEAT_TIMEOUT_ARG, value_parser = parse_duration)]
+        leader_heartbeat_timeout: Duration,
     },
     /// Run the main process: start the execution backend (llama-server from a plan, or the shard
     /// runner pipeline from a manifest) and serve the job API in front of it.
@@ -290,6 +361,15 @@ struct LeaderArgs {
     /// How long llama-server may take to load the model and answer /health (llama backend).
     #[arg(long, default_value = DEFAULT_LLAMA_READY_TIMEOUT_ARG, value_parser = parse_duration)]
     llama_ready_timeout: Duration,
+    /// Close a worker's control connection after this long without a heartbeat, e.g. `7s`;
+    /// the worker reconnects with backoff. Must exceed the workers' --heartbeat-interval.
+    /// `0s` disables the timeout.
+    #[arg(long, default_value = DEFAULT_HEARTBEAT_TIMEOUT_ARG, value_parser = parse_duration)]
+    heartbeat_timeout: Duration,
+    /// Time between the leader's own heartbeats to each connected worker, e.g. `2s`; workers
+    /// redial after their --leader-heartbeat-timeout without one. `0s` disables them.
+    #[arg(long, default_value = DEFAULT_LEADER_HEARTBEAT_INTERVAL_ARG, value_parser = parse_duration)]
+    heartbeat_interval: Duration,
 }
 
 /// `leader --backend` values.
@@ -321,6 +401,7 @@ impl LeaderArgs {
                 manifest_path: self
                     .shard_manifest
                     .context("--shard-manifest is required with --backend shard")?,
+                ring: RingSettings::default(),
             }),
         };
         Ok(LeaderConfig {
@@ -330,8 +411,15 @@ impl LeaderArgs {
             upstream_port: self.llama_port,
             api_addr: self.api,
             worker_wait: self.worker_wait,
+            heartbeat_timeout: zero_disables(self.heartbeat_timeout),
+            heartbeat_interval: zero_disables(self.heartbeat_interval),
         })
     }
+}
+
+/// Maps a heartbeat timeout or interval flag to its setting: `0s` disables it.
+fn zero_disables(duration: Duration) -> Option<Duration> {
+    (!duration.is_zero()).then_some(duration)
 }
 
 /// A flag clap already requires with `--backend llama`; checked again so no unwrap is needed.
@@ -361,9 +449,11 @@ enum HistoryCommand {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_logging();
     let cli = Cli::parse();
+    init_logging(cli.debug);
     match cli.command {
+        Command::Ui(options) => llm_cluster::ui::run(options).await,
+        Command::Mesh { state_dir } => llm_cluster::mesh::cli::run(state_dir).await,
         Command::Verify {
             plan,
             profile,
@@ -371,26 +461,37 @@ async fn main() -> anyhow::Result<()> {
             min_peers,
         } => {
             let output: llm_cluster::planning::PlanningOutput =
-                serde_json::from_str(&std::fs::read_to_string(plan)?)?;
+                llm_cluster::config::read_json_file(&plan, "plan")?;
             let request: llm_cluster::planning::PlanningRequest =
-                serde_json::from_str(&std::fs::read_to_string(profile)?)?;
-            let evidence = serde_json::from_str(&std::fs::read_to_string(evidence)?)?;
+                llm_cluster::config::read_json_file(&profile, "profile")?;
+            let evidence = llm_cluster::config::read_json_file(&evidence, "evidence")?;
             llm_cluster::planning::verify_output(&request, &output, &evidence, min_peers)
                 .map_err(|error| anyhow::anyhow!("verification failed: {error:?}"))?;
             println!("{{\"verified\":true}}");
             Ok(())
         }
         Command::Plan { profile, min_peers } => {
-            let input = std::fs::read_to_string(profile)?;
-            let request = serde_json::from_str(&input)?;
+            let request: llm_cluster::planning::PlanningRequest =
+                llm_cluster::config::read_json_file(&profile, "profile")?;
+            tracing::debug!(
+                peers = request.peers.len(),
+                links = request.links.len(),
+                min_peers,
+                "building placement plan"
+            );
             let output = llm_cluster::planning::build_plan(&request, min_peers)
                 .map_err(|error| anyhow::anyhow!("planning failed: {error:?}"))?;
+            tracing::debug!(
+                assignments = output.placement.assignments.len(),
+                predicted_decode_us = output.placement.predicted_decode_us,
+                "placement plan ready"
+            );
             println!("{}", serde_json::to_string_pretty(&output)?);
             Ok(())
         }
         Command::MeasuredPlan { profile } => {
             let request: llm_cluster::measured_placement::MeasuredRequest =
-                serde_json::from_str(&std::fs::read_to_string(profile)?)?;
+                llm_cluster::config::read_json_file(&profile, "measured profile")?;
             let output = llm_cluster::measured_placement::plan(&request)
                 .map_err(|error| anyhow::anyhow!("measured planning failed: {error:?}"))?;
             println!("{}", serde_json::to_string_pretty(&output)?);
@@ -398,9 +499,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::ValidateMeasured { plan, profile } => {
             let request: llm_cluster::measured_placement::MeasuredRequest =
-                serde_json::from_str(&std::fs::read_to_string(profile)?)?;
+                llm_cluster::config::read_json_file(&profile, "measured profile")?;
             let output: llm_cluster::measured_placement::MeasuredPlacement =
-                serde_json::from_str(&std::fs::read_to_string(plan)?)?;
+                llm_cluster::config::read_json_file(&plan, "measured plan")?;
             llm_cluster::measured_placement::validate_output(&request, &output)
                 .map_err(|error| anyhow::anyhow!("measured plan validation failed: {error:?}"))?;
             println!("{{\"validated\":true}}");
@@ -444,6 +545,35 @@ async fn main() -> anyhow::Result<()> {
             };
             shard_serve(&cli.key, config, &parse_node_ids(allow_peers)?).await
         }
+        Command::ShardRingWorker {
+            runner,
+            model,
+            range,
+            context,
+            gpu_layers,
+            budget_bytes,
+            expected_sha256,
+            source_sha256,
+            upstream,
+            origin,
+            next,
+        } => {
+            let config = RingWorkerConfig {
+                runner,
+                model,
+                begin: range.begin,
+                end: range.end,
+                context,
+                gpu_layers,
+                budget_bytes,
+                expected_sha256,
+                source_sha256,
+                upstream,
+                origin,
+                next,
+            };
+            shard_ring_worker(&cli.key, config).await
+        }
         Command::Worker {
             rpc_server,
             rpc_port,
@@ -451,6 +581,7 @@ async fn main() -> anyhow::Result<()> {
             leader,
             allow_peers,
             heartbeat_interval,
+            leader_heartbeat_timeout,
         } => {
             let config = WorkerConfig {
                 key_path: cli.key,
@@ -461,6 +592,7 @@ async fn main() -> anyhow::Result<()> {
                 leader: leader.as_deref().map(network::parse_node_id).transpose()?,
                 allowed_peers: parse_node_ids(&allow_peers)?,
                 heartbeat_interval,
+                leader_heartbeat_timeout: zero_disables(leader_heartbeat_timeout),
             };
             until_ctrl_c(worker::run_worker(config)).await
         }
@@ -513,12 +645,18 @@ fn history(command: HistoryCommand) -> anyhow::Result<()> {
 }
 
 /// Sends logs to stderr so stdout carries only intentional CLI output such as the node ID.
-fn init_logging() {
-    let filter =
+fn init_logging(debug: bool) {
+    let mut filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
+    if debug {
+        filter = filter.add_directive("llm_cluster=debug".parse().expect("constant log directive"));
+    }
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        .with_thread_ids(debug)
+        .with_file(debug)
+        .with_line_number(debug)
         .init();
 }
 
@@ -567,6 +705,13 @@ async fn shard_serve(
     run_until_ctrl_c(&endpoint, serve).await
 }
 
+async fn shard_ring_worker(key: &Path, config: RingWorkerConfig) -> anyhow::Result<()> {
+    let endpoint = network::bind_endpoint(key, vec![RING_ALPN.to_vec()]).await?;
+    print_node_id(&endpoint);
+    let serve = serve_ring_worker(endpoint.clone(), config);
+    run_until_ctrl_c(&endpoint, serve).await
+}
+
 /// A half-open layer range `[begin, end)` given as `BEGIN:END`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LayerRange {
@@ -591,6 +736,11 @@ fn parse_layer_range(text: &str) -> Result<LayerRange, String> {
 /// Parses every `--allow-peer` value, naming the first invalid one.
 fn parse_node_ids(ids: &[String]) -> anyhow::Result<Vec<iroh::EndpointId>> {
     ids.iter().map(|id| network::parse_node_id(id)).collect()
+}
+
+/// Parses a node ID flag such as `--upstream`, for clap.
+fn parse_node_id_arg(text: &str) -> Result<iroh::EndpointId, String> {
+    network::parse_node_id(text).map_err(|error| format!("{error:#}"))
 }
 
 /// Parses `--worker NODE_ID=ADDR`. The loopback check happens when the listener is bound.
@@ -745,6 +895,94 @@ mod tests {
         assert_eq!(
             parse_duration(DEFAULT_EVIDENCE_WAIT_ARG),
             Ok(evidence::DEFAULT_EVIDENCE_WAIT)
+        );
+    }
+
+    #[test]
+    fn heartbeat_timeout_defaults_on_and_zero_disables_it() {
+        let llama = [
+            "--plan",
+            "plan.json",
+            "--profile",
+            "profile.json",
+            "--llama-server",
+            "llama-server",
+        ];
+        assert_eq!(
+            parse_duration(DEFAULT_HEARTBEAT_TIMEOUT_ARG),
+            Ok(leader::DEFAULT_HEARTBEAT_TIMEOUT)
+        );
+        assert_eq!(
+            leader_config(&llama).heartbeat_timeout,
+            Some(leader::DEFAULT_HEARTBEAT_TIMEOUT)
+        );
+        let disabled = [&llama[..], &["--heartbeat-timeout", "0s"]].concat();
+        assert_eq!(leader_config(&disabled).heartbeat_timeout, None);
+        let custom = [&llama[..], &["--heartbeat-timeout", "1500ms"]].concat();
+        assert_eq!(
+            leader_config(&custom).heartbeat_timeout,
+            Some(Duration::from_millis(1500))
+        );
+    }
+
+    #[test]
+    fn leader_heartbeat_interval_defaults_on_and_zero_disables_it() {
+        let llama = [
+            "--plan",
+            "plan.json",
+            "--profile",
+            "profile.json",
+            "--llama-server",
+            "llama-server",
+        ];
+        assert_eq!(
+            parse_duration(DEFAULT_LEADER_HEARTBEAT_INTERVAL_ARG),
+            Ok(leader::DEFAULT_HEARTBEAT_INTERVAL)
+        );
+        assert_eq!(
+            leader_config(&llama).heartbeat_interval,
+            Some(leader::DEFAULT_HEARTBEAT_INTERVAL)
+        );
+        let disabled = [&llama[..], &["--heartbeat-interval", "0s"]].concat();
+        assert_eq!(leader_config(&disabled).heartbeat_interval, None);
+        let custom = [&llama[..], &["--heartbeat-interval", "500ms"]].concat();
+        assert_eq!(
+            leader_config(&custom).heartbeat_interval,
+            Some(Duration::from_millis(500))
+        );
+    }
+
+    /// The worker's `--leader-heartbeat-timeout`, as its `WorkerConfig` setting.
+    fn worker_leader_heartbeat_timeout(extra: &[&str]) -> Option<Duration> {
+        let args = [&["meshthing", "worker", "--rpc-server", "rpc"][..], extra].concat();
+        let cli = Cli::try_parse_from(args).expect("worker args");
+        let Command::Worker {
+            leader_heartbeat_timeout,
+            ..
+        } = cli.command
+        else {
+            panic!("expected worker, got {:?}", cli.command);
+        };
+        zero_disables(leader_heartbeat_timeout)
+    }
+
+    #[test]
+    fn worker_leader_heartbeat_timeout_defaults_on_and_zero_disables_it() {
+        assert_eq!(
+            parse_duration(DEFAULT_LEADER_HEARTBEAT_TIMEOUT_ARG),
+            Ok(worker::DEFAULT_LEADER_HEARTBEAT_TIMEOUT)
+        );
+        assert_eq!(
+            worker_leader_heartbeat_timeout(&[]),
+            Some(worker::DEFAULT_LEADER_HEARTBEAT_TIMEOUT)
+        );
+        assert_eq!(
+            worker_leader_heartbeat_timeout(&["--leader-heartbeat-timeout", "0s"]),
+            None
+        );
+        assert_eq!(
+            worker_leader_heartbeat_timeout(&["--leader-heartbeat-timeout", "900ms"]),
+            Some(Duration::from_millis(900))
         );
     }
 
@@ -1015,6 +1253,122 @@ mod tests {
         }
         let flag = parse_shard_serve("8:4", &["--allow-peer", "a"]);
         assert!(flag.is_err(), "a reversed --range must be refused");
+    }
+
+    /// `shard-ring-worker` over `range` with its other required flags plus `extra`.
+    fn parse_shard_ring_worker(
+        range: &str,
+        upstream: &str,
+        origin: &str,
+        extra: &[&str],
+    ) -> Result<Command, clap::Error> {
+        let required = [
+            "meshthing",
+            "shard-ring-worker",
+            "--runner",
+            "shard_runner",
+            "--model",
+            "shard.gguf",
+            "--range",
+            range,
+            "--context",
+            "512",
+            "--budget-bytes",
+            "1048576",
+            "--expected-sha256",
+            "abc123",
+            "--upstream",
+            upstream,
+            "--origin",
+            origin,
+        ];
+        Cli::try_parse_from(required.iter().chain(extra)).map(|cli| cli.command)
+    }
+
+    #[test]
+    fn shard_ring_worker_without_next_is_the_terminal() {
+        let upstream = iroh::SecretKey::generate().public();
+        let origin = iroh::SecretKey::generate().public();
+        let command =
+            parse_shard_ring_worker("28:32", &upstream.to_string(), &origin.to_string(), &[])
+                .expect("shard-ring-worker");
+        let Command::ShardRingWorker {
+            runner,
+            model,
+            range,
+            context,
+            gpu_layers,
+            budget_bytes,
+            expected_sha256,
+            source_sha256,
+            upstream: parsed_upstream,
+            origin: parsed_origin,
+            next,
+        } = command
+        else {
+            panic!("expected shard-ring-worker, got {command:?}");
+        };
+        assert_eq!(runner, PathBuf::from("shard_runner"));
+        assert_eq!(model, PathBuf::from("shard.gguf"));
+        assert_eq!(range, LayerRange { begin: 28, end: 32 });
+        assert_eq!((context, gpu_layers, budget_bytes), (512, 0, 1_048_576));
+        assert_eq!(expected_sha256, "abc123");
+        assert_eq!(source_sha256, None);
+        assert_eq!((parsed_upstream, parsed_origin), (upstream, origin));
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn shard_ring_worker_parses_optional_flags() {
+        let peer = iroh::SecretKey::generate().public().to_string();
+        let next = iroh::SecretKey::generate().public();
+        let next_text = next.to_string();
+        let extra = [
+            "--next",
+            next_text.as_str(),
+            "--gpu-layers",
+            "99",
+            "--source-sha256",
+            "def456",
+        ];
+        let command =
+            parse_shard_ring_worker("0:28", &peer, &peer, &extra).expect("shard-ring-worker");
+        let Command::ShardRingWorker {
+            gpu_layers,
+            source_sha256,
+            next: parsed_next,
+            ..
+        } = command
+        else {
+            panic!("expected shard-ring-worker, got {command:?}");
+        };
+        assert_eq!(gpu_layers, 99);
+        assert_eq!(source_sha256.as_deref(), Some("def456"));
+        assert_eq!(parsed_next, Some(next));
+    }
+
+    #[test]
+    fn shard_ring_worker_refuses_bad_peers_and_ranges() {
+        let peer = iroh::SecretKey::generate().public().to_string();
+        let cases = [
+            ("28:32", "not-a-node-id", peer.as_str(), &[][..]),
+            ("28:32", peer.as_str(), "not-a-node-id", &[][..]),
+            (
+                "28:32",
+                peer.as_str(),
+                peer.as_str(),
+                &["--next", "nope"][..],
+            ),
+            ("32:28", peer.as_str(), peer.as_str(), &[][..]),
+        ];
+        for (range, upstream, origin, extra) in cases {
+            assert!(
+                parse_shard_ring_worker(range, upstream, origin, extra).is_err(),
+                "{range} {upstream} {origin} {extra:?} should be refused"
+            );
+        }
+        let missing = Cli::try_parse_from(["meshthing", "shard-ring-worker", "--upstream", &peer]);
+        assert!(missing.is_err(), "missing required flags must be refused");
     }
 
     #[test]

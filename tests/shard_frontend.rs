@@ -45,8 +45,6 @@ const CONTEXT: u32 = 512;
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Metadata and step bound for pipelines built directly by the tests.
 const IO_TIMEOUT: Duration = Duration::from_secs(20);
-/// How long the disconnect test's client waits before hanging up.
-const CLIENT_GIVE_UP: Duration = Duration::from_millis(500);
 /// Bound on what the silent worker buffers while it waits for the leader to leave.
 const SILENT_WORKER_READ_LIMIT: usize = 1 << 20;
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -230,20 +228,22 @@ async fn serve_session(connection: Connection, stage: WorkerStage) {
 
 /// A worker that greets nobody: it takes the preface, never sends metadata, and reports when
 /// the leader's stream goes away.
-async fn start_silent_worker() -> (Endpoint, oneshot::Receiver<()>) {
+async fn start_silent_worker() -> (Endpoint, oneshot::Receiver<()>, oneshot::Receiver<()>) {
     let endpoint = bind_endpoint(vec![RPC_BRIDGE_ALPN.to_vec()], None).await;
     let accepting = endpoint.clone();
+    let (started_tx, started_rx) = oneshot::channel();
     let (closed_tx, closed_rx) = oneshot::channel();
     tokio::spawn(async move {
         let incoming = accepting.accept().await.expect("incoming connection");
         let connection = incoming.await.expect("connection");
         let (_send, mut recv) = connection.accept_bi().await.expect("stream");
         wire::read_preface(&mut recv).await.expect("client preface");
+        let _ = started_tx.send(());
         // Returns once the leader closes the stream or drops the connection.
         let _ = recv.read_to_end(SILENT_WORKER_READ_LIMIT).await;
         let _ = closed_tx.send(());
     });
-    (endpoint, closed_rx)
+    (endpoint, started_rx, closed_rx)
 }
 
 /// A running frontend and the endpoint it dials from.
@@ -274,6 +274,7 @@ impl Frontend {
             listen: addr,
             manifest,
             endpoint: endpoint.clone(),
+            ring: None,
         };
         let task = tokio::spawn(serve_frontend(config, async {
             let _ = stopped.await;
@@ -481,23 +482,34 @@ async fn runner_failure_mid_generation_fails_the_request() {
 
 #[tokio::test]
 async fn client_disconnect_drops_the_generation() {
-    let (worker, closed) = start_silent_worker().await;
+    let (worker, started, closed) = start_silent_worker().await;
     let model = fixture_model();
     let stages = vec![
         remote_stage(0, 2, &worker),
         local_stage(2, LAYERS, &model, &[]),
     ];
     let frontend = Frontend::start_with(manifest(FIXTURE_SHA, CONTEXT, stages), &[&worker]).await;
-    let request = reqwest::Client::new()
-        .post(format!("http://{}/v1/chat/completions", frontend.addr))
-        .timeout(CLIENT_GIVE_UP)
-        .json(&json!({"stream": true, "messages": [{"role": "user", "content": "hi"}]}))
-        .send()
-        .await;
+    let url = format!("http://{}/v1/chat/completions", frontend.addr);
+    let request = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(url)
+            .timeout(TEST_TIMEOUT)
+            .json(&json!({"stream": true, "messages": [{"role": "user", "content": "hi"}]}))
+            .send()
+            .await
+    });
+    // Wait for an actual remote generation before disconnecting. A short wall
+    // timeout can expire during the Iroh handshake under parallel test load.
+    timeout(TEST_TIMEOUT, started)
+        .await
+        .expect("the remote generation starts")
+        .expect("silent worker accepted the preface");
     assert!(
-        request.is_err(),
-        "the silent worker never lets the reply start"
+        !request.is_finished(),
+        "silent worker must still block metadata"
     );
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
     timeout(TEST_TIMEOUT, closed)
         .await
         .expect("the remote stream closes after the client leaves")
@@ -588,6 +600,7 @@ async fn plain_model_identity_comes_from_a_verified_artifact_hash() {
         listen: free_loopback_addr(),
         manifest: manifest(FIXTURE_SHA, CONTEXT, vec![wrong]),
         endpoint: bind_endpoint(Vec::new(), None).await,
+        ring: None,
     };
     let error = serve_frontend(config, std::future::pending())
         .await
@@ -628,6 +641,7 @@ async fn non_loopback_listen_is_refused() {
             vec![local_stage(0, LAYERS, &model, &[])],
         ),
         endpoint: bind_endpoint(Vec::new(), None).await,
+        ring: None,
     };
     let error = serve_frontend(config, std::future::pending())
         .await
@@ -706,6 +720,42 @@ async fn pipeline_drives_three_stages_with_chunked_prefill() {
     assert_eq!(pieces.concat(), fixture_reply());
     assert_eq!(generation.finish, FinishReason::Stop);
     assert_eq!(generation.completion_tokens as usize, fixture_reply().len());
+}
+
+#[tokio::test]
+async fn step_timeout_identifies_the_read_phase() {
+    let model = fixture_model();
+    let runner = example_bin("fake_shard_runner");
+    let env = BTreeMap::from([("FAKE_SHARD_DELAY_AT_STEP_MS".into(), "200".into())]);
+    let launch = LocalLaunch {
+        runner: &runner,
+        model: &model,
+        begin: 0,
+        end: LAYERS,
+        context: CONTEXT,
+        gpu_layers: 0,
+        budget_bytes: BUDGET_BYTES,
+        prompt: "hi",
+        env: &env,
+    };
+    let link = StageLink::spawn_local(&launch, IO_TIMEOUT).await.unwrap();
+    let pipeline = Pipeline::new(vec![link], &expectations(&[(0, LAYERS)], false))
+        .unwrap()
+        .with_step_timeout(Duration::from_millis(50));
+    let error = pipeline
+        .generate(
+            GenerationLimits {
+                max_tokens: 1,
+                context: CONTEXT,
+            },
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("timed out reading step 0"),
+        "{error:#}"
+    );
 }
 
 #[tokio::test]
