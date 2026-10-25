@@ -1,0 +1,2847 @@
+{
+  "status": "passed",
+  "config": {
+    "tokens": 96,
+    "source_sha256": "2de73110cb254cbf09b54b717578dadff12ef1194e7271527e68202f39ba4bfd",
+    "stages": [
+      {
+        "range": [
+          0,
+          28
+        ],
+        "device": "M2 Pro Metal",
+        "command": [
+          "/Users/stephenson.439/llama-rpc-demo/qwen38-shard-experiment/build-qwen38/bin/mesh-shard-runner",
+          "/Users/stephenson.439/llama-rpc-demo/models/Qwen3.8-27B-prefix-0-28.gguf",
+          "0",
+          "28",
+          "512",
+          "99",
+          "11811160064",
+          "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nExplain why splitting one language model across computers allows a larger model to run. Answer in two short sentences.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+          "0"
+        ]
+      },
+      {
+        "range": [
+          28,
+          32
+        ],
+        "device": "M4 iPad Metal over Iroh",
+        "port": 50370
+      },
+      {
+        "range": [
+          32,
+          64
+        ],
+        "device": "taxpayers RTX 5060 Ti CUDA over Iroh",
+        "port": 50372
+      }
+    ]
+  },
+  "steps": [
+    {
+      "stages": [
+        {
+          "step": 0,
+          "n_floats": 230400,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 779.83375,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7515766784,
+            "physical_footprint_bytes": 8464636504,
+            "physical_footprint_peak_bytes": 8464636504,
+            "compressed_bytes": 950845440
+          },
+          "wall_ms": 784.3886659975396,
+          "request_bytes": 200,
+          "response_tensor_bytes": 921600
+        },
+        {
+          "step": 0,
+          "n_floats": 230400,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 282.216209,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1375813632,
+            "physical_footprint_bytes": 1340573424,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 2208.65945899277,
+          "request_bytes": 921620,
+          "response_tensor_bytes": 921600
+        },
+        {
+          "step": 0,
+          "n_floats": 0,
+          "token": 1311,
+          "eog": false,
+          "piece_hex": "4279",
+          "compute_ms": 179.817007,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 680013824,
+          "vm": null,
+          "wall_ms": 4939.184540999122,
+          "request_bytes": 921620,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 7933.575749993906,
+      "phase": "prefill"
+    },
+    {
+      "stages": [
+        {
+          "step": 1,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 183.480458,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7511474176,
+            "physical_footprint_bytes": 8464865880,
+            "physical_footprint_peak_bytes": 8464865880,
+            "compressed_bytes": 955727872
+          },
+          "wall_ms": 191.63779199880082,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 1,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 28.705625,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377435648,
+            "physical_footprint_bytes": 1342277360,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 147.8635000094073,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 1,
+          "n_floats": 0,
+          "token": 48039,
+          "eog": false,
+          "piece_hex": "20646973747269627574696e67",
+          "compute_ms": 33.635822,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 699084800,
+          "vm": null,
+          "wall_ms": 347.6389580027899,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 687.4008750019129,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 2,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 69.275459,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7512047616,
+            "physical_footprint_bytes": 8465390168,
+            "physical_footprint_peak_bytes": 8465390168,
+            "compressed_bytes": 955482112
+          },
+          "wall_ms": 69.50324999343138,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 2,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 21.976375,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 148.00820899836253,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 2,
+          "n_floats": 0,
+          "token": 279,
+          "eog": false,
+          "piece_hex": "20746865",
+          "compute_ms": 27.054733,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 281.9096669991268,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 499.51204100216273,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 3,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 64.403458,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7508557824,
+            "physical_footprint_bytes": 8465390168,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 959004672
+          },
+          "wall_ms": 65.2664169901982,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 3,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 17.929,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 129.07779100351036,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 3,
+          "n_floats": 0,
+          "token": 1558,
+          "eog": false,
+          "piece_hex": "206d6f64656c",
+          "compute_ms": 26.057941,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 215.51708299375605,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 409.9518330040155,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 4,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 57.077084,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7508623360,
+            "physical_footprint_bytes": 8465390168,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 958939136
+          },
+          "wall_ms": 57.24979100341443,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 4,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 21.909875,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 182.94158299977425,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 4,
+          "n_floats": 0,
+          "token": 579,
+          "eog": false,
+          "piece_hex": "2773",
+          "compute_ms": 25.924673,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 213.38933300285134,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 453.633124998305,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 5,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 57.028458,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7508705280,
+            "physical_footprint_bytes": 8465390168,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 958857216
+          },
+          "wall_ms": 57.47379100648686,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 5,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 20.012042,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 296.0178749926854,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 5,
+          "n_floats": 0,
+          "token": 4868,
+          "eog": false,
+          "piece_hex": "20706172616d6574657273",
+          "compute_ms": 25.913595,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 224.31237499404233,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 577.8900830046041,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 6,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 63.563166,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7508721664,
+            "physical_footprint_bytes": 8465390168,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 958840832
+          },
+          "wall_ms": 63.8635829964187,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 6,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 19.54075,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 189.048542000819,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 6,
+          "n_floats": 0,
+          "token": 3808,
+          "eog": false,
+          "piece_hex": "206163726f7373",
+          "compute_ms": 25.99193,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 213.68024998810142,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 466.66145900962874,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 7,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 53.49975,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7508688896,
+            "physical_footprint_bytes": 8465390168,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 958873600
+          },
+          "wall_ms": 57.336750003742054,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 7,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 19.619541,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 228.93037500034552,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 7,
+          "n_floats": 0,
+          "token": 5081,
+          "eog": false,
+          "piece_hex": "206d756c7469706c65",
+          "compute_ms": 25.960035,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 207.8970830043545,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 494.2740409896942,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 8,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 61.891292,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7508623360,
+            "physical_footprint_bytes": 8465390168,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 958922752
+          },
+          "wall_ms": 62.19016699469648,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 8,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 17.073417,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 303.80108300596476,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 8,
+          "n_floats": 0,
+          "token": 12282,
+          "eog": false,
+          "piece_hex": "206d616368696e6573",
+          "compute_ms": 25.951283,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 238.1115839962149,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 604.1603749908973,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 9,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 58.585125,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7508623360,
+            "physical_footprint_bytes": 8465390168,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 958922752
+          },
+          "wall_ms": 58.7068329914473,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 9,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 17.62475,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 251.4273340057116,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 9,
+          "n_floats": 0,
+          "token": 11,
+          "eog": false,
+          "piece_hex": "2c",
+          "compute_ms": 25.95891,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 205.64508299867157,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 515.8154579985421,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 10,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 62.565542,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7508279296,
+            "physical_footprint_bytes": 8465390168,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 958889984
+          },
+          "wall_ms": 62.85020800714847,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 10,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 22.506375,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 207.2375409916276,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 10,
+          "n_floats": 0,
+          "token": 279,
+          "eog": false,
+          "piece_hex": "20746865",
+          "compute_ms": 25.942331,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 204.02975000615697,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 474.2236660094932,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 11,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 60.157417,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7508361216,
+            "physical_footprint_bytes": 8465357400,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 958775296
+          },
+          "wall_ms": 60.42229200829752,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 11,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 20.251834,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 300.0785000040196,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 11,
+          "n_floats": 0,
+          "token": 2702,
+          "eog": false,
+          "piece_hex": "20746f74616c",
+          "compute_ms": 25.94176,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 213.27416600252036,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 573.8418330001878,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 12,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 62.276375,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7508033536,
+            "physical_footprint_bytes": 8465357400,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 958889984
+          },
+          "wall_ms": 62.64133298827801,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 12,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 17.413875,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 185.80500000098255,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 12,
+          "n_floats": 0,
+          "token": 2420,
+          "eog": false,
+          "piece_hex": "20617661696c61626c65",
+          "compute_ms": 26.005152,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 209.5429999899352,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 458.05037500394974,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 13,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 56.046334,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7507984384,
+            "physical_footprint_bytes": 8465373784,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 958955520
+          },
+          "wall_ms": 56.30337499314919,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 13,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 18.9185,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 305.4398329986725,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 13,
+          "n_floats": 0,
+          "token": 4779,
+          "eog": false,
+          "piece_hex": "206d656d6f7279",
+          "compute_ms": 25.971129,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 218.41404199949466,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 580.2367079886608,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 14,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 56.4535,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7508000768,
+            "physical_footprint_bytes": 8465373784,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 958939136
+          },
+          "wall_ms": 56.79341701033991,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 14,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 19.705834,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 341.599249994033,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 14,
+          "n_floats": 0,
+          "token": 34105,
+          "eog": false,
+          "piece_hex": "2065786365656473",
+          "compute_ms": 25.960835,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 257.1687500021653,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 655.6454590026988,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 15,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 59.433041,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7508017152,
+            "physical_footprint_bytes": 8465373784,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 958922752
+          },
+          "wall_ms": 59.76975000521634,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 15,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 17.953292,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 134.64770899736322,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 15,
+          "n_floats": 0,
+          "token": 279,
+          "eog": false,
+          "piece_hex": "20746865",
+          "compute_ms": 25.94786,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 217.63574999931734,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 412.1270839968929,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 16,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 56.974417,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7507984384,
+            "physical_footprint_bytes": 8465373784,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 958939136
+          },
+          "wall_ms": 57.33666599553544,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 16,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 21.496625,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 177.25329200038686,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 16,
+          "n_floats": 0,
+          "token": 8390,
+          "eog": false,
+          "piece_hex": "206361706163697479",
+          "compute_ms": 25.90448,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 217.38258400000632,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 452.5727919972269,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 17,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 61.046458,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7507984384,
+            "physical_footprint_bytes": 8465373784,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 958939136
+          },
+          "wall_ms": 61.456791998352855,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 17,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 20.349625,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 208.93679199798498,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 17,
+          "n_floats": 0,
+          "token": 314,
+          "eog": false,
+          "piece_hex": "206f66",
+          "compute_ms": 25.959662,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 155.19062499515712,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 425.6432920083171,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 18,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 54.346042,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7508000768,
+            "physical_footprint_bytes": 8465373784,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 958922752
+          },
+          "wall_ms": 54.7495409991825,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 18,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 16.784459,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 260.2467499964405,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 18,
+          "n_floats": 0,
+          "token": 264,
+          "eog": false,
+          "piece_hex": "2061",
+          "compute_ms": 25.913312,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 210.41233399591874,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 525.4765419958858,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 19,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 58.666958,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7508017152,
+            "physical_footprint_bytes": 8465373784,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 958906368
+          },
+          "wall_ms": 58.94208300742321,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 19,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 17.866834,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 109.68454199610278,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 19,
+          "n_floats": 0,
+          "token": 3074,
+          "eog": false,
+          "piece_hex": "2073696e676c65",
+          "compute_ms": 25.991239,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 214.22754200466443,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 382.9209169925889,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 20,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 62.471417,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7507574784,
+            "physical_footprint_bytes": 8465373784,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 959135744
+          },
+          "wall_ms": 62.67279200255871,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 20,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 18.839542,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 209.77500001026783,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 20,
+          "n_floats": 0,
+          "token": 3545,
+          "eog": false,
+          "piece_hex": "20646576696365",
+          "compute_ms": 25.951416,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 187.27154200314544,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 459.7677090059733,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 21,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 53.854583,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7507656704,
+            "physical_footprint_bytes": 8465373784,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 959037440
+          },
+          "wall_ms": 54.172375006601214,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 21,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 18.942209,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 152.72033399378415,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 21,
+          "n_floats": 0,
+          "token": 13,
+          "eog": false,
+          "piece_hex": "2e",
+          "compute_ms": 25.934919,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 291.57225000381004,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 498.52308399567846,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 22,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 59.878209,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7507623936,
+            "physical_footprint_bytes": 8465373784,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 959070208
+          },
+          "wall_ms": 60.04816701170057,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 22,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 16.861083,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 152.12062500359025,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 22,
+          "n_floats": 0,
+          "token": 1061,
+          "eog": false,
+          "piece_hex": "2054686973",
+          "compute_ms": 25.944619,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 301.31645800429396,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 513.5309170000255,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 23,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 59.299708,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7507640320,
+            "physical_footprint_bytes": 8465373784,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 959053824
+          },
+          "wall_ms": 59.45429200073704,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 23,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 19.726208,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 183.82587499218062,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 23,
+          "n_floats": 0,
+          "token": 5954,
+          "eog": false,
+          "piece_hex": "20616c6c6f7773",
+          "compute_ms": 25.946002,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 270.5890829965938,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 513.9106249989709,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 24,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 61.408333,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7507705856,
+            "physical_footprint_bytes": 8465373784,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 958988288
+          },
+          "wall_ms": 61.64487500791438,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 24,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 18.895,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 236.22058299952187,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 24,
+          "n_floats": 0,
+          "token": 279,
+          "eog": false,
+          "piece_hex": "20746865",
+          "compute_ms": 25.917092,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 225.72474999469705,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 523.6585840029875,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 25,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 53.513291,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7507722240,
+            "physical_footprint_bytes": 8465373784,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 958971904
+          },
+          "wall_ms": 53.77362499712035,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 25,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 19.644166,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 158.79262500675395,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 25,
+          "n_floats": 0,
+          "token": 1785,
+          "eog": false,
+          "piece_hex": "2073797374656d",
+          "compute_ms": 25.959777,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 178.06324998673517,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 390.67866699770093,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 26,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 52.511667,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7507722240,
+            "physical_footprint_bytes": 8465373784,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 958971904
+          },
+          "wall_ms": 52.75895798695274,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 26,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 21.622792,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 249.2295000120066,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 26,
+          "n_floats": 0,
+          "token": 310,
+          "eog": false,
+          "piece_hex": "20746f",
+          "compute_ms": 25.970568,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 239.10795799747575,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 541.1547920084558,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 27,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 56.817292,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7507738624,
+            "physical_footprint_bytes": 8465373784,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 958955520
+          },
+          "wall_ms": 57.11737499223091,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 27,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 19.071542,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 313.8257499958854,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 27,
+          "n_floats": 0,
+          "token": 2706,
+          "eog": false,
+          "piece_hex": "206c6f6164",
+          "compute_ms": 25.966678,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 289.9290839995956,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 660.9574579924811,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 28,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 58.436417,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7507755008,
+            "physical_footprint_bytes": 8465373784,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 958939136
+          },
+          "wall_ms": 58.57750000723172,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 28,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 17.791166,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 273.7092500028666,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 28,
+          "n_floats": 0,
+          "token": 321,
+          "eog": false,
+          "piece_hex": "20616e64",
+          "compute_ms": 25.97031,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 394.5562499866355,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 726.893792001647,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 29,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 56.675792,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7507771392,
+            "physical_footprint_bytes": 8465373784,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 958922752
+          },
+          "wall_ms": 56.82208300277125,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 29,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 21.958833,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 264.3835829949239,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 29,
+          "n_floats": 0,
+          "token": 1817,
+          "eog": false,
+          "piece_hex": "2070726f63657373",
+          "compute_ms": 25.942296,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 313.8985830009915,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 635.1627910044044,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 30,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 58.9705,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7507787776,
+            "physical_footprint_bytes": 8465373784,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 958906368
+          },
+          "wall_ms": 59.148166998056695,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 30,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 16.913875,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 294.8411249963101,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 30,
+          "n_floats": 0,
+          "token": 264,
+          "eog": false,
+          "piece_hex": "2061",
+          "compute_ms": 25.945903,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 353.8290830038022,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 707.8558750072261,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 31,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 61.420083,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7507738624,
+            "physical_footprint_bytes": 8465373784,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 958955520
+          },
+          "wall_ms": 61.65687499742489,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 31,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 17.029917,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 324.4014160009101,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 31,
+          "n_floats": 0,
+          "token": 1558,
+          "eog": false,
+          "piece_hex": "206d6f64656c",
+          "compute_ms": 25.997402,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 298.385625006631,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 684.4881660072133,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 32,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 56.342708,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7507755008,
+            "physical_footprint_bytes": 8465373784,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 958939136
+          },
+          "wall_ms": 56.547583008068614,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 32,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 16.725125,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 319.6458750026068,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 32,
+          "n_floats": 0,
+          "token": 421,
+          "eog": false,
+          "piece_hex": "2074686174",
+          "compute_ms": 25.95361,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 242.40445799659938,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 618.6328339972533,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 33,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 56.431083,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7507771392,
+            "physical_footprint_bytes": 8465373784,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 958922752
+          },
+          "wall_ms": 56.74133299908135,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 33,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 18.861542,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 328.04962500813417,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 33,
+          "n_floats": 0,
+          "token": 369,
+          "eog": false,
+          "piece_hex": "206973",
+          "compute_ms": 25.973151,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 237.4199170008069,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 622.274416993605,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 34,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 63.406458,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7507804160,
+            "physical_footprint_bytes": 8465373784,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 958889984
+          },
+          "wall_ms": 63.659249994088896,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 34,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 20.346833,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 343.74154200486373,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 34,
+          "n_floats": 0,
+          "token": 2166,
+          "eog": false,
+          "piece_hex": "20746f6f",
+          "compute_ms": 25.965298,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 295.32887499954086,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 702.79616600601,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 35,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 60.876209,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7507787776,
+            "physical_footprint_bytes": 8465373784,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 958906368
+          },
+          "wall_ms": 61.126500004320405,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 35,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 21.430792,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 182.72550000983756,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 35,
+          "n_floats": 0,
+          "token": 3349,
+          "eog": false,
+          "piece_hex": "206c61726765",
+          "compute_ms": 25.944098,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 253.36083299771417,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 497.2700420039473,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 36,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 52.350041,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7507804160,
+            "physical_footprint_bytes": 8465373784,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 958889984
+          },
+          "wall_ms": 52.60249999992084,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 36,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 21.891667,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 134.03099999413826,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 36,
+          "n_floats": 0,
+          "token": 310,
+          "eog": false,
+          "piece_hex": "20746f",
+          "compute_ms": 26.001273,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 157.4568329961039,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 344.1566670080647,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 37,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 53.028125,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7507771392,
+            "physical_footprint_bytes": 8465373784,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 958922752
+          },
+          "wall_ms": 53.225833995384164,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 37,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 20.307083,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 207.19495900266338,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 37,
+          "n_floats": 0,
+          "token": 4786,
+          "eog": false,
+          "piece_hex": "20666974",
+          "compute_ms": 25.990826,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 156.24558299896307,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 416.7140420031501,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 38,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 53.30475,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7507771392,
+            "physical_footprint_bytes": 8465373784,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 958922752
+          },
+          "wall_ms": 53.43149999680463,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 38,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 18.837208,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 106.44750000210479,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 38,
+          "n_floats": 0,
+          "token": 383,
+          "eog": false,
+          "piece_hex": "206f6e",
+          "compute_ms": 25.966672,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 155.93883299152367,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 315.85520900262054,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 39,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 52.3775,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7507787776,
+            "physical_footprint_bytes": 8465373784,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 958906368
+          },
+          "wall_ms": 52.53441599779762,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 39,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 20.775792,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 115.08762500307057,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 39,
+          "n_floats": 0,
+          "token": 799,
+          "eog": false,
+          "piece_hex": "206f6e65",
+          "compute_ms": 25.905252,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 161.94625000935048,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 329.6055419923505,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 40,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 52.408458,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7507836928,
+            "physical_footprint_bytes": 8465373784,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 958857216
+          },
+          "wall_ms": 52.57058300776407,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 40,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 18.94525,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 157.573250005953,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 40,
+          "n_floats": 0,
+          "token": 6165,
+          "eog": false,
+          "piece_hex": "20636f6d7075746572",
+          "compute_ms": 25.965366,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 152.23020801204257,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 362.41279199020937,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 41,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 58.857208,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7507853312,
+            "physical_footprint_bytes": 8465373784,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 958840832
+          },
+          "wall_ms": 59.74120799510274,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 41,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 21.598417,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 133.67433300300036,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 41,
+          "n_floats": 0,
+          "token": 579,
+          "eog": false,
+          "piece_hex": "2773",
+          "compute_ms": 25.912424,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 170.42770799889695,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 364.04895900341216,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 42,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 56.196042,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7506345984,
+            "physical_footprint_bytes": 8465373784,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 959217664
+          },
+          "wall_ms": 56.60350000835024,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 42,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 22.035625,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 115.74641699553467,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 42,
+          "n_floats": 0,
+          "token": 11436,
+          "eog": false,
+          "piece_hex": "206861726477617265",
+          "compute_ms": 25.90664,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 158.88129199447576,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 331.2747500021942,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 43,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 57.640917,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7506444288,
+            "physical_footprint_bytes": 8465373784,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 959102976
+          },
+          "wall_ms": 57.939916994655505,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 43,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 19.227084,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 181.22020800365135,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 43,
+          "n_floats": 0,
+          "token": 13,
+          "eog": false,
+          "piece_hex": "2e",
+          "compute_ms": 25.91019,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 154.81554200232495,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 394.02758299547713,
+      "phase": "decode"
+    },
+    {
+      "stages": [
+        {
+          "step": 44,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 55.882834,
+          "observed_peak_buffer_bytes": 8253922752,
+          "max_rss_bytes": 7822835712,
+          "vm": {
+            "resident_bytes": 7506460672,
+            "physical_footprint_bytes": 8465373784,
+            "physical_footprint_peak_bytes": 8465422936,
+            "compressed_bytes": 959086592
+          },
+          "wall_ms": 56.11112499900628,
+          "request_bytes": 24,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 44,
+          "n_floats": 5120,
+          "token": -1,
+          "eog": false,
+          "piece_hex": "",
+          "compute_ms": 20.043334,
+          "observed_peak_buffer_bytes": 1175917248,
+          "max_rss_bytes": 1451819008,
+          "vm": {
+            "resident_bytes": 1377517568,
+            "physical_footprint_bytes": 1342326512,
+            "physical_footprint_peak_bytes": 1375749896,
+            "compressed_bytes": 0
+          },
+          "wall_ms": 109.44187499990221,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 20480
+        },
+        {
+          "step": 44,
+          "n_floats": 0,
+          "token": 248046,
+          "eog": true,
+          "piece_hex": "",
+          "compute_ms": 25.94538,
+          "observed_peak_buffer_bytes": 10391506464,
+          "max_rss_bytes": 706162688,
+          "vm": null,
+          "wall_ms": 246.4209580066381,
+          "request_bytes": 20500,
+          "response_tensor_bytes": 0
+        }
+      ],
+      "wall_ms": 412.01649999129586,
+      "phase": "decode"
+    }
+  ],
+  "memory_note": "Runtime buffer samples are not total process peaks or hard caps.",
+  "initialization": [
+    {
+      "protocol": 1,
+      "begin": 0,
+      "end": 28,
+      "layers": 64,
+      "embd": 5120,
+      "vocab": 248320,
+      "allocated_bytes": 8253922752,
+      "max_rss_bytes": 7822835712,
+      "vm": {
+        "resident_bytes": 7810400256,
+        "physical_footprint_bytes": 8454806008,
+        "physical_footprint_peak_bytes": 8454806008,
+        "compressed_bytes": 646103040
+      },
+      "source_sha256": "2de73110cb254cbf09b54b717578dadff12ef1194e7271527e68202f39ba4bfd",
+      "tokens": [
+        248045,
+        8678,
+        198,
+        2523,
+        513,
+        264,
+        10631,
+        17313,
+        13,
+        248046,
+        198,
+        248045,
+        846,
+        198,
+        814,
+        20139,
+        3069,
+        42898,
+        799,
+        3992,
+        1558,
+        3808,
+        17943,
+        5954,
+        264,
+        7875,
+        1558,
+        310,
+        1542,
+        13,
+        21134,
+        303,
+        1330,
+        2716,
+        22157,
+        13,
+        248046,
+        198,
+        248045,
+        74455,
+        198,
+        248068,
+        271,
+        248069,
+        271
+      ]
+    },
+    {
+      "protocol": 1,
+      "begin": 28,
+      "end": 32,
+      "layers": 64,
+      "embd": 5120,
+      "vocab": 248320,
+      "allocated_bytes": 1175917248,
+      "max_rss_bytes": 1451819008,
+      "vm": {
+        "resident_bytes": 1451819008,
+        "physical_footprint_bytes": 1375749896,
+        "physical_footprint_peak_bytes": 1375749896,
+        "compressed_bytes": 0
+      },
+      "source_sha256": "2de73110cb254cbf09b54b717578dadff12ef1194e7271527e68202f39ba4bfd",
+      "tokens": [
+        248045,
+        8678,
+        198,
+        2523,
+        513,
+        264,
+        10631,
+        17313,
+        13,
+        248046,
+        198,
+        248045,
+        846,
+        198,
+        814,
+        20139,
+        3069,
+        42898,
+        799,
+        3992,
+        1558,
+        3808,
+        17943,
+        5954,
+        264,
+        7875,
+        1558,
+        310,
+        1542,
+        13,
+        21134,
+        303,
+        1330,
+        2716,
+        22157,
+        13,
+        248046,
+        198,
+        248045,
+        74455,
+        198,
+        248068,
+        271,
+        248069,
+        271
+      ]
+    },
+    {
+      "protocol": 1,
+      "begin": 32,
+      "end": 64,
+      "layers": 64,
+      "embd": 5120,
+      "vocab": 248320,
+      "allocated_bytes": 10391506464,
+      "max_rss_bytes": 374554624,
+      "vm": null,
+      "source_sha256": "2de73110cb254cbf09b54b717578dadff12ef1194e7271527e68202f39ba4bfd",
+      "tokens": [
+        248045,
+        8678,
+        198,
+        2523,
+        513,
+        264,
+        10631,
+        17313,
+        13,
+        248046,
+        198,
+        248045,
+        846,
+        198,
+        814,
+        20139,
+        3069,
+        42898,
+        799,
+        3992,
+        1558,
+        3808,
+        17943,
+        5954,
+        264,
+        7875,
+        1558,
+        310,
+        1542,
+        13,
+        21134,
+        303,
+        1330,
+        2716,
+        22157,
+        13,
+        248046,
+        198,
+        248045,
+        74455,
+        198,
+        248068,
+        271,
+        248069,
+        271
+      ]
+    }
+  ],
+  "text": "By distributing the model's parameters across multiple machines, the total available memory exceeds the capacity of a single device. This allows the system to load and process a model that is too large to fit on one computer's hardware.",
+  "decode_steps_per_second": 1.9804024842364876
+}

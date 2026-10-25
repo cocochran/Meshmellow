@@ -1,0 +1,28 @@
+{
+  "status": "passed",
+  "fixed_route": true,
+  "automatic_placement": false,
+  "fresh_runs": [
+    {
+      "run": "01",
+      "steps": 45,
+      "decode_steps_per_second": 3.9479199526741686
+    },
+    {
+      "run": "02",
+      "steps": 45,
+      "decode_steps_per_second": 3.0484175039209256
+    }
+  ],
+  "final_build_live_run": {
+    "steps": 43,
+    "decode_steps_per_second": 3.6030185587117787,
+    "request_rejection_before_run": true
+  },
+  "source_sha256": {
+    "experiments/mobile-probe/iroh-core/src/ring.rs": "db8331e682fbecf7772819535c56a705bf8c0ad9a93d3ffb7206d0011f27bb3e",
+    "experiments/mobile-probe/iroh-core/Cargo.lock": "ecc832d5a3c7613be2c87bcb95426d94a75b69ad6feb4493bc896f8709b783a2",
+    "experiments/model-validation/ring_trial.py": "d3ef5e065b3f3dac825ee9a407482d1477d47985be1b283dd807f14a224b6768"
+  },
+  "runtime_buffers_are_not_available_memory_or_hard_caps": true
+}

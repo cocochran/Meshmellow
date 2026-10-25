@@ -1,0 +1,12 @@
+{
+  "model": "Qwen3.8-27B UD-Q5_K_M",
+  "model_sha256": "2de73110cb254cbf09b54b717578dadff12ef1194e7271527e68202f39ba4bfd",
+  "model_bytes": 19771509664,
+  "decoder_layers": 64,
+  "mtp_layers_excluded": 1,
+  "mac_runner_sha256": "3c9ec334dd5a9dc657e2b03b2a7194e93aae1435625ff94218120bd0de5774cf",
+  "runtime_patch_sha256": "0988705c7a9dd7fcf6ece7e750806e99bbbe13c99aecfe3d07a7e3b5ed86c118",
+  "prompt": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nExplain why splitting one language model across computers allows a larger model to run. Answer in two short sentences.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+  "transport": "Iroh; SSH/device tools only setup, no USB forwarding",
+  "ios_rust_staticlib_sha256": "f7efb32fc9fcec94c38065f09436d024d1eb8c731f21faf83c233c77c3e0b76e"
+}

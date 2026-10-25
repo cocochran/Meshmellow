@@ -1,0 +1,10 @@
+leader id: 7c8c4f91e3b1798c4c64a3615573700a9785a01d3036cb913bff827cb6ea6182
+2026-10-24T22:52:57.763829Z  INFO llm_cluster::rpc_bridge: rpc bridge leader listening listen=127.0.0.1:50372 worker=0555d4c7eb
+2026-10-24T22:52:57.763825Z  INFO llm_cluster::rpc_bridge: rpc bridge leader listening listen=127.0.0.1:50370 worker=976dd03458
+2026-10-24T22:53:00.767089Z  INFO endpoint{id=7c8c4f91e3}:relay-actor: iroh::socket::transports::relay::actor: home is now relay https://use1-1.relay.n0.iroh.link./, was None
+2026-10-24T22:53:02.861194Z  INFO llm_cluster::rpc_bridge: connected to rpc bridge worker worker=976dd03458 path="relay"
+2026-10-24T22:55:10.489523Z  WARN llm_cluster::rpc_bridge: rpc bridge stream failed remote=976dd03458 stream=client bidirectional stream 0 tcp_peer=127.0.0.1:64612 path="relay" tcp_to_iroh=20505 iroh_to_tcp=21613 duration_ms=127628 close_reason=iroh to tcp: Broken pipe (os error 32)
+2026-10-24T22:58:20.021352Z  INFO llm_cluster::rpc_bridge: connected to rpc bridge worker worker=976dd03458 path="relay"
+2026-10-24T22:58:26.372530Z  INFO llm_cluster::rpc_bridge: connected to rpc bridge worker worker=0555d4c7eb path="relay"
+2026-10-24T22:58:59.909962Z  INFO llm_cluster::rpc_bridge: rpc bridge stream closed remote=0555d4c7eb stream=client bidirectional stream 0 tcp_peer=127.0.0.1:64856 path="relay" tcp_to_iroh=1823625 iroh_to_tcp=8331 duration_ms=33537 close_reason="both directions finished"
+2026-10-24T22:59:00.009300Z  INFO llm_cluster::rpc_bridge: rpc bridge stream closed remote=976dd03458 stream=client bidirectional stream 0 tcp_peer=127.0.0.1:64846 path="relay" tcp_to_iroh=1823625 iroh_to_tcp=1836485 duration_ms=39987 close_reason="both directions finished"

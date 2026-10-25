@@ -1,0 +1,12 @@
+ring node id: 7c8c4f91e3b1798c4c64a3615573700a9785a01d3036cb913bff827cb6ea6182
+2026-10-24T23:50:16.567094Z  INFO endpoint{id=7c8c4f91e3}:relay-actor: iroh::socket::transports::relay::actor: home is now relay https://usw1-1.relay.n0.iroh.link./, was None
+2026-10-24T23:50:41.751468Z  INFO endpoint{id=7c8c4f91e3}:relay-actor: iroh::socket::transports::relay::actor: home is now relay https://use1-1.relay.n0.iroh.link./, was Some(RelayUrl("https://usw1-1.relay.n0.iroh.link./"))
+RING gateway job=c8462d5f0bf3445888753274b14184ea activation_to_entry=1822720 activation_received=0 final_reply_bytes=52437 steps=45
+RING gateway job=8508208a502c4de58ca467338a357757 activation_to_entry=1822720 activation_received=0 final_reply_bytes=52424 steps=45
+RING gateway job=64bcffbcfc5945ec82c0ac4191a5fd04 activation_to_entry=1925120 activation_received=0 final_reply_bytes=50154 steps=43
+ring node id: 7c8c4f91e3b1798c4c64a3615573700a9785a01d3036cb913bff827cb6ea6182
+2026-10-24T23:54:52.515441Z  INFO endpoint{id=7c8c4f91e3}:relay-actor: iroh::socket::transports::relay::actor: home is now relay https://use1-1.relay.n0.iroh.link./, was None
+ring gateway: invalid client step
+2026-10-24T23:55:37.458728Z  INFO endpoint{id=7c8c4f91e3}:relay-actor: iroh::socket::transports::relay::actor: home is now relay https://usw1-1.relay.n0.iroh.link./, was Some(RelayUrl("https://use1-1.relay.n0.iroh.link./"))
+RING gateway job=a28b6e5232824c448d27f97a153b435f activation_to_entry=1925120 activation_received=0 final_reply_bytes=49783 steps=43
+2026-10-24T23:56:02.334816Z  INFO endpoint{id=7c8c4f91e3}:relay-actor: iroh::socket::transports::relay::actor: home is now relay https://use1-1.relay.n0.iroh.link./, was Some(RelayUrl("https://usw1-1.relay.n0.iroh.link./"))
