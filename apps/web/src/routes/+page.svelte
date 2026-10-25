@@ -29,6 +29,8 @@
   let pollController: AbortController | null = null;
   let mounted = false;
   const devices = $derived(snapshot?.devices ?? []);
+  const peers = $derived(snapshot?.peers ?? []);
+  const deviceCount = $derived(snapshot?.source === 'core' ? peers.length : devices.length);
   const connected = $derived(snapshot?.connected === true && !error);
   const runHeading = $derived(!connected ? 'Runtime unavailable' : snapshot?.active ? 'A generation is running' : snapshot?.event === 'done' ? 'Latest run finished' : snapshot?.event === 'error' ? 'Latest run failed' : snapshot?.event === 'paused' ? 'Runtime is paused' : 'Runtime is idle');
   const selectedDevice = $derived(devices.find((d) => d.id === selectedId));
@@ -37,7 +39,7 @@
   const rangeLabel = (d: Device) => d.begin !== null && d.end !== null ? `${d.begin}–${d.end - 1}` : 'Unreported';
   const sizeLabel = (bytes: number | null) => bytes === null ? '—' : `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
   const iconFor = (d: Device) => /ipad|tablet/i.test(d.name) ? 'tablet' : /galaxy|pixel|phone/i.test(d.name) ? 'phone' : /cuda|rtx/i.test(d.hardware) ? 'server' : 'laptop';
-  const statusLabel = (d: Device) => !connected ? 'Unavailable' : !snapshot?.active ? 'Last observed' : d.status === 'inflight' ? 'Computing' : d.status === 'loading' ? 'Loading' : 'In current run';
+  const statusLabel = (d: Device) => !connected ? 'Unavailable' : snapshot?.source === 'core' ? 'Connected' : !snapshot?.active ? 'Last observed' : d.status === 'inflight' ? 'Computing' : d.status === 'loading' ? 'Loading' : 'In current run';
 
   async function refresh() {
     if (refreshing) return;
@@ -101,7 +103,7 @@
     <span class="eyebrow sidebar-label">WORKSPACE</span>
     <nav aria-label="Main navigation">
       {#each sections as item}
-        <button class:current={section === item.id} aria-current={section === item.id ? 'page' : undefined} onclick={() => { section = item.id; notice = ''; }}><Icon name={item.icon} /><span>{item.label}</span>{#if item.id === 'devices' && devices.length}<span class="nav-count">{devices.length}</span>{/if}</button>
+        <button class:current={section === item.id} aria-current={section === item.id ? 'page' : undefined} onclick={() => { section = item.id; notice = ''; }}><Icon name={item.icon} /><span>{item.label}</span>{#if item.id === 'devices' && deviceCount}<span class="nav-count">{deviceCount}</span>{/if}</button>
       {/each}
     </nav>
     <div class="sidebar-bottom">
@@ -124,18 +126,21 @@
           <div class="mesh-art" aria-hidden="true"><div class="orbit orbit-one"></div><div class="orbit orbit-two"></div><svg viewBox="0 0 420 260"><path d="M210 130 90 65 M210 130 330 65 M210 130 75 205 M210 130 345 200" /></svg><span class="art-node art-mac"><Icon name="laptop" size={31}/></span><span class="art-node art-phone"><Icon name="phone" size={28}/></span><span class="art-node art-tablet"><Icon name="tablet" size={29}/></span><span class="art-node art-server"><Icon name="server" size={30}/></span><span class="art-center"><Icon name="model" size={38}/></span><span class="art-caption">MANY DEVICES. ONE POSSIBILITY.</span></div>
         </section>
         <div class="metrics-grid">
-          <div class="metric"><span>Configured stages <Icon name="devices" size={18}/></span><strong>{loading ? '—' : devices.length}<small>devices</small></strong><p>Membership and liveness not yet reported</p></div>
+          <div class="metric"><span>{snapshot?.source === 'core' ? 'Connected peers' : 'Configured stages'} <Icon name="devices" size={18}/></span><strong>{loading || (snapshot?.source === 'core' && !snapshot.peerStatusAvailable) ? '—' : deviceCount}<small>{snapshot?.source === 'core' ? 'peers' : 'devices'}</small></strong><p>{snapshot?.source === 'core' ? 'Authenticated control links to this leader' : 'Membership and liveness not yet reported'}</p></div>
           <div class="metric"><span>Latest decode rate <Icon name="activity" size={18}/></span><strong>{snapshot?.decodeRate?.toFixed(2) ?? '—'}<small>steps / sec</small></strong><p>{snapshot?.active ? 'Reported by the current run' : 'Last run · not a live speed estimate'}</p></div>
           <div class="metric"><span>Observed buffers <Icon name="model" size={18}/></span><strong>{allBuffersKnown ? (observedBuffers / 1024 ** 3).toFixed(1) : '—'}<small>GiB</small></strong><p>Reported stage buffers · not total memory</p></div>
         </div>
       {/if}
 
       {#if section === 'overview' || section === 'devices'}
-        <section class="panel device-panel"><div class="panel-heading"><div><h2>Your devices <span class="count-pill">{devices.length}</span></h2><p>{snapshot?.active ? 'Stages in the current run.' : 'Configured route and last reported measurements.'}</p></div><button class="text-button" disabled={refreshing} onclick={refresh}><Icon name="refresh" size={15}/>{refreshing ? 'Refreshing…' : 'Refresh'}</button></div>
+        <section class="panel device-panel"><div class="panel-heading"><div><h2>{snapshot?.source === 'core' ? 'Connected peers' : 'Your devices'} <span class="count-pill">{snapshot?.source === 'core' && !snapshot.peerStatusAvailable ? '—' : deviceCount}</span></h2><p>{snapshot?.source === 'core' ? 'Authenticated control links currently known to this leader.' : snapshot?.active ? 'Stages in the current run.' : 'Configured route and last reported measurements.'}</p></div><button class="text-button" disabled={refreshing} onclick={refresh}><Icon name="refresh" size={15}/>{refreshing ? 'Refreshing…' : 'Refresh'}</button></div>
           {#if loading}<div class="empty-state"><span class="loading-orbit"></span><h3>Finding your mesh</h3><p>Reading the local runtime.</p></div>
-          {:else if !devices.length}<div class="empty-state"><Icon name="devices" size={35}/><h3>{snapshot?.source === 'core' && connected ? 'Device telemetry isn’t available yet' : 'Your devices will appear here'}</h3><p>{snapshot?.source === 'core' && connected ? 'This core exposes its job queue. Device and layer telemetry will follow.' : 'Connect the runtime to see its configured devices and layer assignments.'}</p></div>
+          {:else if snapshot?.source === 'core' && !snapshot.peerStatusAvailable}<div class="empty-state"><Icon name="info" size={35}/><h3>Peer status isn’t available</h3><p>This core version exposes its job queue, but not connected-peer status.</p></div>
+          {:else if snapshot?.source === 'core' && !peers.length}<div class="empty-state"><Icon name="devices" size={35}/><h3>No peers connected</h3><p>Peers appear here when they establish an authenticated control link.</p></div>
+          {:else if snapshot?.source !== 'core' && !devices.length}<div class="empty-state"><Icon name="devices" size={35}/><h3>Your devices will appear here</h3><p>Connect the runtime to see its configured devices and layer assignments.</p></div>
+          {:else if snapshot?.source === 'core'}<div class="job-list">{#each peers as peer}<div class="job-row"><code>{peer.id}</code><span class="status-pill">Connected</span><span>Heartbeat: {peer.lastHeartbeat ? new Date(peer.lastHeartbeat).toLocaleTimeString() : 'Not reported'}</span></div>{/each}</div>
           {:else}<div class="device-table"><div class="table-head"><span>DEVICE</span><span>OBSERVATION</span><span>LAYERS</span><span>BUFFERS</span><span></span></div>{#each devices as device, i}<button class="device-row" onclick={() => showDevice(device)} aria-label={`View ${device.name}`}><span class="device-name"><span class="device-icon" style={`--device-color: ${colors[i % colors.length]}`}><Icon name={iconFor(device)} size={23}/></span><span><strong>{device.name}</strong><small>{device.hardware}</small></span></span><span class="status-pill" class:computing={snapshot?.active && device.status === 'inflight'}><span class="dot"></span>{statusLabel(device)}</span><span class="mono range-cell">{rangeLabel(device)}</span><span class="mono buffer-cell">{sizeLabel(device.bufferBytes)}</span><Icon name="chevron" size={16}/></button>{/each}</div>{/if}
-          <div class="panel-footer"><Icon name="info" size={14}/><span>Devices contribute contiguous layers. A configured stage does not confirm a device is online.</span></div>
+          {#if snapshot?.source !== 'core'}<div class="panel-footer"><Icon name="info" size={14}/><span>Devices contribute contiguous layers. A configured stage does not confirm a device is online.</span></div>{/if}
         </section>
       {/if}
 

@@ -31,8 +31,15 @@ To inspect the production core's queue instead:
 - `live-demo` reads `/state`: projects topology, reported stage buffers/compute,
   run state and decode rate into a small response. Prompts, generated output,
   raw traces, commands and filesystem paths are not sent to this UI.
-- `core` reads `/jobs`: shows queue status without inventing unavailable device
-  or model telemetry. These source APIs are different; select one explicitly.
+- `core` reads `/jobs` and `/peers`: shows queue status and the authenticated
+  peers currently connected to the leader. Peer IDs do not identify hardware,
+  assigned layers, compute, memory, or trust membership. These source APIs are
+  different; select one explicitly.
+- The core peer endpoint returns a JSON array with `node_id`,
+  `connected_at_unix_ms`, and nullable `last_heartbeat_unix_ms` fields. The
+  dashboard reads both endpoints from the configured loopback origin; if an
+  older core has no `/peers` route, the queue remains available and peer status
+  is shown as unavailable.
 - Device observations are labeled as last reported when idle; configured stages
   do not prove membership or liveness. Buffers do not claim total-memory coverage.
 - Saved local display name and polling interval. Refreshes do not overlap;
@@ -42,12 +49,14 @@ To inspect the production core's queue instead:
 
 ## Core integration still required
 
-The current core does not expose management APIs for emoji invitations, trusted
-membership, benchmarking, model import/download or shared mesh settings. This UI
-does not simulate successful operations or write local records that pretend to
-enroll devices. Those capabilities need authenticated, identity-bound core
-commands/events before enabling the controls. iOS/Android native embedding is
-separate work; a responsive browser UI does not supply mobile compute lifecycle.
+The core exposes `GET /peers` for currently connected, authenticated control
+peers. It does not expose management APIs for emoji invitations, trusted
+membership, benchmarking, model import/download, layer assignments, hardware
+details, or shared mesh settings. This UI does not simulate successful
+operations or write local records that pretend to enroll devices. Those
+capabilities need authenticated, identity-bound core commands/events before
+enabling the controls. iOS/Android native embedding is separate work; a
+responsive browser UI does not supply mobile compute lifecycle.
 
 The selected runtime origin is operator-controlled at launch and limited to
 loopback HTTP. Redirects are refused, fetches time out after three seconds and
