@@ -33,6 +33,20 @@ class MeshInstrumentation : Instrumentation() {
                 val identity = initial.getString("id")
                 command("create", "name" to "Hardware validation", "device_name" to "Pixel validation")
                 val invitation = command("invite").getJSONObject("invite")
+                // Decode the real signed invitation with the bundled production ML Kit engine.
+                val ticket = invitation.getString("ticket")
+                val matrix = InvitationQR.matrix(ticket)
+                val pixels = IntArray(matrix.width * matrix.height) { i -> if (matrix[i % matrix.width, i / matrix.width]) 0xff35221d.toInt() else android.graphics.Color.WHITE }
+                val bitmap = android.graphics.Bitmap.createBitmap(pixels, matrix.width, matrix.height, android.graphics.Bitmap.Config.ARGB_8888)
+                val scanner = com.google.mlkit.vision.barcode.BarcodeScanning.getClient(
+                    com.google.mlkit.vision.barcode.BarcodeScannerOptions.Builder().setBarcodeFormats(com.google.mlkit.vision.barcode.common.Barcode.FORMAT_QR_CODE).build())
+                try {
+                    for (size in listOf(720, 360)) {
+                        val scaled = android.graphics.Bitmap.createScaledBitmap(bitmap, size, size, false)
+                        val codes = com.google.android.gms.tasks.Tasks.await(scanner.process(com.google.mlkit.vision.common.InputImage.fromBitmap(scaled, 0)), 15, java.util.concurrent.TimeUnit.SECONDS)
+                        check(codes.any { it.rawValue == ticket }) { "ML Kit could not decode the signed invitation at $size pixels" }
+                    }
+                } finally { scanner.close() }
                 sendStatus(1, Bundle().apply { putString("ticket", invitation.getString("ticket")) })
                 val deadline = System.nanoTime() + 120_000_000_000L
                 var approved = false
@@ -58,7 +72,7 @@ class MeshInstrumentation : Instrumentation() {
                 val left = command("open", "directory" to state.absolutePath)
                 check(left.isNull("mesh") && left.getJSONArray("members").length() == 0 && left.getString("id") == identity) { "Leave did not survive restart" }
                 resultCode = Activity.RESULT_OK
-                result.putString("result", "PASS: physical Android create, signed ticket, Iroh join, explicit approval, core connection, persisted identity, leave and restart")
+                result.putString("result", "PASS: ML Kit invitation decoding at 720/360px, physical Android create, signed ticket, Iroh join, explicit approval, core connection, persisted identity, leave and restart")
             } catch (failure: Throwable) {
                 result.putString("error", failure.toString())
             } finally {

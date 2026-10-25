@@ -1,6 +1,7 @@
 import SwiftUI
 import CoreImage.CIFilterBuiltins
 import AVFoundation
+import VisionKit
 
 struct CakeInvitationQR: View {
     let ticket: String
@@ -41,94 +42,85 @@ struct CakeInvitationQR: View {
 
 struct InvitationCamera: View {
     @Environment(\.dismiss) private var dismiss
+    @State private var allowed = false
     @State private var error = ""
     let onScan: (String) -> Void
     var body: some View {
         NavigationStack {
-            VStack(spacing: 20) {
-                Text("Find your slice.").font(MeshType.display(32))
-                Text("Point your camera at the cake QR on a trusted device.").foregroundStyle(MeshPalette.muted)
-                CameraPreview(onScan: { text in onScan(text); dismiss() }, onError: { error = $0 })
-                    .frame(maxHeight: 430).clipShape(RoundedRectangle(cornerRadius: 20))
-                if !error.isEmpty {
-                    Text(error).foregroundStyle(MeshPalette.warning)
-                    Button("Camera settings") { if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) } }
+            ZStack(alignment: .bottom) {
+                Color.black.ignoresSafeArea()
+                if allowed {
+                    NativeInvitationScanner(onScan: { onScan($0); dismiss() }, onError: { error = $0 })
+                        .ignoresSafeArea(edges: .bottom)
                 }
-                Text("The scan fills your invitation. You still choose Request to join.").font(.footnote).foregroundStyle(MeshPalette.muted)
-            }.padding(24).background(MeshPalette.canvas)
-                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Close camera") { dismiss() } } }
+                VStack(spacing: 12) {
+                    Text(error.isEmpty ? "Point at the invitation QR" : error).font(.headline)
+                    Text("Tap to focus · Pinch to zoom").font(.subheadline)
+                    if !error.isEmpty {
+                        Button("Camera settings") { if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) } }
+                        Button("Paste an invitation instead") { dismiss() }
+                    }
+                }.padding(24).frame(maxWidth: .infinity).background(.ultraThinMaterial)
+            }.navigationTitle("Scan invitation").navigationBarTitleDisplayMode(.inline)
+                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } } }
+        }.task {
+            guard DataScannerViewController.isSupported else { error = "This device cannot use the camera scanner. Paste an invitation instead."; return }
+            let granted = await AVCaptureDevice.requestAccess(for: .video)
+            if granted { allowed = true } else { error = "Allow camera access in Settings, or paste an invitation." }
         }
     }
 }
 
-private struct CameraPreview: UIViewControllerRepresentable {
+private struct NativeInvitationScanner: UIViewControllerRepresentable {
     let onScan: (String) -> Void
     let onError: (String) -> Void
-    func makeUIViewController(context: Context) -> InvitationCameraController { InvitationCameraController(onScan: onScan, onError: onError) }
-    func updateUIViewController(_ controller: InvitationCameraController, context: Context) {}
+    func makeCoordinator() -> Coordinator { Coordinator(onScan: onScan, onError: onError) }
+    func makeUIViewController(context: Context) -> ScannerHost {
+        let host = ScannerHost()
+        host.scanner.delegate = context.coordinator
+        host.onError = onError
+        return host
+    }
+    func updateUIViewController(_ controller: ScannerHost, context: Context) {}
+    static func dismantleUIViewController(_ controller: ScannerHost, coordinator: Coordinator) { controller.scanner.stopScanning() }
+    final class Coordinator: NSObject, DataScannerViewControllerDelegate {
+        var delivered = false
+        let onScan: (String) -> Void
+        let onError: (String) -> Void
+        init(onScan: @escaping (String) -> Void, onError: @escaping (String) -> Void) { self.onScan = onScan; self.onError = onError }
+        private func read(_ items: [RecognizedItem], scanner: DataScannerViewController) {
+            guard !delivered else { return }
+            for item in items {
+                if case .barcode(let barcode) = item, let text = barcode.payloadStringValue {
+                    guard text.utf8.count <= 4096 && text.hasPrefix("layercake://join/") else { onError("That QR is not a Layercake invitation."); continue }
+                    delivered = true; scanner.stopScanning(); onScan(text); return
+                }
+            }
+        }
+        func dataScanner(_ dataScanner: DataScannerViewController, didAdd addedItems: [RecognizedItem], allItems: [RecognizedItem]) { read(addedItems, scanner: dataScanner) }
+        func dataScanner(_ dataScanner: DataScannerViewController, didUpdate updatedItems: [RecognizedItem], allItems: [RecognizedItem]) { read(updatedItems, scanner: dataScanner) }
+        func dataScanner(_ dataScanner: DataScannerViewController, didTapOn item: RecognizedItem) { read([item], scanner: dataScanner) }
+        func dataScanner(_ dataScanner: DataScannerViewController, becameUnavailableWithError error: DataScannerViewController.ScanningUnavailable) { onError("Camera unavailable. Close and reopen the scanner, or paste your invitation.") }
+    }
 }
 
-private final class InvitationCameraController: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
-    private let session = AVCaptureSession()
-    private let queue = DispatchQueue(label: "layercake.invitation-camera")
-    private var preview: AVCaptureVideoPreviewLayer!
-    private var configured = false
+private final class ScannerHost: UIViewController {
+    let scanner = DataScannerViewController(recognizedDataTypes: [.barcode(symbologies: [.qr])], qualityLevel: .accurate, recognizesMultipleItems: false, isHighFrameRateTrackingEnabled: true, isPinchToZoomEnabled: true, isGuidanceEnabled: true, isHighlightingEnabled: true)
+    var onError: (String) -> Void = { _ in }
     private var visible = false
-    private var delivered = false
-    private let onScan: (String) -> Void
-    private let onError: (String) -> Void
-    init(onScan: @escaping (String) -> Void, onError: @escaping (String) -> Void) {
-        self.onScan = onScan; self.onError = onError
-        super.init(nibName: nil, bundle: nil)
-    }
-    required init?(coder: NSCoder) { fatalError("Not used") }
     override func viewDidLoad() {
         super.viewDidLoad()
-        view.backgroundColor = .black
-        preview = AVCaptureVideoPreviewLayer(session: session); preview.videoGravity = .resizeAspectFill
-        view.layer.addSublayer(preview)
-        NotificationCenter.default.addObserver(self, selector: #selector(suspend), name: UIApplication.willResignActiveNotification, object: nil)
+        addChild(scanner); view.addSubview(scanner.view); scanner.didMove(toParent: self)
+        NotificationCenter.default.addObserver(self, selector: #selector(pause), name: UIApplication.willResignActiveNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(resume), name: UIApplication.didBecomeActiveNotification, object: nil)
     }
-    override func viewDidLayoutSubviews() { super.viewDidLayoutSubviews(); preview.frame = view.bounds }
+    override func viewDidLayoutSubviews() { super.viewDidLayoutSubviews(); scanner.view.frame = view.bounds }
     override func viewDidAppear(_ animated: Bool) { super.viewDidAppear(animated); visible = true; resume() }
-    override func viewWillDisappear(_ animated: Bool) { visible = false; suspend(); super.viewWillDisappear(animated) }
-    deinit { NotificationCenter.default.removeObserver(self) }
-    @objc private func suspend() { queue.async { self.session.stopRunning() } }
+    override func viewWillDisappear(_ animated: Bool) { visible = false; pause(); super.viewWillDisappear(animated) }
+    @objc private func pause() { scanner.stopScanning() }
     @objc private func resume() {
-        guard visible && !delivered else { return }
-        switch AVCaptureDevice.authorizationStatus(for: .video) {
-        case .authorized: start()
-        case .notDetermined:
-            AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in DispatchQueue.main.async {
-                guard let self, self.visible else { return }
-                if granted { self.start() } else { self.onError("Allow camera access in Settings, or close this and paste an invitation.") }
-            } }
-        default: onError("Camera access is off. Enable it in Settings, or paste an invitation instead.")
-        }
+        guard visible else { return }
+        do { try scanner.startScanning() } catch { onError("Cannot start the camera. Check camera access in Settings or paste an invitation.") }
     }
-    private func start() {
-        queue.async {
-            do {
-                if !self.configured {
-                    self.session.beginConfiguration()
-                    defer { self.session.commitConfiguration() }
-                    guard let camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) ?? AVCaptureDevice.default(for: .video) else { throw AppFailure.message("No camera is available. Paste an invitation instead.") }
-                    let input = try AVCaptureDeviceInput(device: camera)
-                    let output = AVCaptureMetadataOutput()
-                    guard self.session.canAddInput(input), self.session.canAddOutput(output) else { throw AppFailure.message("Cannot open the camera. Paste an invitation instead.") }
-                    self.session.addInput(input); self.session.addOutput(output)
-                    output.setMetadataObjectsDelegate(self, queue: .main)
-                    output.metadataObjectTypes = [.qr]
-                    self.configured = true
-                }
-                self.session.startRunning()
-            } catch { DispatchQueue.main.async { self.onError(error.localizedDescription) } }
-        }
-    }
-    func metadataOutput(_ output: AVCaptureMetadataOutput, didOutput objects: [AVMetadataObject], from connection: AVCaptureConnection) {
-        guard visible && !delivered, let text = (objects.first as? AVMetadataMachineReadableCodeObject)?.stringValue else { return }
-        guard text.utf8.count <= 4096 && text.hasPrefix("layercake://join/") else { onError("That is not a Layercake invitation. Try the cake QR."); return }
-        delivered = true; suspend(); onScan(text)
-    }
+    deinit { NotificationCenter.default.removeObserver(self) }
 }

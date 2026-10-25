@@ -116,7 +116,7 @@
       {/each}
     </nav>
     <div class="sidebar-bottom">
-      <div class="sidebar-runtime"><span class="eyebrow">RUNTIME</span><strong><span class="dot" class:disconnected={!connected}></span>{loading ? 'Connecting…' : connected ? 'Connected' : 'Disconnected'}</strong><span>{snapshot?.source === 'core' ? 'Core API' : 'Stage telemetry'} · Read-only</span></div>
+      <div class="sidebar-runtime"><span class="eyebrow">RUNTIME</span><strong><span class="dot" class:disconnected={!connected}></span>{loading ? 'Connecting…' : connected ? 'Connected' : 'Disconnected'}</strong><span>Core runtime · This device</span></div>
       <div class="local-server">Layercake <span class="mono">v0.1</span></div>
     </div>
   </aside>
@@ -129,7 +129,7 @@
       <Enrollment bind:this={enrollmentPanel} onchange={value => membership = value}/>
       {#if membership?.mesh || section === 'settings'}
       {#if notice}<div class="notice" role="status">{notice}<button aria-label="Dismiss message" onclick={() => notice = ''}><Icon name="close" size={16}/></button></div>{/if}
-      {#if error || (!loading && !connected)}<div class="connection-message" role="status"><Icon name="info" /><div><strong>{error ? 'Refresh interrupted' : 'Your runtime isn’t connected'}</strong><p>{error || snapshot?.message}</p>{#if !snapshot?.endpoint}<code>./mesh-ui --runtime http://127.0.0.1:8095</code>{/if}</div><button class="text-button" disabled={refreshing} onclick={refresh}>Retry <Icon name="refresh" size={15}/></button></div>{/if}
+      {#if error || (!loading && !connected)}<div class="connection-message" role="status"><Icon name="info" /><div><strong>{error ? 'Refresh interrupted' : 'Your runtime isn’t connected'}</strong><p>{error || snapshot?.message}</p>{#if !snapshot?.endpoint}<code>./mesh-ui</code>{/if}</div><button class="text-button" disabled={refreshing} onclick={refresh}>Retry <Icon name="refresh" size={15}/></button></div>{/if}
 
       {#if section === 'overview'}
         <div class="metrics-grid">
@@ -177,7 +177,7 @@
 
       {#if section === 'settings'}
         <div class="settings-grid"><section class="panel"><div class="panel-heading"><div><h2>Workspace preferences</h2><p>Saved locally. These do not change mesh membership.</p></div></div><form class="settings-form" onsubmit={saveSettings}><label for="display-name">Workspace display name</label><input id="display-name" bind:value={displayName} maxlength="48" required /><p>A friendly name for this web interface.</p><label for="refresh-interval">Refresh interval</label><select id="refresh-interval" bind:value={refreshSeconds}><option value={2}>Every 2 seconds</option><option value={5}>Every 5 seconds</option><option value={10}>Every 10 seconds</option><option value={30}>Every 30 seconds</option></select><p>Polling pauses while this browser tab is hidden.</p><button class="button primary" disabled={saving}>{saving ? 'Saving…' : 'Save preferences'}<Icon name="check" size={16}/></button></form></section>
-        <section class="panel"><div class="panel-heading"><div><h2>Runtime connection</h2><p>Configured when you launch the web server.</p></div></div><div class="connection-details"><span class="eyebrow">LOCAL ENDPOINT</span><div class="endpoint"><code>{snapshot?.endpoint || 'Not configured'}</code>{#if snapshot?.endpoint}<button aria-label="Copy runtime address" onclick={copyEndpoint}><Icon name="copy" size={17}/></button>{/if}</div><dl><div><dt>Source</dt><dd>{snapshot?.source === 'core' ? 'Core API · job queue' : 'Live runtime · stage telemetry'}</dd></div><div><dt>Access</dt><dd>Read-only</dd></div><div><dt>Pairing</dt><dd>Signed invitations + approval</dd></div></dl><p class="fine-print">Start with <code>--runtime</code> and <code>--source</code> to choose the local connection. Worker configuration stays with the core.</p></div></section></div>
+        <section class="panel"><div class="panel-heading"><div><h2>Runtime connection</h2><p>The core runtime owns this dashboard and its API.</p></div></div><div class="connection-details"><span class="eyebrow">LOCAL ENDPOINT</span><div class="endpoint"><code>{snapshot?.endpoint || 'Not configured'}</code>{#if snapshot?.endpoint}<button aria-label="Copy runtime address" onclick={copyEndpoint}><Icon name="copy" size={17}/></button>{/if}</div><dl><div><dt>Source</dt><dd>{snapshot?.source === 'core' ? 'Core API · job queue' : 'Live runtime · stage telemetry'}</dd></div><div><dt>Access</dt><dd>This device only</dd></div><div><dt>Pairing</dt><dd>Signed invitations + approval</dd></div></dl><p class="fine-print">API URLs and inference readiness appear with each trusted device. Stopping the runtime also stops this dashboard.</p></div></section></div>
       {/if}
 
       {/if}

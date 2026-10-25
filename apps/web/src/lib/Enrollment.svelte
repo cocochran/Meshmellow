@@ -1,4 +1,5 @@
 <script lang="ts">
+  import ApiEndpoint from "./ApiEndpoint.svelte";
   import { onMount } from 'svelte';
   import CakeQR from './CakeQR.svelte';
   import QRScanner from './QRScanner.svelte';
@@ -78,7 +79,7 @@
       {#if confirmingLeave}<p>Disconnect this computer and return to Create / Join? Other devices keep their mesh and trust history.</p><button class="button secondary" onclick={() => confirmingLeave = false}>Stay in mesh</button><button class="button primary" disabled={busy} onclick={async () => { await command('leave'); confirmingLeave = false; }}>Leave mesh</button>
       {:else}<button class="button secondary" onclick={() => confirmingLeave = true}>Leave mesh</button>{/if}
     </div>
-    <div class="member-list">{#each meshState.members as member}<span><strong>{member.name}</strong><small>{member.self ? 'This computer' : member.online ? 'Connected' : 'Offline'}</small></span>{/each}</div>
+    <div class="member-list">{#each meshState.members as member}<div><strong>{member.name}</strong><small>{member.self ? 'This computer' : member.online ? 'Connected' : 'Offline'}</small><ApiEndpoint api={member.api} local={member.self}/></div>{/each}</div>
     {#each meshState.pending as request}<div class="trust-request"><h3>{request.name} wants a slice.</h3><p>Device {request.applicant.slice(0,12)} · Trusted devices can approve others.</p><button class="button primary" disabled={busy} onclick={() => command('decide', { issuer: request.issuer, request: request.id, approve: true })}>Trust device</button><button class="button secondary" disabled={busy} onclick={() => command('decide', { issuer: request.issuer, request: request.id, approve: false })}>Decline</button></div>{/each}
   </section>
 {/if}
@@ -99,5 +100,7 @@
   {#if error}<p role="alert">{error}</p>{/if}{#if note}<p role="status">{note}</p>{/if}
 </dialog>
 <style>
-.leave-mesh{padding:0 24px 24px}.leave-mesh button{margin-right:10px}.welcome{padding:36px;max-width:680px;margin:20px auto}.welcome>img{image-rendering:pixelated;display:block;margin-bottom:18px}.welcome h2{font-family:Georgia,serif;font-size:38px;margin:12px 0}.welcome p{line-height:1.6}.setup-tabs{display:flex;gap:12px;margin:24px 0;flex-wrap:wrap}form{display:grid;gap:14px}input,textarea{width:100%;box-sizing:border-box}textarea{padding:12px;border:1px solid #b9b2a8;border-radius:8px;font:13px monospace;background:var(--surface,#fff);color:inherit}form>.button{justify-self:start}.membership-panel{margin-bottom:24px}.member-list{display:flex;gap:24px;flex-wrap:wrap;padding:0 24px 24px}.member-list span{display:grid;gap:5px}.member-list small{color:#78675d}.trust-request{padding:20px;border-top:1px solid #ddd}.trust-request button{margin-right:10px}dialog .button{margin:8px 8px 8px 0}details{margin:14px 0}summary{cursor:pointer;margin:8px 0}
+.leave-mesh{padding:0 24px 24px}.leave-mesh button{margin-right:10px}.welcome{padding:36px;max-width:680px;margin:20px auto}.welcome>img{image-rendering:pixelated;display:block;margin-bottom:18px}.welcome h2{font-family:Georgia,serif;font-size:38px;margin:12px 0}.welcome p{line-height:1.6}.setup-tabs{display:flex;gap:12px;margin:24px 0;flex-wrap:wrap}form{display:grid;gap:14px}input,textarea{width:100%;box-sizing:border-box}textarea{padding:12px;border:1px solid #b9b2a8;border-radius:8px;font:13px monospace;background:var(--surface,#fff);color:inherit}form>.button{justify-self:start}.membership-panel{margin-bottom:24px}.member-list{display:flex;align-items:flex-start;gap:24px;flex-wrap:wrap;padding:0 24px 24px}.member-list>div{display:grid;align-content:start;gap:5px}.member-list small{color:#78675d}.trust-request{padding:20px;border-top:1px solid #ddd}.trust-request button{margin-right:10px}dialog .button{margin:8px 8px 8px 0}details{margin:14px 0}summary{cursor:pointer;margin:8px 0}
 </style>
+
+{#if meshState && !meshState.mesh}<ApiEndpoint api={meshState.api} local={true}/>{/if}

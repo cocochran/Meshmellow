@@ -38,6 +38,7 @@ import java.util.Date
 }
 
 @Composable fun MembershipSummary(enrollment: EnrollmentController) {
+    val context = LocalContext.current
     val state = enrollment.state
     val scope = rememberCoroutineScope()
     state?.meshName?.let { name ->
@@ -45,6 +46,26 @@ import java.util.Date
         Text("Trusted devices", fontWeight = FontWeight.SemiBold)
         state.members.forEach { member ->
             Text("${member.name}${if (member.id == state.id) " (this device)" else ""} · Trusted · ${if (member.online) "Connected" else "Disconnected"}")
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("OpenAI-compatible API", fontWeight = FontWeight.SemiBold)
+                    val api = member.api
+                    if (api != null) {
+                        Text(if (api.ready) "Ready" else "Listening · inference unavailable")
+                        androidx.compose.foundation.text.selection.SelectionContainer { Text(api.baseURL, fontFamily = FontFamily.Monospace) }
+                        Text(if (member.id == state.id) "On this device only" else "On that device only", style = MaterialTheme.typography.bodySmall)
+                        OutlinedButton(onClick = {
+                            val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                            clipboard.setPrimaryClip(android.content.ClipData.newPlainText("OpenAI API URL", api.baseURL))
+                        }) { Text("Copy API URL") }
+                        Text(api.message, style = MaterialTheme.typography.bodySmall)
+                    } else {
+                        Text(if (member.id == state.id) "API not running" else "API not reported")
+                        Text(if (member.id == state.id) "This device has not started an HTTP inference API." else "No current endpoint has been reported by this peer.", style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            }
+
         }
         Text("Devices are enrolled. Model benchmarking and compute setup are still pending.", style = MaterialTheme.typography.bodySmall)
         LeaveMeshButton(enrollment)

@@ -97,3 +97,19 @@ membership. The private device identity is retained. Other devices keep their me
 and signed trust history and see the departed device offline; this is not global
 trust revocation. A returning device can use a fresh invitation and must be approved
 again. The same core command (`{"op":"leave"}`) is used by web, iOS and Android.
+
+## Integrated desktop host and API metadata
+
+`llm-cluster ui` / the packaged `meshthing` run Node (the Rust membership type),
+HTTP handlers and static UI in one process. There is no JavaScript server or
+membership child process. `GET /api/status` reports the owning process ID and
+actual bound `/v1` base URL. The core's existing queue handles completions when
+an explicitly configured backend is healthy and the node belongs to a mesh.
+
+Trusted Sync replies have an optional `api` object: `base_url`, `scope`
+(`device_local`), `inference_ready`, and `message`. It is live metadata, never
+signed membership or stored identity. Old peers may omit it. Successful refresh
+replaces cached metadata; failed peers disappear from that refresh and leaving
+clears it. The UI never treats peer loopback addresses as remote HTTP routes.
+Only the HTTP host publishes an endpoint after binding. Native mobile membership
+alone does not announce an API it cannot serve.

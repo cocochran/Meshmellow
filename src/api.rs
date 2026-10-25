@@ -95,22 +95,8 @@ pub async fn serve_api(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     ensure_loopback(config.listen)?;
-    let client = reqwest::Client::builder()
-        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
-        .build()
-        .context("failed to build upstream http client")?;
-    let state = Arc::new(ApiState {
-        queue,
-        sink,
-        client,
-        upstream_url: format!("http://{}{CHAT_COMPLETIONS_PATH}", config.upstream),
-    });
-    let router = Router::new()
-        .route(WEB_CLIENT_PATH, get(web_client))
-        .route(CHAT_COMPLETIONS_PATH, post(chat_completions))
-        .route(JOBS_PATH, get(list_jobs))
-        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
-        .with_state(state);
+    let router =
+        queued_router(config.upstream, queue, sink)?.route(WEB_CLIENT_PATH, get(web_client));
     let listener = TcpListener::bind(config.listen)
         .await
         .with_context(|| format!("failed to bind api listener on {}", config.listen))?;
@@ -122,6 +108,30 @@ pub async fn serve_api(
         .with_graceful_shutdown(shutdown)
         .await
         .context("api server failed")
+}
+
+/// Reusable queued inference routes for the integrated desktop runtime.
+pub fn queued_router(
+    upstream: SocketAddr,
+    queue: Arc<JobQueue>,
+    sink: Arc<dyn HistorySink>,
+) -> anyhow::Result<Router> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+        .build()
+        .context("failed to build upstream http client")?;
+    let state = Arc::new(ApiState {
+        queue,
+        sink,
+        client,
+        upstream_url: format!("http://{}{CHAT_COMPLETIONS_PATH}", upstream),
+    });
+    let router = Router::new()
+        .route(CHAT_COMPLETIONS_PATH, post(chat_completions))
+        .route(JOBS_PATH, get(list_jobs))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        .with_state(state);
+    Ok(router)
 }
 
 async fn web_client() -> Html<&'static str> {

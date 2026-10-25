@@ -16,19 +16,6 @@ import urllib.request
 import zipfile
 
 
-class Runtime(BaseHTTPRequestHandler):
-    def do_GET(self):
-        body = b'{"jobs":[]}'
-        self.send_response(200)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Content-Length', str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, *args):
-        pass
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--target', required=True)
@@ -38,8 +25,6 @@ def main():
     archive = Path('dist') / (stem + ('.zip' if windows else '.tar.gz'))
     expected = archive.with_name(archive.name + '.sha256').read_text().split()[0]
     assert hashlib.sha256(archive.read_bytes()).hexdigest() == expected
-    runtime = ThreadingHTTPServer(('127.0.0.1', 0), Runtime)
-    threading.Thread(target=runtime.serve_forever, daemon=True).start()
     with tempfile.TemporaryDirectory() as directory:
         extracted = Path(directory)
         if windows:
@@ -52,15 +37,14 @@ def main():
         build = json.loads((root / 'build.json').read_text())
         for name, digest in build['executables'].items():
             assert hashlib.sha256((root / name).read_bytes()).hexdigest() == digest
-        assert (root / 'runtime/Node-LICENSE.txt').stat().st_size > 1000
+        assert not (root / 'runtime').exists()
         assert any((root / 'third-party-licenses').glob('*manrope*/LICENSE'))
         assert any((root / 'third-party-licenses').glob('*dm-sans*/LICENSE'))
         with socket.socket() as listener:
             listener.bind(('127.0.0.1', 0))
             port = listener.getsockname()[1]
         command = [str(root / ('meshthing.exe' if windows else 'meshthing')),
-                   '--no-open', '--port', str(port), '--runtime',
-                   f'http://127.0.0.1:{runtime.server_port}']
+                   '--no-open', '--port', str(port), '--state-dir', str(extracted / 'state')]
         with (extracted / 'launcher.log').open('w+') as log:
             process = subprocess.Popen(command, cwd=directory, env={**os.environ, 'PATH': ''},
                                        stdout=log, stderr=subprocess.STDOUT)
@@ -71,6 +55,11 @@ def main():
                     try:
                         with urllib.request.urlopen(f'http://127.0.0.1:{port}/api/mesh', timeout=1) as response:
                             assert response.status == 200
+                        with urllib.request.urlopen(f'http://127.0.0.1:{port}/api/status', timeout=2) as response:
+                            status = json.load(response)
+                            assert status['pid'] == process.pid
+                            assert status['api']['base_url'] == f'http://127.0.0.1:{port}/v1'
+                            assert not status['api']['inference_ready']
                         break
                     except OSError:
                         time.sleep(0.1)
@@ -99,8 +88,6 @@ def main():
                 if process.poll() is None:
                     process.kill()
                     process.wait()
-    runtime.shutdown()
-    runtime.server_close()
     print('PASS: archive checksums, standalone browser server, API response, and process cleanup')
 
 

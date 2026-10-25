@@ -13,7 +13,7 @@ test('fresh web mesh creates signed invites, approves a real peer, and persists 
   const binary = resolve('../../target/debug/llm-cluster');
   let web, peer;
   const start = async () => {
-    web = spawn(process.execPath, ['scripts/serve.mjs', '--port', '3227'], { env: { ...process.env, MESHTHING_RUNTIME_URL: '', MESHTHING_UI_STATE_DIR: join(directory, 'ui'), LAYERCAKE_MESH_STATE_DIR: join(directory, 'web'), LAYERCAKE_CORE_BIN: binary }, stdio: ['ignore','pipe','pipe'] });
+    web = spawn(binary, ['ui','--no-open','--assets',resolve('build'),'--port','3227','--state-dir',join(directory,'web')], { stdio: ['ignore','pipe','pipe'] });
     await new Promise((ok, fail) => {
       const timer = setTimeout(() => fail(new Error('web startup timed out')), 10000);
       web.stdout.on('data', data => { if (data.toString().includes(origin)) { clearTimeout(timer); ok(); } });
@@ -50,6 +50,10 @@ test('fresh web mesh creates signed invites, approves a real peer, and persists 
     await post({op:'decide',issuer:pending.issuer,request:pending.id,approve:true});
     await command({op:'refresh'});
     assert.equal((await command({op:'snapshot'})).members.length,2);
+    await command({op:'refresh'});
+    const peerSnapshot = await command({op:'snapshot'});
+    assert.equal(peerSnapshot.members.find(m => m.id === created.id).api.base_url, origin+'/v1');
+    assert.equal(peerSnapshot.members.find(m => m.id === created.id).api.inference_ready, false);
     await stop(); await start();
     const restored = await get();
     assert.equal(restored.id,created.id); assert.equal(restored.members.length,2);

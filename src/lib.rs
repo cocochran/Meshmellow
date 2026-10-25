@@ -20,3 +20,5 @@ pub mod rpc_plan;
 pub mod shard;
 pub mod verification;
 pub mod worker;
+
+pub mod ui;

@@ -29,8 +29,6 @@ import com.google.zxing.BarcodeFormat
 import com.google.zxing.EncodeHintType
 import com.google.zxing.qrcode.QRCodeWriter
 import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
-import com.journeyapps.barcodescanner.ScanContract
-import com.journeyapps.barcodescanner.ScanOptions
 
 object InvitationQR {
     fun accepts(text: String) = text.toByteArray(Charsets.UTF_8).size <= 4096 && text.startsWith("layercake://join/")
@@ -65,16 +63,12 @@ object InvitationQR {
     val context = LocalContext.current
     var message by rememberSaveable { mutableStateOf("") }
     var denied by rememberSaveable { mutableStateOf(false) }
-    val scanner = rememberLauncherForActivityResult(ScanContract()) { result ->
-        result.contents?.let { text ->
-            if (InvitationQR.accepts(text)) { message = "Invitation scanned. Request to join when you’re ready."; onScan(text) }
-            else message = "That is not a Layercake invitation. Try the cake QR."
-        }
-    }
-    fun launchScan() {
-        message = ""
-        scanner.launch(ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE).setPrompt("Find your slice · Scan the cake QR").setBeepEnabled(false).setOrientationLocked(false))
-    }
+    var scanning by rememberSaveable { mutableStateOf(false) }
+    fun launchScan() { message = ""; scanning = true }
+    if (scanning) InvitationScanner(
+        onScan = { text -> scanning = false; message = "Invitation scanned. Request to join when you’re ready."; onScan(text) },
+        onClose = { scanning = false }
+    )
     val permission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         denied = !granted
         if (granted) launchScan() else message = "Camera access is off. Enable it in Settings, or paste an invitation below."

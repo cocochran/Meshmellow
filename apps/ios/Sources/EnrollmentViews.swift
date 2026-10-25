@@ -35,6 +35,17 @@ struct MembershipSummary: View {
         let isSelf = member.id == enrollment.state?.id
         return DisclosureGroup {
             VStack(alignment: .leading, spacing: 8) {
+                Eyebrow(text: "OpenAI-compatible API")
+                if let api = member.api {
+                    Text(api.inference_ready ? "Ready" : "Listening · inference unavailable").font(.subheadline)
+                    Text(api.base_url).font(.caption.monospaced()).textSelection(.enabled)
+                    Text(isSelf ? "On this device only" : "On that device only").font(.caption).foregroundStyle(MeshPalette.muted)
+                    Button("Copy API URL") { UIPasteboard.general.string = api.base_url }
+                    Text(api.message).font(.caption).foregroundStyle(MeshPalette.muted)
+                } else {
+                    Text(isSelf ? "API not running" : "API not reported").font(.subheadline)
+                    Text(isSelf ? "This device has not started an HTTP inference API." : "No current endpoint has been reported by this peer.").font(.caption).foregroundStyle(MeshPalette.muted)
+                }
                 Eyebrow(text: "Device identity")
                 Text(member.id).font(.caption.monospaced()).textSelection(.enabled)
                 Text("Trust is saved. Connected means the core is exchanging heartbeats; compute readiness is separate.").font(.caption).foregroundStyle(MeshPalette.muted)
@@ -128,7 +139,7 @@ struct PairingView: View {
                     ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() }.font(.subheadline.weight(.semibold)) }
                 }
                 .overlay { if enrollment.busy { ProgressView().padding(20).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16)) } }
-        }.sheet(isPresented: $scanning) { InvitationCamera { code = $0 } }
+        }.fullScreenCover(isPresented: $scanning) { InvitationCamera { code = $0 } }
         .presentationDetents([.large]).presentationDragIndicator(.visible).presentationCornerRadius(28)
             .task {
                 if enrollment.state?.mesh != nil && enrollment.state?.invite == nil && enrollment.state?.pending.isEmpty == true {

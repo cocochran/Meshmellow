@@ -23,8 +23,9 @@ enum BonjourTXT {
 }
 
 struct EnrollmentState: Decodable {
+    struct API: Decodable { let base_url: String; let scope: String; let inference_ready: Bool; let message: String }
     struct Mesh: Decodable { let id: String; let name: String }
-    struct Member: Decodable, Identifiable { let id: String; let name: String; let online: Bool? }
+    struct Member: Decodable, Identifiable { let id: String; let name: String; let online: Bool?; let api: API? }
     struct Invitation: Decodable {
         let id: String; let expires: Double; let ticket: String
     }
