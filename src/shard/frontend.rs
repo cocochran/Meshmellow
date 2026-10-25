@@ -19,24 +19,14 @@
 //! the context). A failure mid-stream sends an SSE `error` event and ends without `[DONE]`,
 //! which makes the job API fail the job without committing history. A client that disconnects
 //! drops its generation, which kills the local runners and closes the remote streams.
-//!
-//! Failover: each stage is served by the first of its locations (the manifest's primary, then
-//! its `fallbacks`) that opens, starting from the one that last worked. When a stage with
-//! another location left stops answering mid-generation, its location is set aside for the
-//! rest of the request and the generation restarts from the prompt on fresh links. Greedy
-//! decoding is deterministic, so the restart regenerates the same text: a streamed reply
-//! resumes where it stopped instead of repeating itself, and a restart whose text differs from
-//! what was already sent fails the request rather than splicing two answers together.
 
-use std::collections::HashSet;
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, anyhow, bail};
+use anyhow::{Context, bail};
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
@@ -49,8 +39,8 @@ use futures_util::{StreamExt, stream};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::mpsc::{Receiver, Sender, channel};
+use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -58,8 +48,8 @@ use crate::api::CHAT_COMPLETIONS_PATH;
 use crate::shard::manifest::{ShardManifest, StageLocation, StageSpec};
 use crate::shard::manifest::{same_sha256, sha256_file};
 use crate::shard::pipeline::{
-    FinishReason, Generation, GenerationLimits, LocalLaunch, METADATA_TIMEOUT, Pipeline,
-    PromptTooLong, StageExpectation, StageFault, StageIdentity, StageLink,
+    FinishReason, Generation, GenerationCancelled, GenerationLimits, LocalLaunch, METADATA_TIMEOUT,
+    Pipeline, PromptTooLong, StageExpectation, StageIdentity, StageLink,
 };
 use crate::shard::ring_origin::{RingLink, RingPlan, RingSettings};
 use crate::shard::template::{ChatMessage, ChatRenderer};
@@ -163,12 +153,7 @@ async fn serve_frontend_inner(
     let renderer = ChatRenderer::load(&config.manifest.chat_template)?;
     verify_artifacts(&config.manifest).await?;
     let state = Arc::new(FrontendState {
-        preferred: config
-            .manifest
-            .stages
-            .iter()
-            .map(|_| AtomicUsize::new(0))
-            .collect(),
+        expectations: stage_expectations(&config.manifest),
         manifest: config.manifest,
         endpoint: config.endpoint,
         ring,
@@ -216,15 +201,32 @@ struct FrontendState {
     automatic: Option<crate::mesh::Node>,
     manifest: ShardManifest,
     endpoint: iroh::Endpoint,
-    /// Per stage, the location (an index into [`StageSpec::candidates`]) tried first: the last
-    /// one that opened, so later requests skip a node that already failed over.
-    preferred: Vec<AtomicUsize>,
+    expectations: Vec<StageExpectation>,
+    /// Set for a ring manifest only.
+    ring: Option<RingRuntime>,
+    /// The manifest's chat template, verified and compiled at startup.
+    renderer: ChatRenderer,
     /// Held for the whole of a generation, so only one runs at a time.
     generation_lock: Arc<Mutex<()>>,
 }
 
-/// One location of one stage: `(stage index, index into StageSpec::candidates)`.
-type CandidateId = (usize, usize);
+/// The ring runtime of a ring manifest, which needs `settings`; `None` for a pipeline manifest.
+fn ring_runtime(
+    manifest: &ShardManifest,
+    settings: Option<RingSettings>,
+) -> anyhow::Result<Option<RingRuntime>> {
+    if !manifest.is_ring() {
+        return Ok(None);
+    }
+    let settings = settings.context(
+        "a ring manifest (\"execution\": \"ring\") needs the leader's ring settings: \
+         FrontendConfig::ring must carry the result-channel registry its endpoint feeds",
+    )?;
+    Ok(Some(RingRuntime {
+        plan: RingPlan::from_manifest(manifest)?,
+        settings,
+    }))
+}
 
 fn ensure_loopback(listen: SocketAddr) -> anyhow::Result<()> {
     if !listen.ip().to_canonical().is_loopback() {
@@ -233,67 +235,55 @@ fn ensure_loopback(listen: SocketAddr) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Hashes each local stage file (fallbacks included) that has an `artifact_sha256` and checks
-/// it matches.
+/// Hashes each local stage file that has an `artifact_sha256` and checks it matches.
 async fn verify_artifacts(manifest: &ShardManifest) -> anyhow::Result<()> {
     for stage in &manifest.stages {
-        for location in stage.candidates() {
-            verify_artifact(stage, location).await?;
+        let StageLocation::Local {
+            model,
+            artifact_sha256: Some(expected),
+            ..
+        } = &stage.location
+        else {
+            continue;
+        };
+        let path = model.clone();
+        let actual = tokio::task::spawn_blocking(move || sha256_file(&path))
+            .await
+            .context("artifact hashing task failed")??;
+        if !same_sha256(&actual, expected) {
+            bail!(
+                "local stage {}..{} file {} has SHA-256 {actual}, but artifact_sha256 is {expected}",
+                stage.begin,
+                stage.end,
+                model.display()
+            );
         }
+        info!(stage = %format!("{}..{}", stage.begin, stage.end), "verified artifact_sha256");
     }
     Ok(())
 }
 
-async fn verify_artifact(stage: &StageSpec, location: &StageLocation) -> anyhow::Result<()> {
-    let StageLocation::Local {
-        model,
-        artifact_sha256: Some(expected),
-        ..
-    } = location
-    else {
-        return Ok(());
-    };
-    let path = model.clone();
-    let actual = tokio::task::spawn_blocking(move || sha256_file(&path))
-        .await
-        .context("artifact hashing task failed")??;
-    if !same_sha256(&actual, expected) {
-        bail!(
-            "local stage {} file {} has SHA-256 {actual}, but artifact_sha256 is {expected}",
-            stage_range(stage),
-            model.display()
-        );
-    }
-    info!(stage = %stage_range(stage), "verified artifact_sha256");
-    Ok(())
-}
-
-/// What a stage's metadata must show when `location` serves it. A configured artifact hash
-/// counts as verified because [`verify_artifacts`] has already checked it.
-fn stage_expectation(
-    manifest: &ShardManifest,
-    stage: &StageSpec,
-    location: &StageLocation,
-) -> StageExpectation {
-    StageExpectation {
-        begin: stage.begin,
-        end: stage.end,
-        layers: manifest.layers,
-        model_sha256: manifest.model_sha256.clone(),
-        identity: match location {
-            StageLocation::Remote { .. } => StageIdentity::Remote,
-            StageLocation::Local {
-                artifact_sha256, ..
-            } => StageIdentity::Local {
-                artifact_verified: artifact_sha256.is_some(),
+/// What each stage's metadata must show. Configured artifact hashes count as verified because
+/// [`verify_artifacts`] has already checked them.
+fn stage_expectations(manifest: &ShardManifest) -> Vec<StageExpectation> {
+    manifest
+        .stages
+        .iter()
+        .map(|stage| StageExpectation {
+            begin: stage.begin,
+            end: stage.end,
+            layers: manifest.layers,
+            model_sha256: manifest.model_sha256.clone(),
+            identity: match &stage.location {
+                StageLocation::Remote { .. } => StageIdentity::Remote,
+                StageLocation::Local {
+                    artifact_sha256, ..
+                } => StageIdentity::Local {
+                    artifact_verified: artifact_sha256.is_some(),
+                },
             },
-        },
-    }
-}
-
-/// `begin..end`, for logs and errors.
-fn stage_range(stage: &StageSpec) -> String {
-    format!("{}..{}", stage.begin, stage.end)
+        })
+        .collect()
 }
 
 async fn health() -> Json<Value> {
@@ -503,14 +493,18 @@ async fn chat_completions(State(state): State<Arc<FrontendState>>, body: Bytes) 
         max_tokens = request.max_tokens,
         "shard generation requested"
     );
-    let (events_tx, mut events) = unbounded_channel();
-    let task = GenerationTask(tokio::spawn(run_generation(
-        Arc::clone(&state),
-        request.prompt,
-        request.max_tokens,
-        Delivered::new(request.stream),
-        events_tx,
-    )));
+    let (events_tx, mut events) = channel(GENERATION_EVENT_BUFFER);
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    let task = GenerationTask {
+        cancel: Some(cancel_tx),
+        _join: tokio::spawn(run_generation(
+            Arc::clone(&state),
+            request.prompt,
+            request.max_tokens,
+            events_tx,
+            cancel_rx,
+        )),
+    };
     match events.recv().await {
         Some(Event::Started) => {}
         Some(Event::Failed(failure)) => return failure_response(&failure),
@@ -530,11 +524,51 @@ async fn run_generation(
     state: Arc<FrontendState>,
     prompt: String,
     max_tokens: u32,
-    delivered: Delivered,
-    events: UnboundedSender<Event>,
+    events: Sender<Event>,
+    mut cancel: oneshot::Receiver<()>,
 ) {
-    let _turn = Arc::clone(&state.generation_lock).lock_owned().await;
-    let event = match generate(&state, &prompt, max_tokens, delivered, &events).await {
+    let queued_at = std::time::Instant::now();
+    let _turn = tokio::select! {
+        biased;
+        _ = &mut cancel => return,
+        turn = Arc::clone(&state.generation_lock).lock_owned() => turn,
+    };
+    info!(
+        queue_wait_ms = queued_at.elapsed().as_millis(),
+        "shard generation acquired slot"
+    );
+    let prepared = if let Some(node) = &state.automatic {
+        tokio::select! {
+            _ = &mut cancel => return,
+            result = node.prepare_compute_ring(&state.manifest) => result.and_then(|manifest| {
+                Ok(Arc::new(FrontendState {
+                    expectations: stage_expectations(&manifest),
+                    ring: ring_runtime(&manifest, Some(node.inference_ring_settings()))?,
+                    renderer: ChatRenderer::load(&manifest.chat_template)?,
+                    manifest, endpoint: state.endpoint.clone(),
+                    generation_lock: state.generation_lock.clone(), automatic: None,
+                }))
+            }),
+        }
+    } else {
+        Ok(state.clone())
+    };
+    let state = match prepared {
+        Ok(state) => state,
+        Err(error) => {
+            let _ = events
+                .send(Event::Failed(Failure::from_error(&error)))
+                .await;
+            return;
+        }
+    };
+    if let Some(ring) = &state.ring {
+        ring.settings
+            .channels
+            .execution
+            .begin(&state.manifest, &state.endpoint.id().to_string());
+    }
+    let event = match generate(&state, &prompt, max_tokens, &events, cancel).await {
         Ok(generation) => {
             if let Some(ring) = &state.ring {
                 ring.settings.channels.execution.finish("done");
@@ -565,171 +599,46 @@ async fn run_generation(
     let _ = events.send(event).await;
 }
 
-/// Runs the generation, restarting it from the prompt whenever a stage with another location
-/// left stops answering; the failed location sits out the rest of the request. Any other
-/// failure, or a stage with no location left, ends the request.
 async fn generate(
     state: &FrontendState,
     prompt: &str,
     max_tokens: u32,
-    mut delivered: Delivered,
-    events: &UnboundedSender<Event>,
+    events: &Sender<Event>,
+    mut cancel: oneshot::Receiver<()>,
 ) -> anyhow::Result<Generation> {
-    let mut failed = HashSet::new();
-    let mut started = false;
-    loop {
-        let stages = try_join_all(
-            state
-                .manifest
-                .stages
-                .iter()
-                .enumerate()
-                .map(|(index, stage)| open_stage(state, index, stage, prompt, &failed)),
-        )
-        .await?;
-        let mut chosen = Vec::with_capacity(stages.len());
-        let mut links = Vec::with_capacity(stages.len());
-        let mut expectations = Vec::with_capacity(stages.len());
-        for (index, stage) in stages.into_iter().enumerate() {
-            failed.extend(
-                stage
-                    .unreachable
-                    .into_iter()
-                    .map(|candidate| (index, candidate)),
-            );
-            chosen.push((index, stage.candidate));
-            links.push(stage.link);
-            expectations.push(stage.expectation);
-        }
-        let pipeline = Pipeline::new(links, &expectations)?;
-        let context = state.manifest.context;
-        // Checked before `Started` so an oversized prompt is still answered with a 400.
-        pipeline.ensure_prompt_fits(context)?;
-        if !started {
-            // A send fails only once the handler is gone, and then the task is being aborted.
-            let _ = events.send(Event::Started);
-            started = true;
-        }
-        let limits = GenerationLimits {
-            max_tokens,
-            context,
-        };
-        let error = match run_pipeline(pipeline, limits, &mut delivered, events).await {
-            Ok(generation) => return Ok(generation),
-            Err(error) => error,
-        };
-        let Some(lost) = failover_target(state, &error, &chosen, &failed) else {
-            return Err(error);
-        };
-        let stage = &state.manifest.stages[lost.0];
-        warn!(
-            stage = %stage_range(stage),
-            error = %format!("{error:#}"),
-            "stage failed mid-generation; restarting the prompt on its next location"
-        );
-        failed.insert(lost);
-        delivered.restart();
-    }
-}
-
-/// The location to set aside when `error` came from a stage that has another location left;
-/// `None` when the generation cannot be restarted.
-fn failover_target(
-    state: &FrontendState,
-    error: &anyhow::Error,
-    chosen: &[CandidateId],
-    failed: &HashSet<CandidateId>,
-) -> Option<CandidateId> {
-    let fault = error.downcast_ref::<StageFault>()?;
-    let lost = *chosen.get(fault.index)?;
-    let (stage, _) = lost;
-    let remaining = (0..state.manifest.stages[stage].candidates().count())
-        .map(|candidate| (stage, candidate))
-        .filter(|&candidate| candidate != lost && !failed.contains(&candidate))
-        .count();
-    (remaining > 0).then_some(lost)
-}
-
-/// Runs one attempt, sending the client only text beyond what it already has. Stops early if
-/// the text differs from what a previous attempt sent.
-async fn run_pipeline(
-    pipeline: Pipeline,
-    limits: GenerationLimits,
-    delivered: &mut Delivered,
-    events: &UnboundedSender<Event>,
-) -> anyhow::Result<Generation> {
-    let diverged = Notify::new();
-    let on_text = |text: &str| match delivered.accept(text) {
-        Ok(fresh) if !fresh.is_empty() => {
-            let _ = events.send(Event::Text(fresh.to_owned()));
-        }
-        Ok(_) => {}
-        Err(Diverged) => diverged.notify_one(),
-    };
-    // Dropping the pipeline on divergence kills its runners and closes its streams.
-    let generation = tokio::select! {
-        result = pipeline.generate(limits, on_text) => result?,
-        () = diverged.notified() => return Err(Diverged.into()),
-    };
-    delivered.finish()?;
-    Ok(generation)
-}
-
-/// A stage's link from the first of its locations that opens.
-struct OpenedStage {
-    /// Index into [`StageSpec::candidates`] of the location serving the stage.
-    candidate: usize,
-    link: StageLink,
-    expectation: StageExpectation,
-    /// Locations tried first that failed to open.
-    unreachable: Vec<usize>,
-}
-
-/// Opens the stage on its first location that works, starting with the preferred one and
-/// skipping any that already `failed` this request.
-async fn open_stage(
-    state: &FrontendState,
-    index: usize,
-    stage: &StageSpec,
-    prompt: &str,
-    failed: &HashSet<CandidateId>,
-) -> anyhow::Result<OpenedStage> {
-    let locations: Vec<&StageLocation> = stage.candidates().collect();
-    let preferred = state.preferred[index].load(Ordering::Relaxed);
-    let order = (0..locations.len())
-        .map(|offset| (preferred + offset) % locations.len())
-        .filter(|&candidate| !failed.contains(&(index, candidate)));
-    let mut unreachable = Vec::new();
-    let mut last_error = None;
-    for candidate in order {
-        let location = locations[candidate];
-        match open_link(state, stage, location, prompt).await {
-            Ok(link) => {
-                state.preferred[index].store(candidate, Ordering::Relaxed);
-                return Ok(OpenedStage {
-                    candidate,
-                    link,
-                    expectation: stage_expectation(&state.manifest, stage, location),
-                    unreachable,
-                });
+    let opened = tokio::select! {
+        biased;
+        _ = &mut cancel => return Err(GenerationCancelled.into()),
+        pipeline = async {
+            match &state.ring {
+                None => open_pipeline(state, prompt).await,
+                Some(ring) => open_ring_pipeline(state, ring, prompt).await,
             }
-            Err(error) if locations.len() == 1 => return Err(error),
-            Err(error) => {
-                warn!(
-                    stage = %stage_range(stage),
-                    error = %format!("{error:#}"),
-                    "stage location unavailable; trying the next"
-                );
-                unreachable.push(candidate);
-                last_error = Some(error);
-            }
-        }
+        } => pipeline,
+    };
+    let pipeline = opened?;
+    let context = state.manifest.context;
+    // Checked before `Started` so an oversized prompt is still answered with a 400.
+    if let Err(error) = pipeline.ensure_prompt_fits(context) {
+        pipeline.close(true).await;
+        return Err(error.into());
     }
-    let range = stage_range(stage);
-    Err(match last_error {
-        Some(error) => error.context(format!("no location could serve stage {range}")),
-        None => anyhow!("every location for stage {range} already failed during this request"),
-    })
+    let _ = events.send(Event::Started).await;
+    let limits = GenerationLimits {
+        max_tokens,
+        context,
+    };
+    pipeline
+        .generate_cancellable(limits, cancel, {
+            let events = events.clone();
+            move |text| {
+                let events = events.clone();
+                async move {
+                    let _ = events.send(Event::Text(text)).await;
+                }
+            }
+        })
+        .await
 }
 
 /// Opens every stage of a pipeline manifest at once and validates them.
@@ -767,10 +676,9 @@ async fn open_ring_pipeline(
 async fn open_link(
     state: &FrontendState,
     stage: &StageSpec,
-    location: &StageLocation,
     prompt: &str,
 ) -> anyhow::Result<StageLink> {
-    match location {
+    match &stage.location {
         StageLocation::Remote { worker } => {
             StageLink::connect_remote(&state.endpoint, *worker, METADATA_TIMEOUT).await
         }
@@ -793,62 +701,6 @@ async fn open_link(
                 env,
             };
             StageLink::spawn_local(&launch, METADATA_TIMEOUT).await
-        }
-    }
-}
-
-/// The restarted generation produced different text from what the client already has.
-#[derive(Debug, thiserror::Error)]
-#[error("the restarted generation produced different text from what was already streamed")]
-struct Diverged;
-
-/// What the client has been sent, so a restarted generation repeats none of it.
-struct Delivered {
-    /// Text sent so far across every attempt.
-    sent: String,
-    /// How much of `sent` the current attempt has reproduced.
-    replayed: usize,
-    /// Whether text reaches the client as it is produced; a buffered reply sends only the
-    /// final attempt's text, so a restart owes it nothing.
-    streaming: bool,
-}
-
-impl Delivered {
-    fn new(streaming: bool) -> Self {
-        Self {
-            sent: String::new(),
-            replayed: 0,
-            streaming,
-        }
-    }
-
-    /// Begins another attempt, which must first reproduce whatever was sent.
-    fn restart(&mut self) {
-        self.replayed = 0;
-        if !self.streaming {
-            self.sent.clear();
-        }
-    }
-
-    /// Takes the attempt's next piece and returns the part the client has not seen yet.
-    fn accept<'a>(&mut self, piece: &'a str) -> Result<&'a str, Diverged> {
-        let pending = self.sent.get(self.replayed..).ok_or(Diverged)?;
-        let overlap = pending.len().min(piece.len());
-        if pending.as_bytes()[..overlap] != piece.as_bytes()[..overlap] {
-            return Err(Diverged);
-        }
-        let fresh = piece.get(overlap..).ok_or(Diverged)?;
-        self.replayed += overlap + fresh.len();
-        self.sent.push_str(fresh);
-        Ok(fresh)
-    }
-
-    /// Checks the attempt reproduced everything a previous one sent.
-    fn finish(&self) -> Result<(), Diverged> {
-        if self.replayed == self.sent.len() {
-            Ok(())
-        } else {
-            Err(Diverged)
         }
     }
 }
@@ -1038,59 +890,6 @@ mod tests {
         assert!(ensure_loopback("[::ffff:127.0.0.1]:8080".parse().unwrap()).is_ok());
         assert!(ensure_loopback("0.0.0.0:8080".parse().unwrap()).is_err());
         assert!(ensure_loopback("192.168.1.5:8080".parse().unwrap()).is_err());
-    }
-
-    /// Feeds `pieces` to `delivered` and returns what each one released to the client.
-    fn feed(delivered: &mut Delivered, pieces: &[&str]) -> Result<Vec<String>, Diverged> {
-        pieces
-            .iter()
-            .map(|piece| delivered.accept(piece).map(str::to_owned))
-            .collect()
-    }
-
-    #[test]
-    fn a_streamed_restart_resumes_after_the_text_already_sent() {
-        let mut delivered = Delivered::new(true);
-        assert_eq!(feed(&mut delivered, &["Hel", "lo"]).unwrap(), ["Hel", "lo"]);
-        delivered.restart();
-        let released = feed(&mut delivered, &["He", "l", "lo w", "orld"]).unwrap();
-        assert_eq!(released, ["", "", " w", "orld"]);
-        assert!(delivered.finish().is_ok());
-    }
-
-    #[test]
-    fn a_streamed_restart_must_reproduce_what_was_sent() {
-        let mut delivered = Delivered::new(true);
-        feed(&mut delivered, &["Hello"]).unwrap();
-        delivered.restart();
-        assert!(feed(&mut delivered, &["Help"]).is_err());
-
-        let mut short = Delivered::new(true);
-        feed(&mut short, &["Hello"]).unwrap();
-        short.restart();
-        feed(&mut short, &["He"]).unwrap();
-        assert!(
-            short.finish().is_err(),
-            "stopped before reproducing the text"
-        );
-    }
-
-    #[test]
-    fn replay_respects_multibyte_characters() {
-        let mut delivered = Delivered::new(true);
-        feed(&mut delivered, &["a€"]).unwrap();
-        delivered.restart();
-        assert_eq!(feed(&mut delivered, &["a", "€b"]).unwrap(), ["", "b"]);
-        assert!(delivered.finish().is_ok());
-    }
-
-    #[test]
-    fn a_buffered_restart_owes_the_client_nothing() {
-        let mut delivered = Delivered::new(false);
-        feed(&mut delivered, &["Hello"]).unwrap();
-        delivered.restart();
-        assert_eq!(feed(&mut delivered, &["Bye"]).unwrap(), ["Bye"]);
-        assert!(delivered.finish().is_ok());
     }
 
     #[test]

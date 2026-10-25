@@ -98,15 +98,6 @@ impl Leader {
         }
     }
 
-    /// Entries `peer` has acknowledged in this epoch; `None` until it confirms a snapshot, or
-    /// if it isn't a peer.
-    pub fn acked_len(&self, peer: &NodeId) -> Option<Seq> {
-        match self.peers.get(peer)? {
-            PeerState::Acked(len) => Some(*len),
-            PeerState::NeedsSnapshot => None,
-        }
-    }
-
     /// Peers that hold the full current history.
     pub fn up_to_date_peers(&self) -> Vec<NodeId> {
         let len = self.history.len();

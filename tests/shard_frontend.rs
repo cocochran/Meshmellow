@@ -9,9 +9,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::{Connection, presets};
@@ -103,16 +101,6 @@ fn remote_stage(begin: u32, end: u32, worker: &Endpoint) -> Value {
     json!({"begin": begin, "end": end, "remote": {"worker": worker.id().to_string()}})
 }
 
-/// `stage` with `fallbacks` (each a `{"remote": ...}` or `{"local": ...}` location) added.
-fn with_fallbacks(mut stage: Value, fallbacks: Vec<Value>) -> Value {
-    stage["fallbacks"] = Value::Array(fallbacks);
-    stage
-}
-
-fn remote_location(worker: &Endpoint) -> Value {
-    json!({"remote": {"worker": worker.id().to_string()}})
-}
-
 fn manifest(model_sha256: &str, context: u32, stages: Vec<Value>) -> ShardManifest {
     let value = json!({
         "runner": example_bin("fake_shard_runner"),
@@ -163,54 +151,27 @@ struct WorkerStage {
     end: u32,
     /// `model_sha256` added to the forwarded metadata, or `None` to omit it.
     model_sha256: Option<&'static str>,
-    /// Makes every session's runner exit on receiving this step, as a dying node would.
-    fail_at_step: Option<u32>,
-}
-
-impl WorkerStage {
-    /// The fixture's 0..2 prefix, healthy unless `fail_at_step` is set.
-    fn prefix(fail_at_step: Option<u32>) -> Self {
-        Self {
-            begin: 0,
-            end: 2,
-            model_sha256: Some(FIXTURE_SHA),
-            fail_at_step,
-        }
-    }
 }
 
 /// Plays `shard-serve`: one fake-runner session per incoming connection.
 struct FakeWorker {
     endpoint: Endpoint,
     task: JoinHandle<()>,
-    /// Sessions started so far.
-    sessions: Arc<AtomicUsize>,
 }
 
 impl FakeWorker {
     async fn start(stage: WorkerStage) -> Self {
         let endpoint = bind_endpoint(vec![RPC_BRIDGE_ALPN.to_vec()], None).await;
         let accepting = endpoint.clone();
-        let sessions = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::clone(&sessions);
         let task = tokio::spawn(async move {
             while let Some(incoming) = accepting.accept().await {
                 let Ok(connection) = incoming.await else {
                     continue;
                 };
-                counter.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(serve_session(connection, stage));
             }
         });
-        Self {
-            endpoint,
-            task,
-            sessions,
-        }
-    }
-
-    fn sessions(&self) -> usize {
-        self.sessions.load(Ordering::SeqCst)
+        Self { endpoint, task }
     }
 
     async fn stop(self) {
@@ -225,11 +186,7 @@ async fn serve_session(connection: Connection, stage: WorkerStage) {
         return;
     };
     wire::read_preface(&mut recv).await.expect("client preface");
-    let mut runner = Command::new(example_bin("fake_shard_runner"));
-    if let Some(step) = stage.fail_at_step {
-        runner.env(FAIL_AT_STEP_ENV, step.to_string());
-    }
-    let mut child = runner
+    let mut child = Command::new(example_bin("fake_shard_runner"))
         .arg(fixture_model())
         .args([
             stage.begin.to_string(),
@@ -462,7 +419,6 @@ async fn remote_prefix_and_local_final_serve_completions() {
         begin: 0,
         end: 2,
         model_sha256: Some(FIXTURE_SHA),
-        fail_at_step: None,
     })
     .await;
     let model = fixture_model();
@@ -524,124 +480,6 @@ async fn runner_failure_mid_generation_fails_the_request() {
     frontend.stop().await;
 }
 
-/// The fixture reply, checking the stream ends normally and repeats nothing.
-fn assert_streamed_reply(status: u16, body: &str) {
-    assert_eq!(status, 200, "{body}");
-    assert_eq!(streamed_text(body), fixture_reply(), "{body}");
-}
-
-#[tokio::test]
-async fn remote_failure_mid_stream_restarts_on_a_fallback_worker() {
-    let dying = FakeWorker::start(WorkerStage::prefix(Some(3))).await;
-    let standby = FakeWorker::start(WorkerStage::prefix(None)).await;
-    let model = fixture_model();
-    let prefix = with_fallbacks(
-        remote_stage(0, 2, &dying.endpoint),
-        vec![remote_location(&standby.endpoint)],
-    );
-    let stages = vec![prefix, local_stage(2, LAYERS, &model, &[])];
-    let frontend =
-        Frontend::start(manifest(FIXTURE_SHA, CONTEXT, stages), &[&dying, &standby]).await;
-
-    // Text streamed before the failure is not sent again after the restart.
-    let (status, body) = frontend.chat(true, "hi").await;
-    assert_streamed_reply(status, &body);
-    assert_eq!((dying.sessions(), standby.sessions()), (1, 1));
-
-    // Later requests start on the location that worked.
-    assert_completion(&frontend.chat_ok().await);
-    assert_eq!((dying.sessions(), standby.sessions()), (1, 2));
-    frontend.stop().await;
-    dying.stop().await;
-    standby.stop().await;
-}
-
-#[tokio::test]
-async fn the_leader_takes_over_a_failed_remote_stage_from_a_local_fallback() {
-    let dying = FakeWorker::start(WorkerStage::prefix(Some(2))).await;
-    let model = fixture_model();
-    let local_prefix = local_stage(0, 2, &model, &[]);
-    let prefix = with_fallbacks(
-        remote_stage(0, 2, &dying.endpoint),
-        vec![json!({"local": local_prefix["local"]})],
-    );
-    let stages = vec![prefix, local_stage(2, LAYERS, &model, &[])];
-    let frontend = Frontend::start(manifest(FIXTURE_SHA, CONTEXT, stages), &[&dying]).await;
-    assert_completion(&frontend.chat_ok().await);
-    assert_eq!(dying.sessions(), 1);
-    frontend.stop().await;
-    dying.stop().await;
-}
-
-#[tokio::test]
-async fn an_unreachable_worker_is_skipped_for_its_fallback() {
-    let gone = FakeWorker::start(WorkerStage::prefix(None)).await;
-    let standby = FakeWorker::start(WorkerStage::prefix(None)).await;
-    let model = fixture_model();
-    let prefix = with_fallbacks(
-        remote_stage(0, 2, &gone.endpoint),
-        vec![remote_location(&standby.endpoint)],
-    );
-    let stages = vec![prefix, local_stage(2, LAYERS, &model, &[])];
-    let frontend =
-        Frontend::start(manifest(FIXTURE_SHA, CONTEXT, stages), &[&gone, &standby]).await;
-    gone.stop().await;
-    let started = Instant::now();
-    let (status, body) = frontend.chat(true, "hi").await;
-    assert_streamed_reply(status, &body);
-    tracing::info!(elapsed = ?started.elapsed(), "failed over past an unreachable worker");
-    assert_eq!(standby.sessions(), 1);
-    frontend.stop().await;
-    standby.stop().await;
-}
-
-#[tokio::test]
-async fn a_stage_with_no_location_left_fails_the_request() {
-    let first = FakeWorker::start(WorkerStage::prefix(Some(2))).await;
-    let second = FakeWorker::start(WorkerStage::prefix(Some(2))).await;
-    let model = fixture_model();
-    let prefix = with_fallbacks(
-        remote_stage(0, 2, &first.endpoint),
-        vec![remote_location(&second.endpoint)],
-    );
-    let stages = vec![prefix, local_stage(2, LAYERS, &model, &[])];
-    let frontend =
-        Frontend::start(manifest(FIXTURE_SHA, CONTEXT, stages), &[&first, &second]).await;
-
-    let (status, body) = frontend.chat(true, "hi").await;
-    assert_eq!(status, 200, "{body}");
-    let payloads = sse_payloads(&body);
-    assert!(!payloads.iter().any(|data| data == SSE_DONE), "{body}");
-    let last: Value = serde_json::from_str(payloads.last().expect("events")).expect("json");
-    let message = last["error"]["message"].as_str().expect("error message");
-    assert!(message.contains("step 2"), "{message}");
-    assert_eq!(
-        body.matches("\"content\":\"H\"").count(),
-        1,
-        "the restart repeats nothing: {body}"
-    );
-    assert_eq!((first.sessions(), second.sessions()), (1, 1));
-    frontend.stop().await;
-    first.stop().await;
-    second.stop().await;
-}
-
-#[tokio::test]
-async fn a_remote_stage_without_fallbacks_fails_without_restarting() {
-    let dying = FakeWorker::start(WorkerStage::prefix(Some(2))).await;
-    let model = fixture_model();
-    let stages = vec![
-        remote_stage(0, 2, &dying.endpoint),
-        local_stage(2, LAYERS, &model, &[]),
-    ];
-    let frontend = Frontend::start(manifest(FIXTURE_SHA, CONTEXT, stages), &[&dying]).await;
-    let message = frontend.chat_error(false).await;
-    assert!(message.contains("step 2"), "{message}");
-    assert_eq!(dying.sessions(), 1);
-    frontend.stop().await;
-    dying.stop().await;
-}
-
 #[tokio::test]
 async fn client_disconnect_drops_the_generation() {
     let (worker, started, closed) = start_silent_worker().await;
@@ -701,7 +539,6 @@ async fn remote_stage_with_the_wrong_range_or_hash_is_refused() {
                 begin: 0,
                 end: 1,
                 model_sha256: Some(FIXTURE_SHA),
-                fail_at_step: None,
             },
             "serves layers 0..1",
         ),
@@ -710,7 +547,6 @@ async fn remote_stage_with_the_wrong_range_or_hash_is_refused() {
                 begin: 0,
                 end: 2,
                 model_sha256: Some(OTHER_SHA),
-                fail_at_step: None,
             },
             "relay model_sha256",
         ),
@@ -719,7 +555,6 @@ async fn remote_stage_with_the_wrong_range_or_hash_is_refused() {
                 begin: 0,
                 end: 2,
                 model_sha256: None,
-                fail_at_step: None,
             },
             "did not report model_sha256",
         ),

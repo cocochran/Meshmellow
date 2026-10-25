@@ -87,13 +87,6 @@ impl Node {
         }
     }
 
-    pub fn as_leader(&self) -> Option<&Leader> {
-        match self {
-            Self::Leader(l) => Some(l),
-            Self::Replica(_) => None,
-        }
-    }
-
     pub fn as_leader_mut(&mut self) -> Option<&mut Leader> {
         match self {
             Self::Leader(l) => Some(l),

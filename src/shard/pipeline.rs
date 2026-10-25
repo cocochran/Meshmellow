@@ -10,9 +10,12 @@
 //!
 //! The pipeline handles any number of stages; only the manifest restricts v1 topologies. Each
 //! runner serves one sequence, so links are single-use: [`Pipeline::generate`] consumes them,
-//! and any error closes every link and fails the generation without retrying. A stage that
-//! fails to answer a request is named by a [`StageFault`] in the error, so the caller can
-//! restart the generation without it.
+//! and any error closes every link and fails the generation without retrying.
+//!
+//! In EXPERIMENTAL ring execution ([`Pipeline::with_ring`]) the pipeline is the local stage 0,
+//! which tokenizes, followed by a [`RingLink`] that stands for every remote stage: stage 0's
+//! hidden rows go to the ring's entry worker and each step's token comes back from the terminal.
+//! The same decoding loop, stop rules and UTF-8 assembly apply.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -45,11 +48,6 @@ pub const METADATA_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Bound on one stage answering one request (a full prefill batch on a slow CPU included).
 pub const STEP_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// Bound on reaching a remote stage and opening its stream, so an unreachable worker fails
-/// fast instead of holding the generation; loading the model afterwards has
-/// [`METADATA_TIMEOUT`].
-pub const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Protocol version this pipeline speaks.
 const PROTOCOL_VERSION: u32 = 1;
@@ -159,20 +157,16 @@ impl StageLink {
         metadata_timeout: Duration,
     ) -> anyhow::Result<Self> {
         let label = format!("remote stage on {}", worker.fmt_short());
-        let dial = async {
-            let connection = endpoint
-                .connect(worker, RPC_BRIDGE_ALPN)
-                .await
-                .with_context(|| format!("failed to connect to {label}"))?;
-            let streams = connection
-                .open_bi()
-                .await
-                .with_context(|| format!("failed to open a stream to {label}"))?;
-            anyhow::Ok((connection, streams))
-        };
-        let (connection, (mut send, recv)) = timeout(DIAL_TIMEOUT, dial)
+        let connect_started = Instant::now();
+        let connection = endpoint
+            .connect(worker, RPC_BRIDGE_ALPN)
             .await
-            .with_context(|| format!("could not reach {label} within {DIAL_TIMEOUT:?}"))??;
+            .with_context(|| format!("failed to connect to {label}"))?;
+        debug!(stage = %label, path = path_kind(&connection), connect_us = connect_started.elapsed().as_micros(), "remote stage connected");
+        let (mut send, recv) = connection
+            .open_bi()
+            .await
+            .with_context(|| format!("failed to open a stream to {label}"))?;
         wire::write_preface(&mut send)
             .await
             .with_context(|| format!("failed to greet {label}"))?;
@@ -342,15 +336,6 @@ pub struct Generation {
     pub prompt_tokens: u32,
     /// Completion tokens produced (end-of-generation not counted).
     pub completion_tokens: u32,
-}
-
-/// Context on a generation error: the stage at `index` (in pipeline order) failed or timed out
-/// answering a request. Find it with `error.downcast_ref::<StageFault>()`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("stage {index} stopped answering")]
-pub struct StageFault {
-    /// Position of the failed stage in the pipeline.
-    pub index: usize,
 }
 
 /// The prompt does not fit the context window; a client error, unlike every other failure.
@@ -607,9 +592,11 @@ impl Pipeline {
             }
             let output = link
                 .exchange(step, position, &input, max_floats, self.step_timeout)
-                .await
-                .context(StageFault { index })?;
-            if index == last {
+                .await?;
+            if let Some(ring) = &self.ring {
+                ring.origin_progress(serde_json::json!({"event":"stage_end","begin":link.metadata.begin,"step":step,"output_bytes":output.floats.len()*4,"result":output.reply}));
+            }
+            if is_final {
                 decoder.advance(count);
                 debug!(
                     step,

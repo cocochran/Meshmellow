@@ -18,9 +18,10 @@ use llm_cluster::leader::{
 use llm_cluster::network::{self, SharedPeerTable};
 use llm_cluster::node::PeerTable;
 use llm_cluster::protocol::{CONTROL_ALPN, RPC_BRIDGE_ALPN};
-use llm_cluster::replication::{DEFAULT_CONVERSATION_ID, ReplicationConfig};
+use llm_cluster::shard::ring::{RING_ALPN, RingWorkerConfig, serve_ring_worker};
+use llm_cluster::shard::ring_origin::RingSettings;
 use llm_cluster::shard::serve::{ShardServeConfig, serve_shard};
-use llm_cluster::worker::{self, TakeoverConfig, WorkerConfig};
+use llm_cluster::worker::{self, WorkerConfig};
 use llm_cluster::{api, rpc_bridge};
 use serde::Serialize;
 use tracing_subscriber::EnvFilter;
@@ -51,9 +52,6 @@ const DEFAULT_HEARTBEAT_TIMEOUT_ARG: &str = "7s";
 /// [`DEFAULT_LEADER_HEARTBEAT_INTERVAL_ARG`] plus a second of slack; matches
 /// [`worker::DEFAULT_LEADER_HEARTBEAT_TIMEOUT`].
 const DEFAULT_LEADER_HEARTBEAT_TIMEOUT_ARG: &str = "7s";
-
-/// `worker --failover-after` default; matches [`worker::DEFAULT_FAILOVER_AFTER`].
-const DEFAULT_FAILOVER_AFTER_ARG: &str = "10s";
 
 /// `--worker-wait` default; matches [`leader::DEFAULT_WORKER_WAIT`].
 const DEFAULT_WORKER_WAIT_ARG: &str = "60s";
@@ -255,13 +253,11 @@ enum Command {
         #[command(flatten)]
         profiles: WorkerProfileArgs,
     },
-    /// Contribute this device to a cluster: supervise ggml-rpc-server and bridge it to the leader,
-    /// keep a copy of the conversation, and optionally stand by to take over as leader.
+    /// Contribute this device to a cluster: supervise ggml-rpc-server and bridge it to the leader.
     Worker {
-        /// The ggml-rpc-server binary; omit to only keep a copy of the conversation (and stand by
-        /// with --takeover-manifest), as on a machine that serves layers with shard-serve.
-        #[arg(long, required_unless_present = "takeover_manifest")]
-        rpc_server: Option<PathBuf>,
+        /// The ggml-rpc-server binary.
+        #[arg(long)]
+        rpc_server: PathBuf,
         /// Loopback port for ggml-rpc-server.
         #[arg(long, default_value_t = rpc_bridge::DEFAULT_RPC_PORT)]
         rpc_port: u16,
@@ -285,19 +281,6 @@ enum Command {
         /// disables it.
         #[arg(long, default_value = DEFAULT_LEADER_HEARTBEAT_TIMEOUT_ARG, value_parser = parse_duration)]
         leader_heartbeat_timeout: Duration,
-        /// Directory holding this worker's copy of the conversation.
-        #[arg(long, default_value = store::DEFAULT_DATA_DIR)]
-        data_dir: PathBuf,
-        /// Stand by to take over as leader: the shard manifest this machine would lead with,
-        /// written from its point of view (see docs/history-sync.md).
-        #[arg(long, requires = "leader", conflicts_with = "rpc_server")]
-        takeover_manifest: Option<PathBuf>,
-        /// Job API address to serve after taking over.
-        #[arg(long, default_value_t = leader::DEFAULT_API_ADDR, requires = "takeover_manifest")]
-        takeover_api: SocketAddr,
-        /// How long the leader must stay unreachable before the workers elect a replacement.
-        #[arg(long, default_value = DEFAULT_FAILOVER_AFTER_ARG, value_parser = parse_duration)]
-        failover_after: Duration,
     },
     /// Run the main process: start the execution backend (llama-server from a plan, or the shard
     /// runner pipeline from a manifest) and serve the job API in front of it.
@@ -440,12 +423,6 @@ struct LeaderArgs {
     /// redial after their --leader-heartbeat-timeout without one. `0s` disables them.
     #[arg(long, default_value = DEFAULT_LEADER_HEARTBEAT_INTERVAL_ARG, value_parser = parse_duration)]
     heartbeat_interval: Duration,
-    /// Directory holding the conversation's history, replicated to every worker.
-    #[arg(long, default_value = store::DEFAULT_DATA_DIR)]
-    data_dir: PathBuf,
-    /// Conversation the cluster keeps and replicates.
-    #[arg(long, default_value = DEFAULT_CONVERSATION_ID)]
-    conversation: String,
 }
 
 /// `leader --backend` values.
@@ -489,12 +466,6 @@ impl LeaderArgs {
             worker_wait: self.worker_wait,
             heartbeat_timeout: zero_disables(self.heartbeat_timeout),
             heartbeat_interval: zero_disables(self.heartbeat_interval),
-            replication: Some(ReplicationConfig {
-                data_dir: self.data_dir,
-                conversation_id: self.conversation,
-                min_epoch: 0,
-            }),
-            quorum: None,
         })
     }
 }
@@ -702,10 +673,6 @@ async fn main() -> anyhow::Result<()> {
             allow_peers,
             heartbeat_interval,
             leader_heartbeat_timeout,
-            data_dir,
-            takeover_manifest,
-            takeover_api,
-            failover_after,
         } => {
             let config = WorkerConfig {
                 key_path: cli.key,
@@ -717,10 +684,6 @@ async fn main() -> anyhow::Result<()> {
                 allowed_peers: parse_node_ids(&allow_peers)?,
                 heartbeat_interval,
                 leader_heartbeat_timeout: zero_disables(leader_heartbeat_timeout),
-                data_dir: Some(data_dir),
-                takeover: takeover_manifest
-                    .map(|manifest| TakeoverConfig::new(manifest, takeover_api)),
-                failover_after,
             };
             until_ctrl_c(worker::run_worker(config)).await
         }
@@ -1412,42 +1375,6 @@ mod tests {
             "abc123",
         ];
         Cli::try_parse_from(required.iter().chain(extra)).map(|cli| cli.command)
-    }
-
-    fn parse_worker(args: &[&str]) -> Result<Command, clap::Error> {
-        let program = ["meshthing", "worker"];
-        Cli::try_parse_from(program.iter().chain(args)).map(|cli| cli.command)
-    }
-
-    #[test]
-    fn a_standby_worker_needs_a_leader_but_no_rpc_server() {
-        assert!(
-            parse_worker(&[]).is_err(),
-            "a worker with neither an RPC server nor a takeover manifest has nothing to do"
-        );
-        assert!(
-            parse_worker(&["--takeover-manifest", "m.json"]).is_err(),
-            "a standby must name the leader it takes over from"
-        );
-
-        let command = parse_worker(&["--takeover-manifest", "m.json", "--leader", "abc"])
-            .expect("standby worker");
-        let Command::Worker {
-            rpc_server,
-            takeover_manifest,
-            takeover_api,
-            data_dir,
-            failover_after,
-            ..
-        } = command
-        else {
-            panic!("expected worker, got {command:?}");
-        };
-        assert_eq!(rpc_server, None);
-        assert_eq!(takeover_manifest, Some(PathBuf::from("m.json")));
-        assert_eq!(takeover_api, leader::DEFAULT_API_ADDR);
-        assert_eq!(data_dir, PathBuf::from(store::DEFAULT_DATA_DIR));
-        assert_eq!(failover_after, worker::DEFAULT_FAILOVER_AFTER);
     }
 
     #[test]
