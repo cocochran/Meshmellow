@@ -14,6 +14,8 @@
 //! [`ChatRenderer::render`] then runs per request; a template error (including
 //! `raise_exception`) is a [`RenderError`], which the front end answers with HTTP 400.
 
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 
 use anyhow::{Context, bail};
@@ -26,6 +28,9 @@ use crate::shard::wire;
 
 /// Name the pinned template is registered under; template errors cite it.
 const TEMPLATE_NAME: &str = "chat_template";
+
+/// Chat templates are small text configuration; cap memory used to load a manifest-selected file.
+const MAX_TEMPLATE_BYTES: usize = 1024 * 1024;
 
 /// The function Hugging Face chat templates call to refuse a conversation.
 const RAISE_EXCEPTION: &str = "raise_exception";
@@ -112,10 +117,26 @@ fn load_jinja(pinned: &PinnedTemplate) -> anyhow::Result<RendererKind> {
     })
 }
 
-/// Reads the template file and checks it hashes to `expected`.
+/// Reads a bounded template file and checks it hashes to `expected`.
 fn read_pinned(path: &Path, expected: &str) -> anyhow::Result<String> {
-    let bytes = std::fs::read(path)
+    let file = File::open(path)
         .with_context(|| format!("failed to read chat template {}", path.display()))?;
+    if file.metadata()?.len() > MAX_TEMPLATE_BYTES as u64 {
+        bail!(
+            "chat template {} exceeds the {MAX_TEMPLATE_BYTES}-byte limit",
+            path.display()
+        );
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_TEMPLATE_BYTES.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read chat template {}", path.display()))?;
+    if bytes.len() > MAX_TEMPLATE_BYTES {
+        bail!(
+            "chat template {} exceeds the {MAX_TEMPLATE_BYTES}-byte limit",
+            path.display()
+        );
+    }
     let actual = wire::encode_hex(&Sha256::digest(&bytes));
     if !same_sha256(&actual, expected) {
         bail!(
@@ -231,6 +252,15 @@ mod tests {
         std::fs::write(&path, source).unwrap();
         let sha256 = wire::encode_hex(&Sha256::digest(source.as_bytes()));
         (path, sha256)
+    }
+
+    #[test]
+    fn pinned_template_reader_rejects_files_over_one_mib() {
+        let source = "x".repeat(MAX_TEMPLATE_BYTES + 1);
+        let (path, sha256) = temp_template(&source);
+        let error = read_pinned(&path, &sha256).unwrap_err().to_string();
+        std::fs::remove_file(path).unwrap();
+        assert!(error.contains("1048576-byte limit"), "{error}");
     }
 
     #[test]
