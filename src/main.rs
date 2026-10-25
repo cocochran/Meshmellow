@@ -6,12 +6,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use anyhow::Context;
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use iroh::Endpoint;
 use llm_cluster::evidence::EvidenceConfig;
 use llm_cluster::history_sync::store::{self, HistoryStore, JobStatus};
 use llm_cluster::launch;
-use llm_cluster::leader::{self, LeaderConfig};
+use llm_cluster::leader::{
+    self, BackendConfig, LeaderConfig, LlamaBackendConfig, ShardBackendConfig,
+};
 use llm_cluster::network::{self, SharedPeerTable};
 use llm_cluster::node::PeerTable;
 use llm_cluster::protocol::{CONTROL_ALPN, RPC_BRIDGE_ALPN};
@@ -162,50 +165,9 @@ enum Command {
         #[arg(long, default_value = DEFAULT_HEARTBEAT_INTERVAL_ARG, value_parser = parse_duration)]
         heartbeat_interval: Duration,
     },
-    /// Run the main process: wait for planned workers, start llama-server, and serve the job API.
-    Leader {
-        /// JSON produced by the plan command.
-        #[arg(long)]
-        plan: PathBuf,
-        /// Planning profile JSON the plan was built from; the plan is validated against it before
-        /// anything launches.
-        #[arg(long)]
-        profile: PathBuf,
-        /// Require at least this many contributors, as for the plan command.
-        #[arg(long, default_value_t = launch::DEFAULT_MIN_PEERS)]
-        min_peers: usize,
-        /// RunEvidence JSON an external harness writes after a fresh inference run; when given,
-        /// the leader verifies it against the plan and shuts down if verification fails.
-        #[arg(long)]
-        evidence_file: Option<PathBuf>,
-        /// How long to wait for --evidence-file to appear and parse, e.g. `120s` or `2m`.
-        #[arg(
-            long,
-            default_value = DEFAULT_EVIDENCE_WAIT_ARG,
-            value_parser = parse_duration,
-            requires = "evidence_file"
-        )]
-        evidence_wait: Duration,
-        /// The llama-server binary.
-        #[arg(long)]
-        llama_server: PathBuf,
-        /// Extra argument for llama-server, after the plan's arguments (e.g. `--llama-arg
-        /// --cache-ram --llama-arg 0`); repeatable. The leader's own --host/--port always win.
-        #[arg(long = "llama-arg", allow_hyphen_values = true)]
-        llama_args: Vec<String>,
-        /// Internal loopback port for llama-server.
-        #[arg(long, default_value_t = leader::DEFAULT_LLAMA_PORT)]
-        llama_port: u16,
-        /// Loopback address to serve the job API on.
-        #[arg(long, default_value_t = leader::DEFAULT_API_ADDR)]
-        api: SocketAddr,
-        /// How long to wait for every planned worker to connect, e.g. `60s` or `2m`.
-        #[arg(long, default_value = DEFAULT_WORKER_WAIT_ARG, value_parser = parse_duration)]
-        worker_wait: Duration,
-        /// How long llama-server may take to load the model and answer /health.
-        #[arg(long, default_value = DEFAULT_LLAMA_READY_TIMEOUT_ARG, value_parser = parse_duration)]
-        llama_ready_timeout: Duration,
-    },
+    /// Run the main process: start the execution backend (llama-server from a plan, or the shard
+    /// runner pipeline from a manifest) and serve the job API in front of it.
+    Leader(LeaderArgs),
     /// Send one prompt to a running leader's job API and print the reply.
     Prompt {
         /// Job API address of the leader.
@@ -219,6 +181,139 @@ enum Command {
         #[command(subcommand)]
         command: HistoryCommand,
     },
+}
+
+/// Flags that only the llama backend uses; `--shard-manifest` conflicts with every one of them.
+const LLAMA_ONLY_ARGS: [&str; 8] = [
+    "plan",
+    "profile",
+    "min_peers",
+    "evidence_file",
+    "evidence_wait",
+    "llama_server",
+    "llama_args",
+    "llama_ready_timeout",
+];
+
+/// `leader` flags.
+#[derive(Debug, Args)]
+struct LeaderArgs {
+    /// Execution backend: `llama` runs llama-server over the plan's RPC bridges; `shard` runs
+    /// the shard runner pipeline described by --shard-manifest (see docs/shard-backend.md).
+    #[arg(long, value_enum, default_value_t = BackendKind::Llama)]
+    backend: BackendKind,
+    /// Shard manifest JSON: the runner, model identity and stages. Required with, and only
+    /// accepted with, `--backend shard`; the llama-only flags are refused alongside it.
+    #[arg(
+        long,
+        requires = "backend",
+        required_if_eq("backend", "shard"),
+        conflicts_with_all = LLAMA_ONLY_ARGS
+    )]
+    shard_manifest: Option<PathBuf>,
+    /// JSON produced by the plan command (llama backend).
+    #[arg(
+        long,
+        required_unless_present = "shard_manifest",
+        required_if_eq("backend", "llama")
+    )]
+    plan: Option<PathBuf>,
+    /// Planning profile JSON the plan was built from; the plan is validated against it before
+    /// anything launches (llama backend).
+    #[arg(
+        long,
+        required_unless_present = "shard_manifest",
+        required_if_eq("backend", "llama")
+    )]
+    profile: Option<PathBuf>,
+    /// Require at least this many contributors, as for the plan command (llama backend).
+    #[arg(long, default_value_t = launch::DEFAULT_MIN_PEERS)]
+    min_peers: usize,
+    /// RunEvidence JSON an external harness writes after a fresh inference run; when given,
+    /// the leader verifies it against the plan and shuts down if verification fails (llama
+    /// backend).
+    #[arg(long)]
+    evidence_file: Option<PathBuf>,
+    /// How long to wait for --evidence-file to appear and parse, e.g. `120s` or `2m`.
+    #[arg(
+        long,
+        default_value = DEFAULT_EVIDENCE_WAIT_ARG,
+        value_parser = parse_duration,
+        requires = "evidence_file"
+    )]
+    evidence_wait: Duration,
+    /// The llama-server binary (llama backend).
+    #[arg(
+        long,
+        required_unless_present = "shard_manifest",
+        required_if_eq("backend", "llama")
+    )]
+    llama_server: Option<PathBuf>,
+    /// Extra argument for llama-server, after the plan's arguments (e.g. `--llama-arg
+    /// --cache-ram --llama-arg 0`); repeatable. The leader's own --host/--port always win.
+    #[arg(long = "llama-arg", allow_hyphen_values = true)]
+    llama_args: Vec<String>,
+    /// Internal loopback port for the backend: llama-server's, or the shard front end's with
+    /// `--backend shard`. The job API forwards to it.
+    #[arg(long, default_value_t = leader::DEFAULT_LLAMA_PORT)]
+    llama_port: u16,
+    /// Loopback address to serve the job API on.
+    #[arg(long, default_value_t = leader::DEFAULT_API_ADDR)]
+    api: SocketAddr,
+    /// How long to wait for every planned worker to connect (llama), or for the shard
+    /// pipeline's readiness probe to pass (shard), e.g. `60s` or `2m`.
+    #[arg(long, default_value = DEFAULT_WORKER_WAIT_ARG, value_parser = parse_duration)]
+    worker_wait: Duration,
+    /// How long llama-server may take to load the model and answer /health (llama backend).
+    #[arg(long, default_value = DEFAULT_LLAMA_READY_TIMEOUT_ARG, value_parser = parse_duration)]
+    llama_ready_timeout: Duration,
+}
+
+/// `leader --backend` values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum BackendKind {
+    /// llama-server over RPC bridges, launched from a placement plan.
+    Llama,
+    /// The shard runner pipeline, described by a shard manifest.
+    Shard,
+}
+
+impl LeaderArgs {
+    /// Builds the leader's configuration; `key_path` and `cluster_id` come from the global flags.
+    fn into_config(self, key_path: PathBuf, cluster_id: String) -> anyhow::Result<LeaderConfig> {
+        let backend = match self.backend {
+            BackendKind::Llama => BackendConfig::Llama(LlamaBackendConfig {
+                plan_path: required_for_llama(self.plan, "--plan")?,
+                profile_path: required_for_llama(self.profile, "--profile")?,
+                min_peers: self.min_peers,
+                evidence: self.evidence_file.map(|path| EvidenceConfig {
+                    path,
+                    wait: self.evidence_wait,
+                }),
+                llama_server: required_for_llama(self.llama_server, "--llama-server")?,
+                extra_llama_args: self.llama_args,
+                llama_ready_timeout: self.llama_ready_timeout,
+            }),
+            BackendKind::Shard => BackendConfig::Shard(ShardBackendConfig {
+                manifest_path: self
+                    .shard_manifest
+                    .context("--shard-manifest is required with --backend shard")?,
+            }),
+        };
+        Ok(LeaderConfig {
+            key_path,
+            cluster_id,
+            backend,
+            upstream_port: self.llama_port,
+            api_addr: self.api,
+            worker_wait: self.worker_wait,
+        })
+    }
+}
+
+/// A flag clap already requires with `--backend llama`; checked again so no unwrap is needed.
+fn required_for_llama(value: Option<PathBuf>, flag: &str) -> anyhow::Result<PathBuf> {
+    value.with_context(|| format!("{flag} is required with --backend llama"))
 }
 
 #[derive(Debug, Subcommand)]
@@ -324,38 +419,10 @@ async fn main() -> anyhow::Result<()> {
             };
             until_ctrl_c(worker::run_worker(config)).await
         }
-        Command::Leader {
-            plan,
-            profile,
-            min_peers,
-            evidence_file,
-            evidence_wait,
-            llama_server,
-            llama_args,
-            llama_port,
-            api,
-            worker_wait,
-            llama_ready_timeout,
-        } => {
+        Command::Leader(args) => {
+            let config = args.into_config(cli.key, cli.cluster)?;
             // Not wrapped in until_ctrl_c: the leader handles Ctrl-C itself to stop its parts in order.
-            leader::run_leader_process(LeaderConfig {
-                key_path: cli.key,
-                cluster_id: cli.cluster,
-                plan_path: plan,
-                profile_path: profile,
-                min_peers,
-                evidence: evidence_file.map(|path| EvidenceConfig {
-                    path,
-                    wait: evidence_wait,
-                }),
-                llama_server,
-                extra_llama_args: llama_args,
-                llama_port,
-                api_addr: api,
-                worker_wait,
-                llama_ready_timeout,
-            })
-            .await
+            leader::run_leader_process(config).await
         }
         Command::Prompt { api, ref text } => {
             println!("{}", api::prompt(api, text).await?);
@@ -749,15 +816,19 @@ mod tests {
         .expect("leader args");
         let prompt = Cli::try_parse_from(["meshthing", "prompt", "hello there"]).expect("prompt");
 
-        let Command::Leader {
+        let Command::Leader(LeaderArgs {
+            backend,
+            shard_manifest,
             api,
             llama_port,
             worker_wait,
             ..
-        } = leader.command
+        }) = leader.command
         else {
             panic!("expected leader, got {:?}", leader.command);
         };
+        assert_eq!(backend, BackendKind::Llama);
+        assert_eq!(shard_manifest, None);
         assert_eq!(api, leader::DEFAULT_API_ADDR);
         assert_eq!(llama_port, leader::DEFAULT_LLAMA_PORT);
         assert_eq!(worker_wait, Duration::from_secs(5));
@@ -787,13 +858,13 @@ mod tests {
     fn leader_verification_defaults_off_with_default_min_peers() {
         let command = parse_leader(&[]).expect("leader args");
 
-        let Command::Leader {
+        let Command::Leader(LeaderArgs {
             min_peers,
             evidence_file,
             evidence_wait,
             llama_args,
             ..
-        } = command
+        }) = command
         else {
             panic!("expected leader, got {command:?}");
         };
@@ -819,13 +890,13 @@ mod tests {
         ])
         .expect("leader args");
 
-        let Command::Leader {
+        let Command::Leader(LeaderArgs {
             min_peers,
             evidence_file,
             evidence_wait,
             llama_args,
             ..
-        } = command
+        }) = command
         else {
             panic!("expected leader, got {command:?}");
         };
@@ -841,5 +912,137 @@ mod tests {
             parse_leader(&["--evidence-wait", "5s"]).is_err(),
             "--evidence-wait without --evidence-file must be refused"
         );
+    }
+
+    /// `leader` with `args` and nothing else.
+    fn parse_leader_only(args: &[&str]) -> Result<Command, clap::Error> {
+        Cli::try_parse_from(["meshthing", "leader"].iter().chain(args)).map(|cli| cli.command)
+    }
+
+    /// The leader configuration `leader <args>` builds.
+    fn leader_config(args: &[&str]) -> LeaderConfig {
+        let command = parse_leader_only(args).expect("leader args");
+        let Command::Leader(args) = command else {
+            panic!("expected leader, got {command:?}");
+        };
+        args.into_config(PathBuf::from("leader.key"), "cluster".to_owned())
+            .expect("leader config")
+    }
+
+    #[test]
+    fn llama_backend_requires_plan_profile_and_llama_server() {
+        let required = [
+            ["--plan", "plan.json"],
+            ["--profile", "profile.json"],
+            ["--llama-server", "llama-server"],
+        ];
+        for missing in 0..required.len() {
+            let args: Vec<&str> = required
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != missing)
+                .flat_map(|(_, flag)| *flag)
+                .collect();
+            assert!(
+                parse_leader_only(&args).is_err(),
+                "leader without {} must be refused",
+                required[missing][0]
+            );
+            let explicit = [&["--backend", "llama"][..], &args].concat();
+            assert!(parse_leader_only(&explicit).is_err());
+        }
+    }
+
+    #[test]
+    fn llama_backend_builds_a_llama_config() {
+        let config = leader_config(&[
+            "--plan",
+            "plan.json",
+            "--profile",
+            "profile.json",
+            "--llama-server",
+            "llama-server",
+            "--evidence-file",
+            "evidence.json",
+            "--llama-port",
+            "9001",
+        ]);
+
+        let BackendConfig::Llama(llama) = &config.backend else {
+            panic!("expected the llama backend, got {:?}", config.backend);
+        };
+        assert_eq!(llama.plan_path, PathBuf::from("plan.json"));
+        assert_eq!(llama.profile_path, PathBuf::from("profile.json"));
+        assert_eq!(llama.llama_server, PathBuf::from("llama-server"));
+        assert_eq!(llama.min_peers, launch::DEFAULT_MIN_PEERS);
+        let evidence = llama.evidence.as_ref().expect("evidence configured");
+        assert_eq!(evidence.path, PathBuf::from("evidence.json"));
+        assert_eq!(evidence.wait, evidence::DEFAULT_EVIDENCE_WAIT);
+        assert_eq!(config.upstream_port, 9001);
+    }
+
+    #[test]
+    fn shard_backend_needs_only_a_manifest() {
+        let config = leader_config(&[
+            "--backend",
+            "shard",
+            "--shard-manifest",
+            "manifest.json",
+            "--llama-port",
+            "9002",
+            "--worker-wait",
+            "5s",
+        ]);
+
+        let BackendConfig::Shard(shard) = &config.backend else {
+            panic!("expected the shard backend, got {:?}", config.backend);
+        };
+        assert_eq!(shard.manifest_path, PathBuf::from("manifest.json"));
+        assert_eq!(config.upstream_port, 9002);
+        assert_eq!(config.worker_wait, Duration::from_secs(5));
+        assert_eq!(config.api_addr, leader::DEFAULT_API_ADDR);
+        assert_eq!(config.key_path, PathBuf::from("leader.key"));
+    }
+
+    #[test]
+    fn shard_backend_requires_a_manifest() {
+        assert!(
+            parse_leader_only(&["--backend", "shard"]).is_err(),
+            "--backend shard without --shard-manifest must be refused"
+        );
+    }
+
+    #[test]
+    fn shard_backend_refuses_llama_only_flags() {
+        let llama_only: [&[&str]; 8] = [
+            &["--plan", "plan.json"],
+            &["--profile", "profile.json"],
+            &["--min-peers", "3"],
+            &["--evidence-file", "evidence.json"],
+            &["--evidence-file", "evidence.json", "--evidence-wait", "5s"],
+            &["--llama-server", "llama-server"],
+            &["--llama-arg", "--cache-ram"],
+            &["--llama-ready-timeout", "5s"],
+        ];
+        let shard = ["--backend", "shard", "--shard-manifest", "manifest.json"];
+        for flags in llama_only {
+            let args = [&shard[..], flags].concat();
+            assert!(
+                parse_leader_only(&args).is_err(),
+                "{flags:?} must be refused with --backend shard"
+            );
+        }
+    }
+
+    #[test]
+    fn shard_manifest_requires_the_shard_backend() {
+        let without_backend = parse_leader(&["--shard-manifest", "manifest.json"]);
+        assert!(
+            without_backend.is_err(),
+            "--shard-manifest must be refused with the llama backend"
+        );
+        assert!(parse_leader_only(&["--shard-manifest", "manifest.json"]).is_err());
+        let explicit_llama = ["--backend", "llama", "--shard-manifest", "manifest.json"];
+        assert!(parse_leader_only(&explicit_llama).is_err());
     }
 }

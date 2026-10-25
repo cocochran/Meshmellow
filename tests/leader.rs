@@ -14,7 +14,7 @@ use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode};
 use llm_cluster::api;
 use llm_cluster::evidence::EvidenceConfig;
-use llm_cluster::leader::{LeaderConfig, run_leader_on};
+use llm_cluster::leader::{BackendConfig, LeaderConfig, LlamaBackendConfig, run_leader_on};
 use llm_cluster::planning::{self, PlanningRequest};
 use llm_cluster::protocol::{CONTROL_ALPN, RPC_BRIDGE_ALPN};
 use llm_cluster::worker::{WorkerConfig, run_worker_on};
@@ -110,16 +110,18 @@ impl Cluster {
         let config = LeaderConfig {
             key_path: dir.join("leader.key"),
             cluster_id: CLUSTER_ID.to_owned(),
-            plan_path: launch.plan_path,
-            profile_path: launch.profile_path,
-            min_peers: MIN_PEERS,
-            evidence: None,
-            llama_server: example_bin("fake_llama_server"),
-            extra_llama_args,
-            llama_port,
+            backend: BackendConfig::Llama(LlamaBackendConfig {
+                plan_path: launch.plan_path,
+                profile_path: launch.profile_path,
+                min_peers: MIN_PEERS,
+                evidence: None,
+                llama_server: example_bin("fake_llama_server"),
+                extra_llama_args,
+                llama_ready_timeout: LLAMA_READY_TIMEOUT,
+            }),
+            upstream_port: llama_port,
             api_addr,
             worker_wait: WORKER_WAIT,
-            llama_ready_timeout: LLAMA_READY_TIMEOUT,
         };
         Self {
             dir,
@@ -134,13 +136,26 @@ impl Cluster {
     }
 
     fn llama_addr(&self) -> SocketAddr {
-        SocketAddr::from((Ipv4Addr::LOCALHOST, self.config.llama_port))
+        SocketAddr::from((Ipv4Addr::LOCALHOST, self.config.upstream_port))
+    }
+
+    /// The llama backend settings of the leader's configuration.
+    fn llama(&mut self) -> &mut LlamaBackendConfig {
+        let BackendConfig::Llama(llama) = &mut self.config.backend else {
+            panic!("the leader tests run the llama backend");
+        };
+        llama
+    }
+
+    /// The plan file the leader loads.
+    fn plan_path(&mut self) -> PathBuf {
+        self.llama().plan_path.clone()
     }
 
     /// Turns on post-run verification and returns the file the test must write evidence to.
     fn expect_evidence(&mut self) -> PathBuf {
         let path = self.dir.join("evidence.json");
-        self.config.evidence = Some(EvidenceConfig {
+        self.llama().evidence = Some(EvidenceConfig {
             path: path.clone(),
             wait: TEST_TIMEOUT,
         });
@@ -441,8 +456,8 @@ async fn stop_cleanly(stop: oneshot::Sender<()>, leader: JoinHandle<anyhow::Resu
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn legacy_plan_is_rejected_before_anything_launches() {
-    let cluster = Cluster::new("legacy-plan", &[]).await;
-    edit_json(&cluster.config.plan_path, |plan| {
+    let mut cluster = Cluster::new("legacy-plan", &[]).await;
+    edit_json(&cluster.plan_path(), |plan| {
         plan["runtime_devices"] = json!([]);
     });
 
@@ -457,8 +472,8 @@ async fn legacy_plan_is_rejected_before_anything_launches() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn plan_failing_validation_is_rejected_before_anything_launches() {
-    let cluster = Cluster::new("invalid-plan", &[]).await;
-    edit_json(&cluster.config.plan_path, |plan| {
+    let mut cluster = Cluster::new("invalid-plan", &[]).await;
+    edit_json(&cluster.plan_path(), |plan| {
         plan["placement"]["model_hash"] = json!("some-other-model");
     });
 
@@ -595,7 +610,7 @@ async fn failed_readiness_probe_keeps_the_api_down() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failing_health_check_stops_startup() {
     let mut cluster = Cluster::new("health-fails", &["--fail-health"]).await;
-    cluster.config.llama_ready_timeout = SHORT_LLAMA_READY_TIMEOUT;
+    cluster.llama().llama_ready_timeout = SHORT_LLAMA_READY_TIMEOUT;
 
     let (_stop, leader) = cluster.start_leader();
     let worker = cluster.start_worker();
