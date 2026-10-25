@@ -298,39 +298,41 @@ fn plan_with_topology(
         if ring && peer.id != request.origin_peer_id {
             continue;
         }
-        for (&(begin, end), (range, charged)) in &ranges[index] {
+        for (&begin, alternatives) in &ranges[index] {
             if begin != 0 {
                 continue;
             }
-            let ingress = if peer.id == request.origin_peer_id {
-                None
-            } else {
-                link(
-                    &links,
-                    &request.origin_peer_id,
-                    &peer.id,
-                    request.workload.control_payload_bytes,
-                )
-            };
-            if peer.id != request.origin_peer_id && ingress.is_none() {
-                continue;
+            for (end, range, charged) in alternatives {
+                let ingress = if peer.id == request.origin_peer_id {
+                    None
+                } else {
+                    link(
+                        &links,
+                        &request.origin_peer_id,
+                        &peer.id,
+                        request.workload.control_payload_bytes,
+                    )
+                };
+                if peer.id != request.origin_peer_id && ingress.is_none() {
+                    continue;
+                }
+                let cost = range
+                    .decode_us
+                    .checked_add(ingress.map_or(0, |edge| edge.transfer_us))
+                    .ok_or(MeasuredError::Overflow)?;
+                let candidate = Candidate {
+                    cost,
+                    assignments: vec![MeasuredAssignment {
+                        peer_id: peer.id.clone(),
+                        layers: 0..*end,
+                        range_profile_id: range.profile_id.clone(),
+                        charged_bytes: charged.clone(),
+                        decode_us: range.decode_us,
+                    }],
+                    links: ingress.map_or_else(Vec::new, |edge| vec![edge.profile_id.clone()]),
+                };
+                insert_cheaper(&mut states, (1 << index, index, *end), candidate);
             }
-            let cost = range
-                .decode_us
-                .checked_add(ingress.map_or(0, |edge| edge.transfer_us))
-                .ok_or(MeasuredError::Overflow)?;
-            let candidate = Candidate {
-                cost,
-                assignments: vec![MeasuredAssignment {
-                    peer_id: peer.id.clone(),
-                    layers: 0..*end,
-                    range_profile_id: range.profile_id.clone(),
-                    charged_bytes: charged.clone(),
-                    decode_us: range.decode_us,
-                }],
-                links: ingress.map_or_else(Vec::new, |edge| vec![edge.profile_id.clone()]),
-            };
-            insert_cheaper(&mut states, (1 << index, index, *end), candidate);
         }
     }
     let subset_limit = 1usize << active.len();
