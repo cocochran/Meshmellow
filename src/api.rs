@@ -6,6 +6,9 @@
 //! are relayed chunk by chunk as they arrive; the assistant text is assembled on the side for
 //! the [`HistorySink`]. A streamed reply completes only after a valid `[DONE]` terminator;
 //! truncated, malformed or error-bearing SSE fails the job without committing history.
+//! The sink sees each running job's lifecycle: `started` when it gets the permit, then either
+//! `record` with the completed turn or `ended` with [`TurnOutcome::Failed`] or
+//! [`TurnOutcome::Canceled`].
 //! `GET /jobs` lists job states and `GET /peers` lists peers with authenticated control links.
 
 use std::future::Future;
@@ -28,7 +31,7 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
-use crate::history::{CompletedTurn, HistorySink};
+use crate::history::{CompletedTurn, HistorySink, StartedTurn, TurnOutcome};
 use crate::jobs::{JobInfo, JobPermit, JobQueue};
 use crate::network::SharedPeerTable;
 
@@ -94,7 +97,7 @@ struct ApiState {
 /// Each chat request acquires a permit from `queue`, has its optional `conversation_id`
 /// stripped, and is forwarded to llama-server (streaming or not). The permit is completed on
 /// success, failed on an upstream error or non-2xx reply, and canceled if the client
-/// disconnects. Completed turns go to `sink`.
+/// disconnects. `sink` is told when each job starts and how it ends (see [`HistorySink`]).
 pub async fn serve_api(
     config: ApiConfig,
     queue: Arc<JobQueue>,
@@ -261,26 +264,25 @@ async fn chat_completions(State(state): State<Arc<ApiState>>, body: Bytes) -> Re
         request_id = permit.request_id(),
         is_streaming, "job running"
     );
-    let turn = PendingTurn {
+    let turn = StartedTurn {
         request_id: permit.request_id().to_owned(),
         conversation_id,
         request,
     };
-    let send = state.client.post(&state.upstream_url).json(&turn.request);
+    let finish = JobFinish::start(permit, turn, Arc::clone(&state.sink));
+    let send = state
+        .client
+        .post(&state.upstream_url)
+        .json(&finish.turn.request);
     let upstream = match send.send().await {
         Ok(upstream) => upstream,
         Err(err) => {
             let reason = format!("upstream request failed: {err}");
-            return fail_job(permit, StatusCode::BAD_GATEWAY, reason);
+            return fail_job(finish, StatusCode::BAD_GATEWAY, reason);
         }
     };
-    let finish = JobFinish {
-        permit,
-        turn,
-        sink: Arc::clone(&state.sink),
-    };
     if !upstream.status().is_success() {
-        relay_upstream_error(upstream, finish.permit).await
+        relay_upstream_error(upstream, finish).await
     } else if is_streaming {
         relay_stream(upstream, finish)
     } else {
@@ -319,13 +321,12 @@ fn buffered_response_text(body: &[u8]) -> Result<String, String> {
 }
 
 /// Marks the job failed and answers with an OpenAI-style error body.
-fn fail_job(permit: JobPermit, status: StatusCode, reason: String) -> Response {
-    warn!(request_id = permit.request_id(), %reason, "job failed");
+fn fail_job(finish: JobFinish, status: StatusCode, reason: String) -> Response {
     let mut response = error_response(status, &reason);
-    if let Ok(request_id) = HeaderValue::from_str(permit.request_id()) {
+    if let Ok(request_id) = HeaderValue::from_str(finish.request_id()) {
         response.headers_mut().insert(REQUEST_ID_HEADER, request_id);
     }
-    permit.fail(reason);
+    finish.fail(reason);
     response
 }
 
@@ -363,15 +364,13 @@ fn upstream_content_type(upstream: &reqwest::Response) -> Option<HeaderValue> {
 }
 
 /// Passes a non-2xx llama-server reply through unchanged and fails the job.
-async fn relay_upstream_error(upstream: reqwest::Response, permit: JobPermit) -> Response {
+async fn relay_upstream_error(upstream: reqwest::Response, finish: JobFinish) -> Response {
     let status = upstream.status();
     let content_type = upstream_content_type(&upstream);
     // The status alone explains the failure; an unreadable error body is relayed as empty.
     let body = upstream.bytes().await.unwrap_or_default();
-    let response = relay_response(status, content_type, permit.request_id(), Body::from(body));
-    let reason = format!("upstream returned {status}");
-    warn!(request_id = permit.request_id(), %reason, "job failed");
-    permit.fail(reason);
+    let response = relay_response(status, content_type, finish.request_id(), Body::from(body));
+    finish.fail(format!("upstream returned {status}"));
     response
 }
 
@@ -383,15 +382,14 @@ async fn relay_buffered(upstream: reqwest::Response, finish: JobFinish) -> Respo
         Ok(body) => body,
         Err(err) => {
             let reason = format!("failed to read upstream reply: {err}");
-            return fail_job(finish.permit, StatusCode::BAD_GATEWAY, reason);
+            return fail_job(finish, StatusCode::BAD_GATEWAY, reason);
         }
     };
     let response_text = match buffered_response_text(&body) {
         Ok(text) => text,
-        Err(reason) => return fail_job(finish.permit, StatusCode::BAD_GATEWAY, reason),
+        Err(reason) => return fail_job(finish, StatusCode::BAD_GATEWAY, reason),
     };
-    let request_id = &finish.turn.request_id;
-    let response = relay_response(status, content_type, request_id, Body::from(body));
+    let response = relay_response(status, content_type, finish.request_id(), Body::from(body));
     finish.complete(response_text);
     response
 }
@@ -400,7 +398,7 @@ async fn relay_buffered(upstream: reqwest::Response, finish: JobFinish) -> Respo
 fn relay_stream(upstream: reqwest::Response, finish: JobFinish) -> Response {
     let status = upstream.status();
     let content_type = upstream_content_type(&upstream);
-    let request_id = finish.turn.request_id.clone();
+    let request_id = finish.request_id().to_owned();
     let relay = StreamRelay {
         chunks: Box::pin(upstream.bytes_stream()),
         assembler: SseTextAssembler::default(),
@@ -410,38 +408,81 @@ fn relay_stream(upstream: reqwest::Response, finish: JobFinish) -> Response {
     relay_response(status, content_type, &request_id, body)
 }
 
-/// The parts of a running request needed to record its outcome.
-struct PendingTurn {
-    request_id: String,
-    conversation_id: Option<String>,
-    request: Value,
-}
-
-/// Owns a running job's permit until its reply is fully delivered.
+/// Owns a running job's permit until its reply is fully delivered, and reports the job's
+/// lifecycle to the history sink: `started` on creation, then exactly one of `record`
+/// ([`complete`](Self::complete)), `ended(Failed)` ([`fail`](Self::fail)), or `ended(Canceled)`
+/// when dropped unfinished because the client went away.
+///
+/// The sink is told before the permit is released, so its calls for this job finish before the
+/// next queued job can start.
 struct JobFinish {
-    permit: JobPermit,
-    turn: PendingTurn,
+    turn: StartedTurn,
     sink: Arc<dyn HistorySink>,
+    /// `Some` until the job's outcome is reported.
+    permit: Option<JobPermit>,
 }
 
 impl JobFinish {
-    /// Completes the job and hands the turn to the history sink.
-    fn complete(self, response_text: String) {
-        info!(request_id = self.permit.request_id(), "job completed");
-        self.permit.complete();
+    /// Takes over a freshly acquired permit and reports the job as started.
+    fn start(permit: JobPermit, turn: StartedTurn, sink: Arc<dyn HistorySink>) -> Self {
+        sink.started(&turn);
+        Self {
+            turn,
+            sink,
+            permit: Some(permit),
+        }
+    }
+
+    fn request_id(&self) -> &str {
+        &self.turn.request_id
+    }
+
+    /// Hands the completed turn to the history sink, then completes the job.
+    fn complete(mut self, response_text: String) {
+        let Some(permit) = self.permit.take() else {
+            return;
+        };
+        info!(request_id = self.request_id(), "job completed");
         self.sink.record(CompletedTurn {
-            request_id: self.turn.request_id,
-            conversation_id: self.turn.conversation_id,
-            request: self.turn.request,
+            request_id: std::mem::take(&mut self.turn.request_id),
+            conversation_id: self.turn.conversation_id.take(),
+            request: self.turn.request.take(),
             response_text,
         });
+        permit.complete();
+    }
+
+    /// Reports the failure to the history sink, then fails the job with the same reason.
+    fn fail(mut self, reason: String) {
+        let Some(permit) = self.permit.take() else {
+            return;
+        };
+        warn!(request_id = self.request_id(), %reason, "job failed");
+        let outcome = TurnOutcome::Failed {
+            reason: reason.clone(),
+        };
+        self.sink.ended(self.request_id(), outcome);
+        permit.fail(reason);
+    }
+}
+
+impl Drop for JobFinish {
+    /// Dropped without an outcome: the client went away, so the job is canceled.
+    fn drop(&mut self) {
+        let Some(permit) = self.permit.take() else {
+            return;
+        };
+        info!(request_id = self.request_id(), "job canceled");
+        self.sink.ended(self.request_id(), TurnOutcome::Canceled);
+        // Dropping the permit without an outcome marks the job canceled and frees the slot.
+        drop(permit);
     }
 }
 
 type UpstreamChunks = Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>;
 
 /// State of one streamed reply. Dropping it before the upstream stream ends (the client
-/// disconnected) drops the permit, which cancels the job.
+/// disconnected) drops the [`JobFinish`], which cancels the job.
 struct StreamRelay {
     chunks: UpstreamChunks,
     assembler: SseTextAssembler,
@@ -459,9 +500,7 @@ impl StreamRelay {
                 Some((Ok(chunk), self))
             }
             Some(Err(err)) => {
-                let reason = format!("upstream stream failed: {err}");
-                warn!(request_id = finish.permit.request_id(), %reason, "job failed");
-                finish.permit.fail(reason);
+                finish.fail(format!("upstream stream failed: {err}"));
                 Some((Err(std::io::Error::other(err)), self))
             }
             None => match std::mem::take(&mut self.assembler).finish() {
@@ -470,8 +509,7 @@ impl StreamRelay {
                     None
                 }
                 Err(reason) => {
-                    warn!(request_id = finish.permit.request_id(), %reason, "job failed");
-                    finish.permit.fail(reason.to_owned());
+                    finish.fail(reason.to_owned());
                     Some((
                         Err(std::io::Error::new(
                             std::io::ErrorKind::UnexpectedEof,
@@ -555,18 +593,50 @@ mod tests {
     use crate::jobs::JobStatus;
     use std::sync::Mutex;
 
-    #[derive(Default)]
-    struct RecordingSink(Mutex<Vec<CompletedTurn>>);
+    /// One history hook call, keyed by the job's request ID.
+    #[derive(Debug, PartialEq)]
+    enum Hook {
+        Started(String),
+        Recorded {
+            request_id: String,
+            response_text: String,
+        },
+        Ended(String, TurnOutcome),
+    }
 
-    impl HistorySink for RecordingSink {
-        fn record(&self, turn: CompletedTurn) {
-            self.0.lock().unwrap().push(turn);
+    #[derive(Default)]
+    struct RecordingSink(Mutex<Vec<Hook>>);
+
+    impl RecordingSink {
+        fn hooks(&self) -> std::sync::MutexGuard<'_, Vec<Hook>> {
+            self.0.lock().unwrap()
         }
     }
 
-    async fn check_stream(events: &str, succeeds: bool) {
-        let queue = Arc::new(JobQueue::new());
-        let sink = Arc::new(RecordingSink::default());
+    impl HistorySink for RecordingSink {
+        fn started(&self, turn: &StartedTurn) {
+            self.hooks().push(Hook::Started(turn.request_id.clone()));
+        }
+
+        fn record(&self, turn: CompletedTurn) {
+            self.hooks().push(Hook::Recorded {
+                request_id: turn.request_id,
+                response_text: turn.response_text,
+            });
+        }
+
+        fn ended(&self, request_id: &str, outcome: TurnOutcome) {
+            self.hooks()
+                .push(Hook::Ended(request_id.to_owned(), outcome));
+        }
+    }
+
+    /// Acquires a permit and wraps `events` (split into 3-byte chunks) in a stream relay.
+    async fn start_relay(
+        queue: &JobQueue,
+        sink: &Arc<RecordingSink>,
+        events: &str,
+    ) -> (StreamRelay, String) {
         let permit = queue.acquire(None).await;
         let request_id = permit.request_id().to_owned();
         let chunks = events
@@ -574,19 +644,23 @@ mod tests {
             .chunks(3)
             .map(|chunk| Ok::<_, reqwest::Error>(Bytes::copy_from_slice(chunk)))
             .collect::<Vec<_>>();
+        let turn = StartedTurn {
+            request_id: request_id.clone(),
+            conversation_id: None,
+            request: json!({}),
+        };
         let relay = StreamRelay {
             chunks: Box::pin(stream::iter(chunks)),
             assembler: SseTextAssembler::default(),
-            finish: Some(JobFinish {
-                permit,
-                turn: PendingTurn {
-                    request_id,
-                    conversation_id: None,
-                    request: json!({}),
-                },
-                sink: sink.clone(),
-            }),
+            finish: Some(JobFinish::start(permit, turn, sink.clone())),
         };
+        (relay, request_id)
+    }
+
+    async fn check_stream(events: &str, succeeds: bool) {
+        let queue = Arc::new(JobQueue::new());
+        let sink = Arc::new(RecordingSink::default());
+        let (relay, request_id) = start_relay(&queue, &sink, events).await;
         let mut remaining = Some(relay);
         let mut failed = false;
         while let Some(relay) = remaining.take() {
@@ -605,16 +679,50 @@ mod tests {
             }
         );
         {
-            let turns = sink.0.lock().unwrap();
-            assert_eq!(turns.len(), usize::from(succeeds));
+            let hooks = sink.hooks();
+            assert_eq!(
+                hooks.len(),
+                2,
+                "started plus exactly one outcome: {hooks:?}"
+            );
+            assert_eq!(hooks[0], Hook::Started(request_id.clone()));
             if succeeds {
-                assert_eq!(turns[0].response_text, "Hello");
+                let recorded = Hook::Recorded {
+                    request_id,
+                    response_text: "Hello".to_owned(),
+                };
+                assert_eq!(hooks[1], recorded);
+            } else {
+                assert!(
+                    matches!(&hooks[1], Hook::Ended(id, TurnOutcome::Failed { .. }) if *id == request_id),
+                    "unexpected outcome: {:?}",
+                    hooks[1]
+                );
             }
         }
         let next = tokio::time::timeout(Duration::from_secs(1), queue.acquire(None))
             .await
             .expect("stream outcome must release the running slot");
         next.complete();
+    }
+
+    #[tokio::test]
+    async fn dropping_a_stream_mid_reply_reports_canceled_once() {
+        let queue = JobQueue::new();
+        let sink = Arc::new(RecordingSink::default());
+        let events = format!("{}data: [DONE]\n\n", delta_event("Hello"));
+        let (relay, request_id) = start_relay(&queue, &sink, &events).await;
+        let (chunk, relay) = relay.next_chunk().await.expect("first chunk");
+        chunk.unwrap();
+        drop(relay);
+        assert_eq!(
+            *sink.hooks(),
+            [
+                Hook::Started(request_id.clone()),
+                Hook::Ended(request_id, TurnOutcome::Canceled),
+            ]
+        );
+        assert_eq!(queue.jobs()[0].status, JobStatus::Canceled);
     }
 
     #[tokio::test]
