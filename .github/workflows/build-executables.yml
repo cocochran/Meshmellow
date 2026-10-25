@@ -2,6 +2,7 @@ name: Build executables
 
 on:
   push:
+    branches: [main]
     paths:
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -25,7 +26,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: executables-${{ github.ref }}
+  group: executables-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
