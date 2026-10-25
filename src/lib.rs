@@ -7,6 +7,7 @@ pub mod history_sync;
 pub mod jobs;
 pub mod launch;
 pub mod leader;
+pub mod measured_placement;
 pub mod network;
 pub mod node;
 pub mod placement;

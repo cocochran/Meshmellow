@@ -89,6 +89,18 @@ enum Command {
         #[arg(long, default_value_t = 2)]
         min_peers: usize,
     },
+    /// Search exact measured shard ranges and directed links; advisory JSON only.
+    MeasuredPlan {
+        /// Versioned JSON with fresh range, link and memory observations.
+        profile: PathBuf,
+    },
+    /// Recheck a saved measured plan against refreshed observations; no runtime verification.
+    ValidateMeasured {
+        /// JSON produced by `measured-plan`.
+        plan: PathBuf,
+        /// Versioned measured profile with current capacity and time.
+        profile: PathBuf,
+    },
     /// Print this node's ID and accept control connections from peers.
     Listen,
     /// Connect to a listening node, exchange hellos, and print the peer's hello.
@@ -374,6 +386,24 @@ async fn main() -> anyhow::Result<()> {
             let output = llm_cluster::planning::build_plan(&request, min_peers)
                 .map_err(|error| anyhow::anyhow!("planning failed: {error:?}"))?;
             println!("{}", serde_json::to_string_pretty(&output)?);
+            Ok(())
+        }
+        Command::MeasuredPlan { profile } => {
+            let request: llm_cluster::measured_placement::MeasuredRequest =
+                serde_json::from_str(&std::fs::read_to_string(profile)?)?;
+            let output = llm_cluster::measured_placement::plan(&request)
+                .map_err(|error| anyhow::anyhow!("measured planning failed: {error:?}"))?;
+            println!("{}", serde_json::to_string_pretty(&output)?);
+            Ok(())
+        }
+        Command::ValidateMeasured { plan, profile } => {
+            let request: llm_cluster::measured_placement::MeasuredRequest =
+                serde_json::from_str(&std::fs::read_to_string(profile)?)?;
+            let output: llm_cluster::measured_placement::MeasuredPlacement =
+                serde_json::from_str(&std::fs::read_to_string(plan)?)?;
+            llm_cluster::measured_placement::validate_output(&request, &output)
+                .map_err(|error| anyhow::anyhow!("measured plan validation failed: {error:?}"))?;
+            println!("{{\"validated\":true}}");
             Ok(())
         }
         Command::Listen => listen(&cli.key, &cli.cluster).await,

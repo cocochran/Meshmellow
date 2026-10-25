@@ -1,5 +1,10 @@
 # Compute distribution: placement and RPC planning
 
+For exact contiguous-range measurements and joint peer order/range search,
+see the separate [M-5 measured placement path](measured-placement.md). It
+produces an advisory shard-stage plan and does not change this RPC launch
+contract.
+
 Aarush's component exposes a transport-independent Rust library. It selects
 contiguous layers for eligible contributors and prepares advisory llama.cpp
 server arguments. It does not start workers, run a model, enforce OS memory caps,
