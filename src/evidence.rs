@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail};
+use tokio::io::AsyncReadExt;
 use tokio::time::Instant;
 
 use crate::launch::LaunchPlan;
@@ -21,6 +22,9 @@ pub const DEFAULT_EVIDENCE_WAIT: Duration = Duration::from_secs(120);
 /// How often the evidence file is re-read while waiting for it.
 const EVIDENCE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Evidence reports are small summaries; cap reads even if a configured file keeps growing.
+const MAX_EVIDENCE_BYTES: usize = 1024 * 1024;
+
 /// Where to find the run evidence and how long to wait for it.
 #[derive(Debug, Clone)]
 pub struct EvidenceConfig {
@@ -28,6 +32,12 @@ pub struct EvidenceConfig {
     pub path: PathBuf,
     /// Longest time to wait for the file to exist and parse.
     pub wait: Duration,
+}
+
+#[derive(Debug)]
+enum EvidenceReadError {
+    Retry(String),
+    TooLarge,
 }
 
 /// Waits for the run evidence file, then verifies it against the launch plan.
@@ -52,7 +62,13 @@ async fn wait_for_evidence(config: &EvidenceConfig) -> anyhow::Result<RunEvidenc
         match read_evidence(&config.path).await {
             Ok(Some(evidence)) => return Ok(evidence),
             Ok(None) => {}
-            Err(error) => last_error = Some(error),
+            Err(EvidenceReadError::Retry(error)) => last_error = Some(error),
+            Err(EvidenceReadError::TooLarge) => {
+                bail!(
+                    "run evidence at {} exceeds {MAX_EVIDENCE_BYTES} bytes",
+                    config.path.display()
+                );
+            }
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -64,15 +80,25 @@ async fn wait_for_evidence(config: &EvidenceConfig) -> anyhow::Result<RunEvidenc
 
 /// Reads the evidence file: `Ok(None)` while it does not exist yet, `Err` with a description
 /// while it cannot be read or parsed (for example, because it is still being written).
-async fn read_evidence(path: &Path) -> Result<Option<RunEvidence>, String> {
-    let text = match tokio::fs::read_to_string(path).await {
-        Ok(text) => text,
+async fn read_evidence(path: &Path) -> Result<Option<RunEvidence>, EvidenceReadError> {
+    let file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("failed to read: {error}")),
+        Err(error) => return Err(EvidenceReadError::Retry(format!("failed to read: {error}"))),
     };
+    let mut bytes = Vec::new();
+    file.take((MAX_EVIDENCE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|error| EvidenceReadError::Retry(format!("failed to read: {error}")))?;
+    if bytes.len() > MAX_EVIDENCE_BYTES {
+        return Err(EvidenceReadError::TooLarge);
+    }
+    let text = String::from_utf8(bytes)
+        .map_err(|error| EvidenceReadError::Retry(format!("evidence is not UTF-8: {error}")))?;
     serde_json::from_str(&text)
         .map(Some)
-        .map_err(|error| format!("invalid run evidence JSON: {error}"))
+        .map_err(|error| EvidenceReadError::Retry(format!("invalid run evidence JSON: {error}")))
 }
 
 fn timeout_message(config: &EvidenceConfig, last_error: Option<&str>) -> String {
@@ -158,6 +184,17 @@ mod tests {
         let config = temp_config();
 
         assert!(read_evidence(&config.path).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn oversized_evidence_is_rejected_at_the_read_limit() {
+        let config = temp_config();
+        std::fs::write(&config.path, vec![b'x'; MAX_EVIDENCE_BYTES + 1]).unwrap();
+
+        let result = read_evidence(&config.path).await;
+
+        std::fs::remove_file(&config.path).unwrap();
+        assert!(matches!(result, Err(EvidenceReadError::TooLarge)));
     }
 
     #[tokio::test]

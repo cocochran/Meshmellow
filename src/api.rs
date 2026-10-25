@@ -15,7 +15,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use axum::body::{Body, Bytes};
@@ -29,10 +29,10 @@ use futures_util::{Stream, StreamExt, stream};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::history::{CompletedTurn, HistorySink, StartedTurn, TurnOutcome};
-use crate::jobs::{JobInfo, JobPermit, JobQueue};
+use crate::jobs::{JobInfo, JobPermit, JobQueue, MAX_OUTSTANDING_JOBS};
 use crate::network::SharedPeerTable;
 
 /// OpenAI-compatible chat endpoint, served here and by llama-server.
@@ -65,6 +65,15 @@ const SSE_DATA_PREFIX: &str = "data:";
 
 /// Payload that ends an OpenAI-style event stream.
 const SSE_DONE: &str = "[DONE]";
+
+/// Largest buffered SSE event line before the upstream stream is rejected as invalid.
+const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
+
+/// Largest non-streaming upstream response retained in memory.
+const MAX_BUFFERED_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Largest assistant response retained for conversation history; streaming to the client can continue.
+const MAX_HISTORY_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// JSON pointer to the assistant text in a non-streamed chat completion.
 const MESSAGE_CONTENT_POINTER: &str = "/choices/0/message/content";
@@ -188,10 +197,12 @@ pub async fn prompt(api: SocketAddr, text: &str) -> anyhow::Result<String> {
         .await
         .with_context(|| format!("failed to reach the api at {api}"))?;
     let status = response.status();
-    let body = response
-        .bytes()
+    let chunks = response
+        .bytes_stream()
+        .map(|chunk| chunk.context("failed to read the api reply body"));
+    let body = collect_upstream_chunks(Box::pin(chunks), MAX_BUFFERED_RESPONSE_BYTES)
         .await
-        .context("failed to read the api reply")?;
+        .context("failed to read bounded api reply")?;
     if !status.is_success() {
         bail!("api returned {status}: {}", String::from_utf8_lossy(&body));
     }
@@ -258,11 +269,22 @@ async fn chat_completions(State(state): State<Arc<ApiState>>, body: Bytes) -> Re
         Ok(parsed) => parsed,
         Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
     };
-    let permit = state.queue.acquire(conversation_id.clone()).await;
+    let queued_at = Instant::now();
+    let Some(permit) = state.queue.try_acquire(conversation_id.clone()).await else {
+        debug!(
+            limit = MAX_OUTSTANDING_JOBS,
+            "inference queue is full; rejecting request"
+        );
+        return error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "inference queue is full; retry after a running job finishes",
+        );
+    };
+    let queue_wait_ms = queued_at.elapsed().as_millis();
     let is_streaming = request.get("stream").and_then(Value::as_bool) == Some(true);
     info!(
         request_id = permit.request_id(),
-        is_streaming, "job running"
+        queue_wait_ms, is_streaming, "job running"
     );
     let turn = StartedTurn {
         request_id: permit.request_id().to_owned(),
@@ -367,10 +389,17 @@ fn upstream_content_type(upstream: &reqwest::Response) -> Option<HeaderValue> {
 async fn relay_upstream_error(upstream: reqwest::Response, finish: JobFinish) -> Response {
     let status = upstream.status();
     let content_type = upstream_content_type(&upstream);
-    // The status alone explains the failure; an unreadable error body is relayed as empty.
-    let body = upstream.bytes().await.unwrap_or_default();
+    // The status alone explains the failure; an unreadable or oversized error body is relayed empty.
+    let body = match buffer_upstream(upstream, MAX_BUFFERED_RESPONSE_BYTES).await {
+        Ok(body) => body,
+        Err(error) => {
+            warn!(request_id = finish.request_id(), %error, "could not buffer upstream error body");
+            Bytes::new()
+        }
+    };
     let response = relay_response(status, content_type, finish.request_id(), Body::from(body));
-    finish.fail(format!("upstream returned {status}"));
+    let reason = format!("upstream returned {status}");
+    finish.fail(reason);
     response
 }
 
@@ -378,7 +407,7 @@ async fn relay_upstream_error(upstream: reqwest::Response, finish: JobFinish) ->
 async fn relay_buffered(upstream: reqwest::Response, finish: JobFinish) -> Response {
     let status = upstream.status();
     let content_type = upstream_content_type(&upstream);
-    let body = match upstream.bytes().await {
+    let body = match buffer_upstream(upstream, MAX_BUFFERED_RESPONSE_BYTES).await {
         Ok(body) => body,
         Err(err) => {
             let reason = format!("failed to read upstream reply: {err}");
@@ -392,6 +421,35 @@ async fn relay_buffered(upstream: reqwest::Response, finish: JobFinish) -> Respo
     let response = relay_response(status, content_type, finish.request_id(), Body::from(body));
     finish.complete(response_text);
     response
+}
+
+/// Collects a non-streaming upstream reply without allowing its body to grow without bound.
+async fn buffer_upstream(upstream: reqwest::Response, limit: usize) -> anyhow::Result<Bytes> {
+    if upstream
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        bail!("upstream response exceeds the {limit}-byte buffering limit");
+    }
+    let chunks = upstream
+        .bytes_stream()
+        .map(|chunk| chunk.context("failed to read upstream response body"));
+    collect_upstream_chunks(Box::pin(chunks), limit).await
+}
+
+async fn collect_upstream_chunks(
+    mut chunks: impl Stream<Item = anyhow::Result<Bytes>> + Unpin,
+    limit: usize,
+) -> anyhow::Result<Bytes> {
+    let mut body = Vec::new();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk?;
+        if body.len().saturating_add(chunk.len()) > limit {
+            bail!("response exceeds the {limit}-byte buffering limit");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(body))
 }
 
 /// Relays a streamed reply chunk by chunk; the job finishes when the stream does.
@@ -477,6 +535,16 @@ impl Drop for JobFinish {
         // Dropping the permit without an outcome marks the job canceled and frees the slot.
         drop(permit);
     }
+
+    /// Completes the request without retaining an oversized response in conversation history.
+    fn complete_without_history(self) {
+        warn!(
+            request_id = self.permit.request_id(),
+            limit_bytes = MAX_HISTORY_RESPONSE_BYTES,
+            "job completed but response was too large to retain in history"
+        );
+        self.permit.complete();
+    }
 }
 
 type UpstreamChunks = Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>;
@@ -504,8 +572,12 @@ impl StreamRelay {
                 Some((Err(std::io::Error::other(err)), self))
             }
             None => match std::mem::take(&mut self.assembler).finish() {
-                Ok(text) => {
+                Ok(Some(text)) => {
                     finish.complete(text);
+                    None
+                }
+                Ok(None) => {
+                    finish.complete_without_history();
                     None
                 }
                 Err(reason) => {
@@ -532,14 +604,43 @@ struct SseTextAssembler {
     text: String,
     done: bool,
     invalid: bool,
+    history_limited: bool,
 }
 
 impl SseTextAssembler {
     fn push(&mut self, bytes: &[u8]) {
-        self.partial_line.extend_from_slice(bytes);
-        while let Some(newline) = self.partial_line.iter().position(|&byte| byte == b'\n') {
-            let line: Vec<u8> = self.partial_line.drain(..=newline).collect();
+        if self.invalid {
+            return;
+        }
+
+        let mut offset = 0;
+        while let Some(relative_newline) = bytes[offset..].iter().position(|&byte| byte == b'\n') {
+            let line_end = offset + relative_newline + 1;
+            let line_len = self.partial_line.len().saturating_add(line_end - offset);
+            if line_len > MAX_SSE_LINE_BYTES {
+                self.invalid = true;
+                self.partial_line.clear();
+                return;
+            }
+
+            let mut line = std::mem::take(&mut self.partial_line);
+            line.extend_from_slice(&bytes[offset..line_end]);
             self.absorb_line(&line);
+            line.clear();
+            self.partial_line = line;
+            if self.invalid {
+                self.partial_line.clear();
+                return;
+            }
+            offset = line_end;
+        }
+
+        let remaining = &bytes[offset..];
+        if self.partial_line.len().saturating_add(remaining.len()) > MAX_SSE_LINE_BYTES {
+            self.invalid = true;
+            self.partial_line.clear();
+        } else {
+            self.partial_line.extend_from_slice(remaining);
         }
     }
 
@@ -553,7 +654,11 @@ impl SseTextAssembler {
         };
         let data = data.trim_start();
         if data == SSE_DONE {
-            self.done = true;
+            if self.done {
+                self.invalid = true;
+            } else {
+                self.done = true;
+            }
             return;
         }
         if self.done {
@@ -569,12 +674,17 @@ impl SseTextAssembler {
             return;
         }
         if let Some(fragment) = chunk.pointer(DELTA_CONTENT_POINTER).and_then(Value::as_str) {
-            self.text.push_str(fragment);
+            if self.text.len().saturating_add(fragment.len()) > MAX_HISTORY_RESPONSE_BYTES {
+                self.text = String::new();
+                self.history_limited = true;
+            } else if !self.history_limited {
+                self.text.push_str(fragment);
+            }
         }
     }
 
     /// A complete response must end with [DONE], including without a final newline.
-    fn finish(mut self) -> Result<String, &'static str> {
+    fn finish(mut self) -> Result<Option<String>, &'static str> {
         let rest = std::mem::take(&mut self.partial_line);
         self.absorb_line(&rest);
         if self.invalid {
@@ -583,7 +693,7 @@ impl SseTextAssembler {
         if !self.done {
             return Err("upstream SSE ended before [DONE]");
         }
-        Ok(self.text)
+        Ok((!self.history_limited).then_some(self.text))
     }
 }
 
@@ -747,6 +857,12 @@ mod tests {
             )
             .await;
         }
+        for trailing in [
+            "data: [DONE]\n\ndata: [DONE]\n\n",
+            "data: [DONE]\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\n",
+        ] {
+            check_stream(&format!("{}{trailing}", delta_event("Hello")), false).await;
+        }
     }
 
     fn delta_event(fragment: &str) -> String {
@@ -799,7 +915,7 @@ mod tests {
         for piece in events.as_bytes().chunks(7) {
             assembler.push(piece);
         }
-        assert_eq!(assembler.finish().unwrap(), "Hello, wörld");
+        assert_eq!(assembler.finish().unwrap(), Some("Hello, wörld".to_owned()));
     }
 
     #[test]
@@ -808,7 +924,33 @@ mod tests {
         assembler.push(delta_event("a").replace('\n', "\r\n").as_bytes());
         assembler.push(delta_event("b").as_bytes());
         assembler.push(b"data: [DONE]");
-        assert_eq!(assembler.finish().unwrap(), "ab");
+        assert_eq!(assembler.finish().unwrap(), Some("ab".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn upstream_buffer_stops_at_its_limit() {
+        let chunks = stream::iter([
+            Ok(Bytes::from_static(b"123")),
+            Ok(Bytes::from_static(b"456")),
+        ]);
+        let error = collect_upstream_chunks(chunks, 5)
+            .await
+            .expect_err("oversized reply must not be buffered");
+        assert!(error.to_string().contains("buffering limit"));
+    }
+
+    #[test]
+    fn oversized_stream_text_is_not_retained_for_history() {
+        let mut assembler = SseTextAssembler {
+            text: "x".repeat(MAX_HISTORY_RESPONSE_BYTES),
+            ..SseTextAssembler::default()
+        };
+        assembler.absorb_line(br#"data: {"choices":[{"delta":{"content":"y"}}]}"#);
+        assembler.done = true;
+
+        assert!(assembler.history_limited);
+        assert!(assembler.text.is_empty());
+        assert_eq!(assembler.finish().unwrap(), None);
     }
 
     #[test]

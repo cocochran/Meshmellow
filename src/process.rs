@@ -40,6 +40,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 /// Longest HTTP status line read during a [`Readiness::HttpOk`] probe.
 const MAX_STATUS_LINE_LEN: u64 = 1024;
 
+/// Maximum child output buffered for one tracing event; longer lines are split into chunks.
+const MAX_CHILD_LOG_LINE_BYTES: u64 = 8 * 1024;
+
 const DEFAULT_MAX_RESTARTS: u32 = 3;
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(8);
@@ -321,11 +324,17 @@ async fn forward_lines(name: String, stream: &'static str, pipe: impl AsyncRead 
     let mut line = Vec::new();
     loop {
         line.clear();
-        match reader.read_until(b'\n', &mut line).await {
+        match (&mut reader)
+            .take(MAX_CHILD_LOG_LINE_BYTES)
+            .read_until(b'\n', &mut line)
+            .await
+        {
             Ok(0) => return,
             Ok(_) => {
+                let truncated =
+                    line.last() != Some(&b'\n') && line.len() as u64 == MAX_CHILD_LOG_LINE_BYTES;
                 let text = String::from_utf8_lossy(line.trim_ascii_end());
-                info!(target: CHILD_LOG_TARGET, name = %name, stream, "{text}");
+                info!(target: CHILD_LOG_TARGET, name = %name, stream, truncated, "{text}");
             }
             Err(error) => {
                 warn!(target: CHILD_LOG_TARGET, name = %name, stream, %error, "failed to read child output");
