@@ -6,7 +6,7 @@ android {
     namespace = "org.meshthing.mobile"
     compileSdk { version = release(36) { minorApiLevel = 1 } }
     buildToolsVersion = "36.1.0"
-    defaultConfig { applicationId = "org.meshthing.mobile"; testInstrumentationRunner = "org.meshthing.mobile.MeshInstrumentation"; minSdk = 26; targetSdk = 36; versionCode = 1; versionName = "0.1.0" }
+    defaultConfig { applicationId = "org.meshthing.mobile"; testInstrumentationRunner = providers.gradleProperty("backgroundTest").map { "org.meshthing.mobile.BackgroundInstrumentation" }.getOrElse("org.meshthing.mobile.MeshInstrumentation"); minSdk = 26; targetSdk = 36; versionCode = 1; versionName = "0.1.0" }
     buildFeatures { compose = true }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
     testOptions { unitTests.isReturnDefaultValues = true }

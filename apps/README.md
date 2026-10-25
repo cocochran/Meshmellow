@@ -55,7 +55,8 @@ hide those limitations behind a Start button. Coordinate M-26 with the core owne
    memory accounting and no automatic eligibility from OS inventory alone.
 4. Staged model file access, full verification, reserved capacity and ready state.
 5. Start/stop/join lifecycle that terminates owned tasks, reports errors and
-   withdraws availability on background/suspension; foreground-only initially.
+   withdraws availability on suspension. Android now supports opt-in background
+   peer connectivity via a foreground service; iOS membership remains foreground-only.
 6. Versioned events consumed by all UI clients. No arbitrary command execution
    or fixed diagnostic peer keys in app code.
 
@@ -71,3 +72,8 @@ membership. The private device identity is retained. Other devices keep their me
 and signed trust history and see the departed device offline; this is not global
 trust revocation. A returning device can use a fresh invitation and must be approved
 again. The same core command (`{"op":"leave"}`) is used by web, iOS and Android.
+
+Android’s **Keep mesh active** service keeps the core connected when its Activity
+is closed. See [background usage and battery limits](android/README.md#keep-the-mesh-active-in-the-background).
+This does not make mobile model execution ready. [iOS background limits](ios/README.md#background-limits)
+allow future finite jobs, not an indefinite mesh listener.

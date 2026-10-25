@@ -40,12 +40,13 @@ data class EnrollmentState(
     }
 }
 
-class EnrollmentController(private val app: Application) {
+class EnrollmentController(private val app: Application, private val directory: java.io.File = java.io.File(app.noBackupFilesDir, "enrollment")) {
     var state by mutableStateOf<EnrollmentState?>(null); private set
     var error by mutableStateOf(""); private set
     var discoveryError by mutableStateOf(""); private set
     var busy by mutableStateOf(false); private set
     private var active = false
+    val isRunning get() = active
     private val mutex = Mutex()
 
     private suspend fun call(command: JSONObject, update: Boolean = true) {
@@ -59,10 +60,10 @@ class EnrollmentController(private val app: Application) {
         active = true
         try {
             EnrollmentNative.initialize(app)
-            call(JSONObject().put("op", "open").put("directory", java.io.File(app.noBackupFilesDir, "enrollment").absolutePath))
+            call(JSONObject().put("op", "open").put("directory", directory.absolutePath))
             error = ""
         } catch (cancelled: CancellationException) { throw cancelled }
-        catch (failure: Exception) { error = failure.message ?: "Cannot start enrollment." }
+        catch (failure: Exception) { active = false; state = null; error = failure.message ?: "Cannot start enrollment." }
     }
     suspend fun stop() {
         active = false
