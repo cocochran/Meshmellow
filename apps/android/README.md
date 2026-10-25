@@ -39,9 +39,21 @@ Use an explicit device ID for installation and port forwarding. Do not replace
 or interfere with active experimental workers while validating the app.
 
 See [mobile capabilities and core integration](../README.md). The application
-runs the core Iroh endpoint with Internet invitation lookup while in the foreground.
+runs the core Iroh endpoint with signed full invitations while in the foreground.
 It creates meshes, shares signed invitations and manages trusted membership.
 Native inference and automatic benchmarking are not yet connected. No broad storage permission, background
 service, wake lock, diagnostic peer identity or model weights are included.
 
 Full invitations work over Iroh without a lookup service. No Layercake server needs to be hosted. See [core membership](../../docs/mesh-membership.md). Device validation uses physical phones; do not start an Android emulator.
+
+Cake QR invitations are generated locally with ZXing. Join a mesh → Scan cake QR
+requests CAMERA permission on demand and opens a full-screen CameraX preview with bundled, offline ML Kit QR recognition.
+Tap to focus, pinch to zoom, automatic zoom suggestions and a flashlight help
+read dense invitations. ZXing is used only to generate the QR image.
+Denied access offers Camera settings and paste. Scanning fills the invitation;
+Request to join and trusted approval are still required. Camera hardware is
+optional, so devices without a camera can paste invitations.
+
+Trusted device cards show reported OpenAI API URLs, copy controls and inference
+readiness. Loopback URLs belong to the named device. Mobile membership currently
+has no HTTP inference listener and reports that explicitly.

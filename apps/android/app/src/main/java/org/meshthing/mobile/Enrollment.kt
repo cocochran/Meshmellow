@@ -18,7 +18,8 @@ object EnrollmentNative {
     @JvmStatic external fun command(input: String): String
 }
 
-data class TrustedMember(val id: String, val name: String, val online: Boolean = false)
+data class NodeAPI(val baseURL: String, val ready: Boolean, val message: String)
+data class TrustedMember(val id: String, val name: String, val online: Boolean = false, val api: NodeAPI? = null)
 data class JoinRequest(val id: String, val issuer: String, val applicant: String, val name: String)
 data class EnrollmentState(
     val id: String, val port: Int, val meshName: String?, val joiningName: String?,
@@ -33,7 +34,7 @@ data class EnrollmentState(
             val invite = json.optJSONObject("invite")
             return EnrollmentState(json.getString("id"), json.getInt("port"), json.optJSONObject("mesh")?.getString("name"), json.optJSONObject("joining")?.getString("name"),
                 invite?.getString("id") ?: "", invite?.getLong("expires") ?: 0,
-                (0 until members.length()).map { members.getJSONObject(it).let { m -> TrustedMember(m.getString("id"), m.getString("name"), m.optBoolean("online")) } },
+                (0 until members.length()).map { members.getJSONObject(it).let { m -> TrustedMember(m.getString("id"), m.getString("name"), m.optBoolean("online"), m.optJSONObject("api")?.let { a -> NodeAPI(a.getString("base_url"), a.getBoolean("inference_ready"), a.getString("message")) }) } },
                 (0 until pending.length()).map { pending.getJSONObject(it).let { p -> JoinRequest(p.getString("id"), p.getString("issuer"), p.getString("applicant"), p.getString("name")) } }, json.getString("notice"), invite?.optString("ticket") ?: "")
         }
     }

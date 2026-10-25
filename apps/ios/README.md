@@ -85,3 +85,13 @@ Start `python3 ../enrollment/tests/ios-peer.py SIMULATOR_UUID` in another termin
 `-parallel-testing-enabled NO test-without-building`. XCTest creates the mesh,
 shows the invitation, approves the discovered peer and checks relaunch persistence.
 The driver uses a full signed invitation and real authenticated Iroh.
+
+Cake QR invitations are generated on-device with Core Image. Join a mesh → Scan
+cake QR requests camera permission on demand, uses Apple VisionKit’s full-screen DataScanner with guidance, highlighting and pinch-to-zoom,
+and fills the invitation for review. Camera images are not uploaded. Denied access
+shows Settings and paste alternatives; leaving the scanner or backgrounding pauses
+capture. NSCameraUsageDescription is included in the installed bundle.
+
+Trusted device details show reported OpenAI API URLs, copy controls and inference
+readiness. Loopback URLs belong to the named device. Mobile membership currently
+has no HTTP inference listener and reports that explicitly.

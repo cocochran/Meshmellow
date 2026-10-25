@@ -21,6 +21,15 @@ use tokio::sync::{Mutex, Semaphore};
 const ALPN: &[u8] = b"meshthing/enrollment/1";
 const MAX_WIRE: usize = 128 * 1024;
 
+/// A bound local HTTP API, announced only to authenticated mesh members.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ApiEndpoint {
+    pub base_url: String,
+    pub scope: String,
+    pub inference_ready: bool,
+    pub message: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Peer {
     pub id: String,
@@ -105,6 +114,8 @@ enum Wire {
 
 #[derive(Serialize, Deserialize)]
 struct Reply {
+    #[serde(default)]
+    api: Option<ApiEndpoint>,
     error: Option<String>,
     ledger: Option<Ledger>,
     #[serde(default)]
@@ -114,6 +125,7 @@ struct Reply {
 impl Reply {
     fn empty() -> Self {
         Self {
+            api: None,
             error: None,
             ledger: None,
             pending: vec![],
@@ -130,7 +142,10 @@ pub struct Node {
     record: Arc<Mutex<Record>>,
     peers: Arc<Mutex<BTreeMap<String, Peer>>>,
     remote_pending: Arc<Mutex<Vec<Pending>>>,
+    local_api: Arc<Mutex<Option<ApiEndpoint>>>,
+    peer_apis: Arc<Mutex<BTreeMap<String, ApiEndpoint>>>,
     internet: bool,
+    membership_epoch: tokio::sync::watch::Sender<u64>,
     control_peers: crate::network::SharedPeerTable,
     control_tasks: Arc<Mutex<BTreeMap<String, tokio::task::JoinHandle<()>>>>,
 }
@@ -205,12 +220,24 @@ impl Node {
             peers: Default::default(),
             remote_pending: Default::default(),
             internet,
+            local_api: Default::default(),
+            peer_apis: Default::default(),
+            membership_epoch: tokio::sync::watch::channel(0).0,
             control_peers: Default::default(),
             control_tasks: Default::default(),
         };
         node.serve();
         node.maintain_mesh();
         Ok(node)
+    }
+
+    pub async fn set_api_endpoint(&self, api: Option<ApiEndpoint>) {
+        *self.local_api.lock().await = api;
+    }
+
+    /// Shared authenticated control connections for the embedded read-only API.
+    pub fn control_peer_table(&self) -> crate::network::SharedPeerTable {
+        self.control_peers.clone()
     }
 
     pub fn id(&self) -> String {
@@ -242,7 +269,9 @@ impl Node {
         let temporary = self.path.with_extension("tmp");
         write_private(&temporary, &bytes, false)?;
         std::fs::rename(&temporary, &self.path)?;
-        // Persist rename as well as file contents before reporting success.
+        // Unix supports syncing the parent directory after rename. Windows cannot
+        // open directories with File::open; the file itself was synced above.
+        #[cfg(unix)]
         std::fs::File::open(self.path.parent().unwrap())?.sync_all()?;
         Ok(())
     }
@@ -269,6 +298,34 @@ impl Node {
             Ok(())
         })
         .await
+    }
+
+    /// Leave locally, retaining this device's identity. Existing peers retain
+    /// their signed trust history; rejoining still requests explicit approval.
+    pub async fn leave(&self) -> Result<()> {
+        self.peer_apis.lock().await.clear();
+        self.change(|r| {
+            ensure!(r.ledger.is_some(), "This device has no mesh to leave.");
+            *r = Record::default();
+            Ok(())
+        })
+        .await?;
+        self.membership_epoch
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+        let tasks = std::mem::take(&mut *self.control_tasks.lock().await);
+        for task in tasks.values() {
+            task.abort();
+        }
+        for (_, task) in tasks {
+            let _ = task.await;
+        }
+        *self
+            .control_peers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Peer state unavailable."))? = Default::default();
+        self.peers.lock().await.clear();
+        self.remote_pending.lock().await.clear();
+        Ok(())
     }
 
     pub async fn invite(&self) -> Result<String> {
@@ -524,8 +581,12 @@ impl Node {
             });
         }
         let mut pending = vec![];
+        let mut apis = BTreeMap::new();
         while let Some(result) = jobs.join_next().await {
             if let Ok(Ok((issuer, response))) = result {
+                if let Some(api) = response.api {
+                    apis.insert(issuer.clone(), api);
+                }
                 if let Some(next) = response.ledger {
                     self.merge(&next).await?;
                 }
@@ -536,7 +597,11 @@ impl Node {
                 );
             }
         }
-        *self.remote_pending.lock().await = pending;
+        let current = self.record.lock().await;
+        if current.ledger.as_ref().map(|l| l.genesis.id()) == Some(ledger.genesis.id()) {
+            *self.remote_pending.lock().await = pending;
+            *self.peer_apis.lock().await = apis;
+        }
         Ok(())
     }
 
@@ -564,16 +629,19 @@ impl Node {
             .peers()
             .map(|p| p.node_id.to_string())
             .collect();
+        let local_api = self.local_api.lock().await.clone();
+        let apis = self.peer_apis.lock().await;
         let members = if let Some(ledger) = &r.ledger {
             ledger
                 .members()?
                 .into_iter()
-                .map(|(id, name)| json!({"id": id, "name": name, "self": id == self.id(), "online": id == self.id() || connected.contains(&id)}))
+                .map(|(id, name)| json!({"id": id, "name": name, "self": id == self.id(), "online": id == self.id() || connected.contains(&id), "api": if id == self.id() { local_api.as_ref() } else { apis.get(&id) }}))
                 .collect::<Vec<_>>()
         } else {
             vec![]
         };
         Ok(json!({
+            "api": local_api,
             "id": self.id(), "port": self.endpoint.bound_sockets().iter().find(|s| s.is_ipv4()).map(|s| s.port()).unwrap_or(0),
             "mesh": r.ledger.as_ref().map(|l| json!({"id": l.genesis.id(), "name": l.genesis.name})),
             "members": members, "pending": pending,
@@ -595,6 +663,7 @@ impl Node {
         };
         match text("op")? {
             "snapshot" => {}
+            "leave" => self.leave().await?,
             "create" => self.create(text("name")?, text("device_name")?).await?,
             "invite" => {
                 self.invite().await?;
@@ -661,10 +730,9 @@ impl Node {
                     name: device_name,
                 } => {
                     let ledger = r.ledger.as_ref().context("This device has no mesh.")?;
-                    ensure!(
-                        !ledger.members()?.contains_key(remote),
-                        "This device is already trusted."
-                    );
+                    // A device may have left locally while other members retain
+                    // its signed trust history. It can request admission again;
+                    // the invitation and explicit decision are still required.
                     let active = r.invite.as_ref().context("Invitation unavailable.")?;
                     ensure!(
                         active.id == invite && active.expires > now(),
@@ -783,6 +851,7 @@ impl Node {
                 }
             }
             Ok(Reply {
+                api: None,
                 error: None,
                 ledger: Some(current.clone()),
                 pending: r
@@ -799,7 +868,11 @@ impl Node {
 
     async fn dispatch(&self, remote: &str, message: Wire) -> Result<Reply> {
         match message {
-            Wire::Sync { ledger } => self.handle_trusted(remote, ledger, None).await,
+            Wire::Sync { ledger } => {
+                let mut reply = self.handle_trusted(remote, ledger, None).await?;
+                reply.api = self.local_api.lock().await.clone();
+                Ok(reply)
+            }
             Wire::Decide {
                 ledger,
                 request,
@@ -847,6 +920,19 @@ impl Node {
                     && let Ok(members) = ledger.members()
                 {
                     let mut tasks = node.control_tasks.lock().await;
+                    // A leave may have completed while this loop held an older
+                    // ledger snapshot. Never restart links for that snapshot.
+                    if node
+                        .record
+                        .lock()
+                        .await
+                        .ledger
+                        .as_ref()
+                        .map(|l| l.genesis.id())
+                        != Some(ledger.genesis.id())
+                    {
+                        continue;
+                    }
                     tasks.retain(|id, task| {
                         if !members.contains_key(id) {
                             task.abort();
@@ -927,6 +1013,7 @@ impl Node {
                     };
                     let remote = connection.remote_id().to_string();
                     if connection.alpn() == crate::protocol::CONTROL_ALPN {
+                        let mut epoch = node.membership_epoch.subscribe();
                         let Ok(hello) = node.control_hello(&remote).await else {
                             connection.close(1u32.into(), b"membership required");
                             return;
@@ -938,13 +1025,13 @@ impl Node {
                         )
                         .await
                         {
-                            crate::network::maintain_peer_session(
-                                &session,
-                                &node.id(),
-                                &node.control_peers,
-                                Self::control_options(),
-                            )
-                            .await;
+                            let id = node.id();
+                            tokio::select! {
+                                _ = epoch.changed() => {},
+                                _ = crate::network::maintain_peer_session(
+                                    &session, &id, &node.control_peers, Self::control_options(),
+                                ) => {},
+                            }
                         }
                         return;
                     }

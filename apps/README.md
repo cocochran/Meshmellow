@@ -4,20 +4,6 @@
   browser, with no Tauri or Electron shell.
 - [iOS](ios/README.md): native SwiftUI application for iPhone and iPad.
 - [Android](android/README.md): native Kotlin / Jetpack Compose application.
-- [Desktop executables](desktop/README.md): Windows, Linux and macOS terminal
-  launcher and archive packaging for the browser dashboard.
-
-## Source layout
-
-All application clients live under `apps/`. The shared Rust core remains in
-`src/`, with membership and invitation logic in `src/mesh/`. The native C/JNI
-adapter is in `apps/enrollment/` and depends on the core; the core does not depend
-on any app. Shared artwork lives in `apps/branding/`.
-
-The desktop launcher source and packaging scripts live in `apps/desktop/`.
-Its binary target is declared in the root Cargo manifest so existing
-`cargo build --bins` and `cargo run --bin meshthing` commands continue to work.
-The default `cargo run` command still starts the `llm-cluster` core CLI.
 
 The mobile applications are native clients, not WebViews. They currently provide
 dashboard telemetry, device inventory, local preferences and the single tested
@@ -77,3 +63,11 @@ This is a proposed adapter boundary, not an implemented FFI or approval of chang
 to running workers. Native UI data and settings are centralized in `MeshStore`
 on each platform so the transport can be replaced with a core adapter without
 duplicating planners or trust rules in the views.
+
+### Leave a mesh
+
+Leave mesh disconnects this device, cancels its invitations and clears its local
+membership. The private device identity is retained. Other devices keep their mesh
+and signed trust history and see the departed device offline; this is not global
+trust revocation. A returning device can use a fresh invitation and must be approved
+again. The same core command (`{"op":"leave"}`) is used by web, iOS and Android.

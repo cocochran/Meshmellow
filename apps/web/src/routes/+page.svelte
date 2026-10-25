@@ -1,5 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import Enrollment from '#lib/Enrollment.svelte';
+  import type { EnrollmentState } from '#lib/enrollment.ts';
   import Icon from '#lib/Icon.svelte';
   import { defaultPreferences, type MeshSnapshot, type Preferences, type Device } from '#lib/types.ts';
 
@@ -22,7 +24,8 @@
   let notice = $state('');
   let saving = $state(false);
   let detailDialog: HTMLDialogElement;
-  let pairDialog: HTMLDialogElement;
+  let enrollmentPanel: Enrollment;
+  let membership = $state<EnrollmentState | null>(null);
   let selectedId = $state<string | null>(null);
   let deviceQuery = $state('');
   let deviceOrder = $state('route');
@@ -84,7 +87,7 @@
     return () => { mounted = false; clearTimeout(timer); controller.abort(); pollController?.abort(); };
   });
   function showDevice(device: Device) { selectedId = device.id; detailDialog.showModal(); }
-  function showPairing() { pairDialog.showModal(); }
+  function showPairing() { void enrollmentPanel.showInvitation(); }
   async function saveSettings(event: SubmitEvent) {
     event.preventDefault(); saving = true; notice = '';
     try {
@@ -102,32 +105,34 @@
   }
 </script>
 
-<svelte:head><title>Layercake · {preferences.displayName}</title><meta name="description" content="Monitor devices, model layers, and runtime performance in your Layercake network." /></svelte:head>
+<svelte:head><title>Layercake · {membership?.mesh?.name || 'Welcome'}</title><meta name="description" content="Monitor devices, model layers, and runtime performance in your Layercake network." /></svelte:head>
 
 <a class="skip-link" href="#main-content">Skip to content</a>
 <div class="app-shell">
   <aside class="sidebar">
     <a class="brand" href="/" aria-label="Layercake overview"><span class="brand-mark" aria-hidden="true"><img src="/layercake-logo.png" width="41" height="41" alt="" /></span><span>Layercake</span></a>
-    <div class="workspace"><span class="workspace-icon">L</span><div><strong>{preferences.displayName}</strong><span>Local workspace</span></div></div>
+    <div class="workspace"><span class="workspace-icon">L</span><div><strong>{membership?.mesh?.name || 'Welcome'}</strong><span>Local workspace</span></div></div>
     <span class="eyebrow sidebar-label">WORKSPACE</span>
     <nav aria-label="Main navigation">
       {#each sections as item}
-        <button class:current={section === item.id} aria-current={section === item.id ? 'page' : undefined} onclick={() => { section = item.id; notice = ''; }}><Icon name={item.icon} /><span>{item.label}</span>{#if item.id === 'devices' && deviceCount}<span class="nav-count">{deviceCount}</span>{/if}</button>
+        <button class:current={section === item.id} disabled={!membership?.mesh && item.id !== 'settings' && item.id !== 'overview'} aria-current={section === item.id ? 'page' : undefined} onclick={() => { section = item.id; notice = ''; }}><Icon name={item.icon} /><span>{item.label}</span>{#if item.id === 'devices' && deviceCount}<span class="nav-count">{deviceCount}</span>{/if}</button>
       {/each}
     </nav>
     <div class="sidebar-bottom">
-      <div class="sidebar-runtime"><span class="eyebrow">RUNTIME</span><strong><span class="dot" class:disconnected={!connected}></span>{loading ? 'Connecting…' : connected ? 'Connected' : 'Disconnected'}</strong><span>{snapshot?.source === 'core' ? 'Core API' : 'Stage telemetry'} · Read-only</span></div>
+      <div class="sidebar-runtime"><span class="eyebrow">RUNTIME</span><strong><span class="dot" class:disconnected={!connected}></span>{loading ? 'Connecting…' : connected ? 'Connected' : 'Disconnected'}</strong><span>Core runtime · This device</span></div>
       <div class="local-server">Layercake <span class="mono">v0.1</span></div>
     </div>
   </aside>
 
   <div class="main-column">
-    <header class="topbar"><div class="breadcrumb">{preferences.displayName}<span>/</span><strong>{sections.find((s) => s.id === section)?.label}</strong></div><div class="topbar-right"><span class="connection" class:offline={!connected}><span class="dot"></span>{loading ? 'Connecting' : connected ? 'Runtime connected' : 'Runtime disconnected'}</span></div></header>
+    <header class="topbar"><div class="breadcrumb">{membership?.mesh?.name || 'Welcome'}<span>/</span><strong>{sections.find((s) => s.id === section)?.label}</strong></div><div class="topbar-right"><span class="connection" class:offline={!connected}><span class="dot"></span>{loading ? 'Connecting' : connected ? 'Runtime connected' : 'Runtime disconnected'}</span></div></header>
     <main id="main-content">
-      <div class="page-heading"><div><h1>{section === 'overview' ? 'Overview' : section === 'devices' ? 'Devices' : section === 'model' ? 'Model distribution' : section === 'activity' ? 'Activity' : 'Settings'}</h1><p>{section === 'overview' ? 'Your model, and the devices running it.' : section === 'devices' ? 'Inspect layer assignments and compare stage compute times.' : section === 'model' ? 'Layer placement across the configured route.' : section === 'activity' ? 'Requests and the latest runtime state.' : 'Manage local preferences and runtime connection.'}</p></div><button class="button secondary" onclick={showPairing}><Icon name="plus" size={16} /> Add device</button></div>
+      <div class="page-heading"><div><h1>{section === 'overview' ? 'Overview' : section === 'devices' ? 'Devices' : section === 'model' ? 'Model distribution' : section === 'activity' ? 'Activity' : 'Settings'}</h1><p>{section === 'overview' ? 'Your model, and the devices running it.' : section === 'devices' ? 'Inspect layer assignments and compare stage compute times.' : section === 'model' ? 'Layer placement across the configured route.' : section === 'activity' ? 'Requests and the latest runtime state.' : 'Manage local preferences and runtime connection.'}</p></div>{#if membership?.mesh}<button class="button secondary" onclick={showPairing}><Icon name="plus" size={16} /> Add device</button>{/if}</div>
 
+      <Enrollment bind:this={enrollmentPanel} onchange={value => membership = value}/>
+      {#if membership?.mesh || section === 'settings'}
       {#if notice}<div class="notice" role="status">{notice}<button aria-label="Dismiss message" onclick={() => notice = ''}><Icon name="close" size={16}/></button></div>{/if}
-      {#if error || (!loading && !connected)}<div class="connection-message" role="status"><Icon name="info" /><div><strong>{error ? 'Refresh interrupted' : 'Your runtime isn’t connected'}</strong><p>{error || snapshot?.message}</p>{#if !snapshot?.endpoint}<code>./mesh-ui --runtime http://127.0.0.1:8095</code>{/if}</div><button class="text-button" disabled={refreshing} onclick={refresh}>Retry <Icon name="refresh" size={15}/></button></div>{/if}
+      {#if error || (!loading && !connected)}<div class="connection-message" role="status"><Icon name="info" /><div><strong>{error ? 'Refresh interrupted' : 'Your runtime isn’t connected'}</strong><p>{error || snapshot?.message}</p>{#if !snapshot?.endpoint}<code>./mesh-ui</code>{/if}</div><button class="text-button" disabled={refreshing} onclick={refresh}>Retry <Icon name="refresh" size={15}/></button></div>{/if}
 
       {#if section === 'overview'}
         <div class="metrics-grid">
@@ -145,7 +150,7 @@
 
       {#if section === 'overview'}
         <section class="panel route-panel" aria-labelledby="route-title">
-          <div class="panel-heading"><div><h2 id="route-title">Execution route</h2><p>{snapshot?.model || 'Model not reported'}</p></div><span class="run-state" class:active={connected && snapshot?.active} class:failed={connected && snapshot?.event === 'error'}><span class="dot"></span>{runHeading}</span></div>
+          <div class="panel-heading"><div><h2 id="route-title">Execution route</h2><p>{snapshot?.model || 'Qwen3.8-27B'}</p></div><span class="run-state" class:active={connected && snapshot?.active} class:failed={connected && snapshot?.event === 'error'}><span class="dot"></span>{runHeading}</span></div>
           {#if devices.length}<ol class="route-list">{#each devices as device, i}<li><button onclick={() => showDevice(device)}><span class="route-stage"><span class="stage-number">{String(i + 1).padStart(2, '0')}</span><Icon name={iconFor(device)} size={19}/>{#if snapshot?.active && device.status === 'inflight'}<span class="stage-working">Computing</span>{/if}</span><strong>{device.name}</strong><span class="route-layers">Layers <span class="mono">{rangeLabel(device)}</span></span></button>{#if i < devices.length - 1}<span class="route-arrow" aria-hidden="true"><Icon name="arrow" size={16}/></span>{/if}</li>{/each}</ol>{:else}<div class="empty-inline">The device route appears when stage telemetry is available.</div>{/if}
           <div class="panel-footer">Configured order · select a stage to inspect its measurements.</div>
         </section>
@@ -169,9 +174,9 @@
       {/if}
 
       {#if section === 'overview' || section === 'model'}
-        <section class="panel model-panel"><div class="panel-heading"><div><h2>Layer allocation</h2><p>{snapshot?.model || 'Mesh model'} · {snapshot?.layers ? `${snapshot.layers} decoder layers` : 'Layer count not reported'}</p></div><span class="subtle-tag">{connected ? 'Runtime configuration' : 'Not connected'}</span></div>
+        <section class="panel model-panel"><div class="panel-heading"><div><h2>Layer allocation</h2><p>{snapshot?.model || 'Qwen3.8-27B'} · {snapshot?.layers ? `${snapshot.layers} decoder layers` : 'Layer count not reported'}</p></div><span class="subtle-tag">{connected ? 'Runtime configuration' : 'Not connected'}</span></div>
           {#if devices.length}<div class="layer-map" aria-label="Layer distribution">{#each devices as device, i}<button style={`--device-color: ${colors[i % colors.length]}; flex: ${device.end !== null && device.begin !== null ? Math.max(1, device.end - device.begin) : 1}`} aria-label={`${device.name}, layers ${rangeLabel(device)}`} onclick={() => showDevice(device)}><span>{rangeLabel(device)}</span></button>{/each}</div><div class="layer-legend">{#each devices as device, i}<span><i style={`background: ${colors[i % colors.length]}`}></i>{device.name}</span>{/each}</div>{:else}<div class="empty-inline">Layer assignments appear when your runtime reports a configured model.</div>{/if}
-          {#if section === 'model'}<div class="info-grid"><div><span class="eyebrow">PLACEMENT</span><h3>Placement</h3><p>Device benchmarks will determine which layers fit and which route runs best. Current assignments come from your runtime configuration.</p></div><div><span class="eyebrow">MODEL MANAGEMENT</span><h3>Model management</h3><p>Model import, downloads and capacity recommendations are waiting for core integration. This UI does not change the running model.</p></div></div>{/if}
+          {#if section === 'model'}<div class="info-grid"><div><span class="eyebrow">PLACEMENT</span><h3>Placement</h3><p>Device benchmarks will determine which layers fit and which route runs best. Current assignments come from your runtime configuration.</p></div><div><span class="eyebrow">MODEL MANAGEMENT</span><h3>Model management</h3><p>The mesh uses Qwen3.8-27B UD-Q5_K_M from testing. Automatic setup of assigned model layers is being connected to the core.</p></div></div>{/if}
         </section>
       {/if}
 
@@ -184,14 +189,13 @@
 
       {#if section === 'settings'}
         <div class="settings-grid"><section class="panel"><div class="panel-heading"><div><h2>Workspace preferences</h2><p>Saved locally. These do not change mesh membership.</p></div></div><form class="settings-form" onsubmit={saveSettings}><label for="display-name">Workspace display name</label><input id="display-name" bind:value={displayName} maxlength="48" required /><p>A friendly name for this web interface.</p><label for="refresh-interval">Refresh interval</label><select id="refresh-interval" bind:value={refreshSeconds}><option value={2}>Every 2 seconds</option><option value={5}>Every 5 seconds</option><option value={10}>Every 10 seconds</option><option value={30}>Every 30 seconds</option></select><p>Polling pauses while this browser tab is hidden.</p><button class="button primary" disabled={saving}>{saving ? 'Saving…' : 'Save preferences'}<Icon name="check" size={16}/></button></form></section>
-        <section class="panel"><div class="panel-heading"><div><h2>Runtime connection</h2><p>Configured when you launch the web server.</p></div></div><div class="connection-details"><span class="eyebrow">LOCAL ENDPOINT</span><div class="endpoint"><code>{snapshot?.endpoint || 'Not configured'}</code>{#if snapshot?.endpoint}<button aria-label="Copy runtime address" onclick={copyEndpoint}><Icon name="copy" size={17}/></button>{/if}</div><dl><div><dt>Source</dt><dd>{snapshot?.source === 'core' ? 'Core API · jobs and peers' : 'Live runtime · stage telemetry'}</dd></div><div><dt>Access</dt><dd>Read-only</dd></div><div><dt>Pairing</dt><dd>Awaiting core support</dd></div></dl><p class="fine-print">Start with <code>--runtime</code> and <code>--source</code> to choose the local connection. Worker configuration stays with the core.</p></div></section></div>
+        <section class="panel"><div class="panel-heading"><div><h2>Runtime connection</h2><p>The core runtime owns this dashboard and its API.</p></div></div><div class="connection-details"><span class="eyebrow">LOCAL ENDPOINT</span><div class="endpoint"><code>{snapshot?.endpoint || 'Not configured'}</code>{#if snapshot?.endpoint}<button aria-label="Copy runtime address" onclick={copyEndpoint}><Icon name="copy" size={17}/></button>{/if}</div><dl><div><dt>Source</dt><dd>{snapshot?.source === 'core' ? 'Core API · job queue' : 'Live runtime · stage telemetry'}</dd></div><div><dt>Access</dt><dd>This device only</dd></div><div><dt>Pairing</dt><dd>Signed invitations + approval</dd></div></dl><p class="fine-print">API URLs and inference readiness appear with each trusted device. Stopping the runtime also stops this dashboard.</p></div></section></div>
       {/if}
 
-      <footer class="page-footer"><span>Local dashboard · Read-only</span><span>{snapshot ? `Last checked ${new Date(snapshot.checkedAt).toLocaleTimeString()}` : 'Waiting for first observation'}</span></footer>
+      {/if}
+      <footer class="page-footer"><span>Local mesh · Iroh</span><span>{snapshot ? `Last checked ${new Date(snapshot.checkedAt).toLocaleTimeString()}` : 'Waiting for first observation'}</span></footer>
     </main>
   </div>
 </div>
 
 <dialog bind:this={detailDialog} onclose={() => selectedId = null} aria-labelledby="device-title"><div class="dialog-heading"><span class="eyebrow">DEVICE DETAILS</span><button aria-label="Close device details" onclick={() => detailDialog.close()}><Icon name="close"/></button></div>{#if selectedDevice}<div class="dialog-device-icon"><Icon name={iconFor(selectedDevice)} size={36}/></div><h2 id="device-title">{selectedDevice.name}</h2><p>{selectedDevice.hardware}</p><dl class="detail-list"><div><dt>Layer range</dt><dd>{rangeLabel(selectedDevice)}</dd></div><div><dt>Observation</dt><dd>{statusLabel(selectedDevice)}</dd></div><div><dt>Last native compute</dt><dd>{selectedDevice.computeMs?.toFixed(1) ?? '—'} ms</dd></div><div><dt>Observed buffers</dt><dd>{sizeLabel(selectedDevice.bufferBytes)}</dd></div><div><dt>Stage executions</dt><dd>{selectedDevice.executions}</dd></div></dl><div class="soft-note"><Icon name="info" size={18}/><p>These are runtime measurements, not a full memory budget or a device benchmark. Trust status is not reported yet.</p></div>{:else}<h2 id="device-title">Device no longer reported</h2><p>Refresh the mesh to see the current route.</p>{/if}<button class="button secondary full-width" onclick={() => detailDialog.close()}>Done</button></dialog>
-
-<dialog bind:this={pairDialog} aria-labelledby="pair-title"><div class="dialog-heading"><span class="eyebrow">DEVICE ENROLLMENT</span><button aria-label="Close pairing" onclick={() => pairDialog.close()}><Icon name="close"/></button></div><h2 id="pair-title">Add a device</h2><p>Device pairing is not available in this web build yet.</p><div class="soft-note"><Icon name="info" size={18}/><p>This dashboard displays the route configured by your runtime. Creating invitations and approving devices require core enrollment integration.</p></div><button class="button secondary full-width" onclick={() => pairDialog.close()}>Close</button></dialog>

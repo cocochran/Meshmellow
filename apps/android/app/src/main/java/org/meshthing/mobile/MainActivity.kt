@@ -126,6 +126,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable private fun MeshScreen(store: MeshStore, pair: (Boolean) -> Unit, detail: (MeshDevice) -> Unit) {
     val scope = rememberCoroutineScope()
     Text(store.enrollment.state?.meshName?.let { "● Joined $it" } ?: if (store.enrollment.state?.joiningName != null) "Waiting for approval" else "Create or join your mesh", color = Moss, style = MaterialTheme.typography.labelMedium)
@@ -135,8 +136,11 @@ class MainActivity : ComponentActivity() {
             Text("YOUR DEVICES. ONE MODEL.", style = MaterialTheme.typography.labelSmall)
             Text(if (store.enrollment.state?.meshName == null) "A little from each.\nMore together." else "Your mesh,\na slice from each.", style = MaterialTheme.typography.headlineLarge)
             Text("Welcome, ${store.deviceName}. Give your devices a shared purpose.", style = MaterialTheme.typography.bodyMedium)
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(onClick = { pair(false) }, enabled = store.enrollment.state?.joiningName == null) { Icon(Icons.Default.Add, null); Spacer(Modifier.width(7.dp)); Text(if (store.enrollment.state?.meshName == null) "Create a mesh" else "Invite a device") }
-            if (store.enrollment.state?.meshName == null && store.enrollment.state?.joiningName == null) OutlinedButton(onClick = { pair(true) }) { Text("Join a mesh") }
+                if (store.enrollment.state?.meshName != null) LeaveMeshButton(store.enrollment)
+            }
+            if (store.enrollment.state?.meshName == null && store.enrollment.state?.joiningName == null) OutlinedButton(onClick = { pair(true) }) { Text("Join / scan QR") }
         }
     }
     MembershipSummary(store.enrollment)

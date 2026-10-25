@@ -22,7 +22,23 @@ import kotlinx.coroutines.launch
 import java.text.DateFormat
 import java.util.Date
 
+@Composable fun LeaveMeshButton(enrollment: EnrollmentController) {
+    var confirmingLeave by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    OutlinedButton(onClick = { confirmingLeave = true }, enabled = !enrollment.busy) {
+        Text("Leave mesh", color = MaterialTheme.colorScheme.error)
+    }
+    if (confirmingLeave) AlertDialog(
+        onDismissRequest = { confirmingLeave = false },
+        title = { Text("Leave this mesh?") },
+        text = { Text("This device will disconnect and return to Create / Join. Other devices keep their mesh and trust history.") },
+        confirmButton = { TextButton(onClick = { confirmingLeave = false; scope.launch { enrollment.perform("leave") } }) { Text("Leave mesh") } },
+        dismissButton = { TextButton(onClick = { confirmingLeave = false }) { Text("Stay in mesh") } }
+    )
+}
+
 @Composable fun MembershipSummary(enrollment: EnrollmentController) {
+    val context = LocalContext.current
     val state = enrollment.state
     val scope = rememberCoroutineScope()
     state?.meshName?.let { name ->
@@ -30,8 +46,29 @@ import java.util.Date
         Text("Trusted devices", fontWeight = FontWeight.SemiBold)
         state.members.forEach { member ->
             Text("${member.name}${if (member.id == state.id) " (this device)" else ""} · Trusted · ${if (member.online) "Connected" else "Disconnected"}")
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("OpenAI-compatible API", fontWeight = FontWeight.SemiBold)
+                    val api = member.api
+                    if (api != null) {
+                        Text(if (api.ready) "Ready" else "Listening · inference unavailable")
+                        androidx.compose.foundation.text.selection.SelectionContainer { Text(api.baseURL, fontFamily = FontFamily.Monospace) }
+                        Text(if (member.id == state.id) "On this device only" else "On that device only", style = MaterialTheme.typography.bodySmall)
+                        OutlinedButton(onClick = {
+                            val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                            clipboard.setPrimaryClip(android.content.ClipData.newPlainText("OpenAI API URL", api.baseURL))
+                        }) { Text("Copy API URL") }
+                        Text(api.message, style = MaterialTheme.typography.bodySmall)
+                    } else {
+                        Text(if (member.id == state.id) "API not running" else "API not reported")
+                        Text(if (member.id == state.id) "This device has not started an HTTP inference API." else "No current endpoint has been reported by this peer.", style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            }
+
         }
         Text("Devices are enrolled. Model benchmarking and compute setup are still pending.", style = MaterialTheme.typography.bodySmall)
+        LeaveMeshButton(enrollment)
     }
     state?.joiningName?.let { name ->
         Text("Waiting to join $name", style = MaterialTheme.typography.titleMedium)
@@ -73,8 +110,9 @@ import java.util.Date
 
             if (state?.meshName != null) {
                 Text(state.meshName, style = MaterialTheme.typography.titleLarge)
-                Text("Share the invitation, then paste it into Join a mesh on the other device.")
+                Text("On your other device, choose Join a mesh, then Scan cake QR.")
                 if (state.ticket.isNotEmpty()) {
+                    CakeInvitationQR(state.ticket)
                     Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface, RoundedCornerShape(18.dp)).padding(22.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
                         Text("Private invitation", style = MaterialTheme.typography.titleMedium)
                         Text(state.ticket, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall, maxLines = 3, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -99,6 +137,7 @@ import java.util.Date
                 }
                 OutlinedTextField(value = deviceName, onValueChange = { if (it.length <= 48) deviceName = it }, label = { Text("This device’s name") }, singleLine = true)
                 if (join) {
+                    ScanInvitationButton { code = it }
                     OutlinedTextField(value = code, onValueChange = { if (it.length <= 4096) code = it }, label = { Text("Paste invitation") })
                     Text("Paste the full invitation from a trusted device. Any trusted member can approve your request.")
                     Button(onClick = { scope.launch { enrollment.perform("join", "invitation" to code, "device_name" to deviceName) } }, enabled = !enrollment.busy && state != null && code.isNotBlank() && deviceName.isNotBlank()) { Text("Request to join") }

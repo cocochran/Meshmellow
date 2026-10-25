@@ -432,3 +432,75 @@ fn self_contained_invitation_rejects_tampering_and_oversize_input() {
     assert!(invitation::Invitation::from_ticket(&locator.ticket()).is_err());
     assert!(invitation::Invitation::from_ticket(&"x".repeat(4097)).is_err());
 }
+
+#[tokio::test]
+async fn leaving_disconnects_persists_and_rejoining_requires_approval() {
+    let ad = tempfile::tempdir().unwrap();
+    let bd = tempfile::tempdir().unwrap();
+    let a = Node::open_local(ad.path()).await.unwrap();
+    let b = Node::open_local(bd.path()).await.unwrap();
+    a.create("Original mesh", "A").await.unwrap();
+    a.discover(vec![peer(&b).await]).await.unwrap();
+    a.invite().await.unwrap();
+    b.join(peer(&a).await, "B").await.unwrap();
+    b.discover(vec![peer(&a).await]).await.unwrap();
+    let request = a.snapshot().await.unwrap()["pending"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    a.decide(&a.id(), &request, true).await.unwrap();
+    b.refresh().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while a.snapshot().await.unwrap()["connected_peers"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let original_id = b.id();
+    let left = b.command(json!({"op":"leave"})).await.unwrap();
+    assert!(left["mesh"].is_null());
+    assert!(left["invite"].is_null());
+    assert!(left["members"].as_array().unwrap().is_empty());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !a.snapshot().await.unwrap()["connected_peers"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    b.close().await;
+    let b = Node::open_local(bd.path()).await.unwrap();
+    assert_eq!(b.id(), original_id);
+    assert!(b.snapshot().await.unwrap()["mesh"].is_null());
+    a.invite().await.unwrap();
+    b.join(peer(&a).await, "B").await.unwrap();
+    b.refresh().await.unwrap();
+    assert!(b.snapshot().await.unwrap()["mesh"].is_null());
+    let request = a.snapshot().await.unwrap()["pending"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    a.decide(&a.id(), &request, true).await.unwrap();
+    b.refresh().await.unwrap();
+    assert_eq!(
+        b.snapshot().await.unwrap()["members"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    b.leave().await.unwrap();
+    b.create("New mesh", "B").await.unwrap();
+    assert_eq!(b.snapshot().await.unwrap()["mesh"]["name"], "New mesh");
+    a.close().await;
+    b.close().await;
+}

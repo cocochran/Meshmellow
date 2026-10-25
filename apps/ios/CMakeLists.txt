@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.28)
 project(MeshThing LANGUAGES Swift)
 add_executable(MeshThing MACOSX_BUNDLE
   Sources/MeshThingApp.swift Sources/MeshStore.swift Sources/Views.swift Sources/Palette.swift Sources/Design.swift
-  Sources/EnrollmentStore.swift Sources/EnrollmentViews.swift Shared/Contracts.swift Shared/EnrollmentState.swift
+  Sources/EnrollmentStore.swift Sources/EnrollmentViews.swift Sources/InvitationQR.swift Shared/Contracts.swift Shared/EnrollmentState.swift
   Resources/Assets.xcassets)
 set_source_files_properties(Resources/Assets.xcassets PROPERTIES
   MACOSX_PACKAGE_LOCATION Resources XCODE_EXPLICIT_FILE_TYPE folder.assetcatalog)

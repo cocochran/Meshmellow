@@ -11,6 +11,7 @@
   <key>UILaunchScreen</key><dict/>
   <key>LSRequiresIPhoneOS</key><true/>
   <key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string><string>UIInterfaceOrientationPortraitUpsideDown</string><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
+  <key>NSCameraUsageDescription</key><string>Scan a Layercake cake QR to join a mesh. Camera images stay on this device.</string>
   <key>NSLocalNetworkUsageDescription</key><string>Connect directly to Layercake peers when they are on your network. Internet pairing also works through Iroh.</string>
   <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
   <key>UISupportsDocumentBrowser</key><false/>
