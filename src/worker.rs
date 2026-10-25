@@ -7,6 +7,12 @@
 //! stream, redialling with backoff whenever the link drops. Heartbeat sequence numbers keep
 //! counting across reconnects, so every heartbeat this process sends has a larger sequence than
 //! the one before it.
+//!
+//! The worker also watches the leader's own heartbeats on the link (see
+//! [`network::watch_heartbeats`]). Once the leader has sent one, a gap longer than
+//! [`WorkerConfig::leader_heartbeat_timeout`] makes the worker close the link with
+//! [`network::HEARTBEAT_TIMEOUT_CODE`] and redial, instead of waiting for QUIC's idle timeout to
+//! notice a crashed or suspended leader. A leader that never heartbeats is never timed out.
 
 use std::convert::Infallible;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -14,28 +20,30 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, anyhow, bail};
+use anyhow::{Context, anyhow};
+use iroh::endpoint::ConnectionError;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
-use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 
-use crate::network::{self, SharedPeerTable};
+use crate::network::{self, HEARTBEAT_EPOCH, SharedPeerTable};
 use crate::node::PeerTable;
 use crate::process::{self, ChildSpec, Readiness, RestartPolicy};
-use crate::protocol::{self, CONTROL_ALPN, Heartbeat, Hello, Message, RPC_BRIDGE_ALPN};
+use crate::protocol::{CONTROL_ALPN, Heartbeat, Hello, RPC_BRIDGE_ALPN};
 use crate::rpc_bridge;
 
 /// How often a worker sends a heartbeat to its leader unless configured otherwise.
 pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How long a worker waits for the leader's next heartbeat before dropping the link and
+/// redialling, unless configured otherwise: three missed beats at the leader's 2s default
+/// (`leader::DEFAULT_HEARTBEAT_INTERVAL`) plus a second of slack.
+pub const DEFAULT_LEADER_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(7);
 
 /// Log label for the supervised RPC server.
 const RPC_SERVER_NAME: &str = "ggml-rpc-server";
 
 /// Longest the RPC server may take to accept TCP connections after each (re)start.
 const RPC_READY_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Leadership epoch carried in heartbeats; elections (and real epochs) do not exist yet.
-const HEARTBEAT_EPOCH: u64 = 0;
 
 /// Workers keep no replicated log yet, so their hello always reports an empty one.
 const LAST_LOG_INDEX: u64 = 0;
@@ -68,6 +76,13 @@ pub struct WorkerConfig {
     pub allowed_peers: Vec<EndpointId>,
     /// Time between heartbeats on the control link.
     pub heartbeat_interval: Duration,
+    /// How long the worker waits for the leader's next heartbeat before closing the control link
+    /// with [`network::HEARTBEAT_TIMEOUT_CODE`] and redialling, usually
+    /// [`DEFAULT_LEADER_HEARTBEAT_TIMEOUT`]. It arms only once the leader has sent a heartbeat on
+    /// the current link, so a leader that never heartbeats is never timed out. Must exceed the
+    /// leader's heartbeat interval and must not be zero; `None` disables it, leaving a lost
+    /// leader to QUIC's idle timeout.
+    pub leader_heartbeat_timeout: Option<Duration>,
 }
 
 /// Runs a worker until the RPC server fails for good or the future is dropped.
@@ -125,7 +140,7 @@ async fn serve(
             Err(error) => Err(error.context(format!("{RPC_SERVER_NAME} exhausted its restarts"))),
         },
         served = rpc_bridge::serve_worker(endpoint.clone(), rpc_addr, allowed) => served,
-        () = keep_control_link(endpoint, leader, config.heartbeat_interval, &config.cluster_id) => Ok(()),
+        () = keep_control_link(endpoint, leader, config) => Ok(()),
     };
     if let Err(error) = rpc_server.shutdown().await {
         warn!(error = %format!("{error:#}"), "failed to stop {RPC_SERVER_NAME} cleanly");
@@ -166,8 +181,7 @@ fn rpc_server_spec(config: &WorkerConfig, rpc_addr: SocketAddr) -> ChildSpec {
 async fn keep_control_link(
     endpoint: &Endpoint,
     leader: Option<EndpointAddr>,
-    interval: Duration,
-    cluster_id: &str,
+    config: &WorkerConfig,
 ) {
     let Some(leader) = leader else {
         return std::future::pending().await;
@@ -175,11 +189,12 @@ async fn keep_control_link(
     let mut link = ControlLink {
         endpoint,
         leader,
-        local: network::local_hello(endpoint, cluster_id, LAST_LOG_INDEX),
+        local: network::local_hello(endpoint, &config.cluster_id, LAST_LOG_INDEX),
         peers: Arc::new(Mutex::new(PeerTable::new())),
         heartbeats: HeartbeatSequence::new(endpoint.id().to_string()),
         backoff: ReconnectBackoff::default(),
-        interval,
+        interval: config.heartbeat_interval,
+        leader_heartbeat_timeout: config.leader_heartbeat_timeout,
     };
     link.run().await;
 }
@@ -189,10 +204,12 @@ struct ControlLink<'a> {
     endpoint: &'a Endpoint,
     leader: EndpointAddr,
     local: Hello,
+    /// Holds the leader while a link is up, with the last heartbeat the leader sent on it.
     peers: SharedPeerTable,
     heartbeats: HeartbeatSequence,
     backoff: ReconnectBackoff,
     interval: Duration,
+    leader_heartbeat_timeout: Option<Duration>,
 }
 
 impl ControlLink<'_> {
@@ -215,7 +232,8 @@ impl ControlLink<'_> {
         }
     }
 
-    /// Dials the leader, then sends heartbeats on one stream until the link fails.
+    /// Dials the leader, then sends heartbeats on one stream while watching the leader's, until
+    /// the link fails.
     async fn session(&mut self) -> anyhow::Result<Infallible> {
         let dial = network::dial_peer(self.endpoint, self.leader.clone(), &self.local, &self.peers);
         let session = tokio::time::timeout(LEADER_DIAL_TIMEOUT, dial)
@@ -224,24 +242,28 @@ impl ControlLink<'_> {
         self.backoff.reset();
         info!(leader = %session.hello().node_id, "control link to leader established");
 
-        let connection = session.connection();
-        let mut stream = connection
-            .open_uni()
-            .await
-            .context("failed to open heartbeat stream")?;
-        let mut ticker = tokio::time::interval(self.interval);
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    let heartbeat = Message::Heartbeat(self.heartbeats.next_heartbeat());
-                    protocol::write_frame(&mut stream, &heartbeat)
-                        .await
-                        .context("failed to send heartbeat")?;
-                }
-                reason = connection.closed() => bail!("leader closed the control link: {reason}"),
-            }
+        let watch = network::watch_heartbeats(&session, &self.peers, self.leader_heartbeat_timeout);
+        // Both run for the whole session: the send loop only ends on a failed write, and the
+        // watch only when the connection closes, whether the leader closed it or the watch did.
+        let heartbeats = &mut self.heartbeats;
+        let send = network::write_heartbeats(session.connection(), self.interval, || {
+            heartbeats.next_heartbeat()
+        });
+        tokio::select! {
+            sent = send => sent,
+            reason = watch => Err(link_lost(reason)),
         }
+    }
+}
+
+/// Explains why [`network::watch_heartbeats`] saw the control link close.
+///
+/// Only the watch closes the connection locally during a session (closing the endpoint ends
+/// the worker instead of redialling), so a local close means the leader went quiet.
+fn link_lost(reason: ConnectionError) -> anyhow::Error {
+    match reason {
+        ConnectionError::LocallyClosed => anyhow!("leader stopped heartbeating"),
+        other => anyhow!("leader closed the control link: {other}"),
     }
 }
 
@@ -323,7 +345,22 @@ mod tests {
             leader: None,
             allowed_peers: Vec::new(),
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+            leader_heartbeat_timeout: Some(DEFAULT_LEADER_HEARTBEAT_TIMEOUT),
         }
+    }
+
+    #[test]
+    fn a_locally_closed_link_means_the_leader_went_quiet() {
+        let quiet = link_lost(ConnectionError::LocallyClosed);
+        let timed_out = link_lost(ConnectionError::TimedOut);
+
+        assert_eq!(quiet.to_string(), "leader stopped heartbeating");
+        assert!(
+            timed_out
+                .to_string()
+                .starts_with("leader closed the control link"),
+            "{timed_out}"
+        );
     }
 
     #[test]
