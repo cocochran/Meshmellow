@@ -36,11 +36,12 @@ cannot force the logger to buffer the entire line at once.
 Non-streaming upstream responses are capped at 16 MiB while buffering. Streaming responses
 continue to the client, but responses over 16 MiB are omitted from conversation history to keep
 history capture bounded; this is logged when the stream completes.
-Mesh membership refreshes log per-member sync failures, and control-session task failures are
-logged with the affected peer when available.
-The enrollment CLI warns on the first periodic membership refresh failure or timeout, uses
-debug logs for continuing failures, and logs when refresh recovers; this avoids hiding an outage
-while keeping the normal two-second polling loop from flooding warning logs.
+Mesh membership refreshes warn on the first sync failure for a member, use debug logs for
+retries, and log when sync recovers. Mesh control connections follow the same pattern for
+hello, address, dial and timeout failures; the member ID is included in each event. The
+enrollment CLI warns on the first periodic membership refresh failure or timeout, uses
+debug logs for continuing failures, and logs when refresh recovers; this avoids hiding an
+outage while keeping the normal two-second polling loop from flooding warning logs.
 Readiness-probe error excerpts are capped at 512 characters (at most 2 KiB read), and the
 external run-evidence file is capped at 1 MiB per poll.
 The CLI rejects plan, profile and shard-manifest JSON files larger than 64 MiB before parsing;

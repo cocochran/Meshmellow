@@ -499,8 +499,9 @@ pub(crate) async fn forward_stderr(stderr: ChildStderr, pid: Option<u32>) {
         {
             Ok(0) => return,
             Ok(_) => {
+                let truncated = line.last() != Some(&b'\n') && line.len() as u64 == MAX_STDERR_LINE;
                 let text = String::from_utf8_lossy(&line);
-                info!(pid, "shard runner: {}", text.trim_end());
+                info!(pid, truncated, "shard runner: {}", text.trim_end());
             }
             Err(error) => {
                 warn!(pid, %error, "failed to read shard runner stderr");

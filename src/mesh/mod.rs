@@ -977,9 +977,19 @@ impl Node {
                         tasks.insert(
                             id.clone(),
                             tokio::spawn(async move {
+                                let mut last_dial_error = None;
                                 while !client.endpoint.is_closed() {
-                                    let Ok(hello) = client.control_hello(&remote).await else {
-                                        break;
+                                    let hello = match client.control_hello(&remote).await {
+                                        Ok(hello) => hello,
+                                        Err(error) => {
+                                            report_control_dial_failure(
+                                                &remote,
+                                                &error,
+                                                &mut last_dial_error,
+                                            );
+                                            tokio::time::sleep(Duration::from_secs(2)).await;
+                                            continue;
+                                        }
                                     };
                                     let peer =
                                         client.peers.lock().await.get(&remote).cloned().unwrap_or(
@@ -990,8 +1000,17 @@ impl Node {
                                                 relay: None,
                                             },
                                         );
-                                    let Ok(address) = peer.addr() else {
-                                        break;
+                                    let address = match peer.addr() {
+                                        Ok(address) => address,
+                                        Err(error) => {
+                                            report_control_dial_failure(
+                                                &remote,
+                                                &error,
+                                                &mut last_dial_error,
+                                            );
+                                            tokio::time::sleep(Duration::from_secs(2)).await;
+                                            continue;
+                                        }
                                     };
                                     let dial = crate::network::dial_peer(
                                         &client.endpoint,
@@ -999,16 +1018,29 @@ impl Node {
                                         &hello,
                                         &client.control_peers,
                                     );
-                                    if let Ok(Ok(session)) =
-                                        tokio::time::timeout(Duration::from_secs(15), dial).await
-                                    {
-                                        crate::network::maintain_peer_session(
-                                            &session,
-                                            &client.id(),
-                                            &client.control_peers,
-                                            Self::control_options(),
-                                        )
-                                        .await;
+                                    match tokio::time::timeout(Duration::from_secs(15), dial).await {
+                                        Ok(Ok(session)) => {
+                                            if last_dial_error.take().is_some() {
+                                                info!(member = %remote, "mesh control connection recovered");
+                                            }
+                                            crate::network::maintain_peer_session(
+                                                &session,
+                                                &client.id(),
+                                                &client.control_peers,
+                                                Self::control_options(),
+                                            )
+                                            .await;
+                                        }
+                                        Ok(Err(error)) => report_control_dial_failure(
+                                            &remote,
+                                            &error,
+                                            &mut last_dial_error,
+                                        ),
+                                        Err(_) => report_control_dial_failure(
+                                            &remote,
+                                            "connection attempt timed out after 15s",
+                                            &mut last_dial_error,
+                                        ),
                                     }
                                     tokio::time::sleep(Duration::from_secs(2)).await;
                                 }
@@ -1132,6 +1164,20 @@ impl Node {
         .await
         .context("Device unavailable. Check your Internet connection and keep both apps open.")?
     }
+}
+
+fn report_control_dial_failure(
+    member: &str,
+    error: impl std::fmt::Display,
+    last_error: &mut Option<String>,
+) {
+    let error = error.to_string();
+    if last_error.is_none() {
+        warn!(%member, %error, "mesh control connection failed");
+    } else {
+        debug!(%member, %error, "mesh control connection still failing");
+    }
+    *last_error = Some(error);
 }
 
 /// Flushes the directory entry after an atomic rename where the platform supports it.
