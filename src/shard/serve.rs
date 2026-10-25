@@ -56,7 +56,7 @@ pub const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const RUNNER_EXIT_GRACE: Duration = Duration::from_secs(10);
 
 /// How long to keep draining a reaped runner's stderr, in case a grandchild still holds it.
-const STDERR_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const STDERR_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Per-direction copy buffer; QUIC flow control and the pipes bound everything beyond it.
 const COPY_BUFFER_LEN: usize = 64 * 1024;
@@ -71,7 +71,7 @@ const HASH_CHUNK_LEN: usize = 8 * 1024 * 1024;
 const SHA256_HEX_LEN: usize = 64;
 
 /// Application error code used to reset a session stream that failed part-way.
-const SESSION_ABORTED: VarInt = VarInt::from_u32(1);
+pub(crate) const SESSION_ABORTED: VarInt = VarInt::from_u32(1);
 
 /// Application error code used to close a connection that negotiated another protocol.
 const WRONG_ALPN: VarInt = VarInt::from_u32(2);
@@ -139,7 +139,7 @@ pub async fn serve_shard(
 }
 
 /// The served stage, its file hashes, and the lock that keeps sessions one at a time.
-struct Shard {
+pub(crate) struct Shard {
     config: ShardServeConfig,
     artifact_sha256: String,
     runner_sha256: String,
@@ -148,7 +148,7 @@ struct Shard {
 
 impl Shard {
     /// Validates `config` and hashes its files, refusing a model that does not match.
-    async fn load(mut config: ShardServeConfig) -> anyhow::Result<Self> {
+    pub(crate) async fn load(mut config: ShardServeConfig) -> anyhow::Result<Self> {
         ensure!(
             config.begin < config.end,
             "invalid layer range {}:{}: begin must be below end",
@@ -184,7 +184,7 @@ impl Shard {
     }
 
     /// Identity announced to leaders: the original model for an exported shard, else the file.
-    fn model_sha256(&self) -> &str {
+    pub(crate) fn model_sha256(&self) -> &str {
         self.config
             .source_sha256
             .as_deref()
@@ -192,7 +192,7 @@ impl Shard {
     }
 
     /// Checks the runner's metadata against this stage and adds the worker's hashes to it.
-    fn stamp_metadata(&self, meta: &mut StageMetadata) -> anyhow::Result<()> {
+    pub(crate) fn stamp_metadata(&self, meta: &mut StageMetadata) -> anyhow::Result<()> {
         ensure!(
             (meta.begin, meta.end) == (self.config.begin, self.config.end),
             "runner reports layers {}:{}, expected {}:{}",
@@ -215,7 +215,7 @@ impl Shard {
     }
 
     /// Starts a runner for this stage with piped stdio; it is killed if the handle is dropped.
-    fn spawn_runner(&self) -> anyhow::Result<Child> {
+    pub(crate) fn spawn_runner(&self) -> anyhow::Result<Child> {
         let config = &self.config;
         Command::new(&config.runner)
             .arg(&config.model)
@@ -467,7 +467,7 @@ async fn idle_watchdog(activity: &Notify) -> anyhow::Error {
 
 /// Waits for the runner to exit, killing it unless it ended cleanly and exits within
 /// [`RUNNER_EXIT_GRACE`]. Returns only once the process has been reaped.
-async fn reap(runner: &mut Child, ended_cleanly: bool) -> anyhow::Result<ExitStatus> {
+pub(crate) async fn reap(runner: &mut Child, ended_cleanly: bool) -> anyhow::Result<ExitStatus> {
     // Its stdin is already gone on the clean path; dropping it here covers the error paths.
     drop(runner.stdin.take());
     if ended_cleanly && let Ok(status) = timeout(RUNNER_EXIT_GRACE, runner.wait()).await {
@@ -482,7 +482,7 @@ async fn reap(runner: &mut Child, ended_cleanly: bool) -> anyhow::Result<ExitSta
 }
 
 /// Logs the runner's stderr line by line until it closes.
-async fn forward_stderr(stderr: ChildStderr, pid: Option<u32>) {
+pub(crate) async fn forward_stderr(stderr: ChildStderr, pid: Option<u32>) {
     let pid = pid.unwrap_or_default();
     let mut reader = BufReader::new(stderr);
     let mut line = Vec::new();
@@ -514,7 +514,7 @@ fn abort_stream(send: &mut SendStream, recv: &mut RecvStream) {
 }
 
 /// Session tasks handle their own errors, so a join error can only be a panic worth reporting.
-fn log_task_panic(joined: Result<(), JoinError>) {
+pub(crate) fn log_task_panic(joined: Result<(), JoinError>) {
     if let Err(join_error) = joined {
         error!(%join_error, "shard worker task panicked");
     }

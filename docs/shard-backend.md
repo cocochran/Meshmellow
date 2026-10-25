@@ -100,7 +100,7 @@ so it exists only on the llama backend.
 | `layers` | Total layers in the model. |
 | `context` | Context window passed to every stage, 32 to 4096. A prompt longer than this is refused with HTTP 400. |
 | `max_tokens` | Cap on completion tokens (default 512); a request may ask for fewer. |
-| `chat_template` | Required. `chatml` is the only v1 value; the template is never guessed. |
+| `chat_template` | Required: `"chatml"` or a pinned Jinja template object; the template is never guessed. See [Chat templates](#chat-templates). |
 | `stages` | Layer ranges in order, half-open, covering `0..layers` with no gaps. Each has `begin`, `end` and exactly one of `remote` or `local`. |
 | `remote.worker` | Node ID of the `shard-serve` worker for this range. The leader dials it by ID: through Iroh's n0 discovery in production, or in-memory address lookup in tests. |
 | `local.model` | Model or exported shard file the local runner loads. |
@@ -111,20 +111,210 @@ so it exists only on the llama backend.
 
 Unknown fields are refused everywhere, so a typo cannot silently drop a setting.
 
+### Chat templates
+
+The front end renders a request's `messages` into the prompt the tokenizing stage tokenizes
+(the local final stage, or stage 0 in a ring). `chat_template` takes one of two forms.
+
+`"chatml"` writes `<|im_start|>{role}\n{content}<|im_end|>\n` for each message, then
+`<|im_start|>assistant\n`.
+
+A pinned Jinja template renders the model's official chat template:
+
+```json
+"chat_template": {
+  "jinja": {"path": "qwen3-chat-template.jinja", "sha256": "<64 hex digits: SHA-256 of the file>"},
+  "enable_thinking": false
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `jinja.path` | The template file, for example a GGUF's `tokenizer.chat_template` metadata saved as text. A relative path is resolved against the manifest file's directory. (A manifest built in memory rather than loaded from a file keeps it relative to the working directory, as model paths are.) |
+| `jinja.sha256` | SHA-256 of the file's bytes (64 hex digits). |
+| `enable_thinking` | Optional, default `false`. Passed to the template as `enable_thinking`. |
+
+When the front end starts, it reads the file once, checks its SHA-256 and compiles it. A
+missing file, a hash mismatch or a template that does not compile stops startup, as an
+`artifact_sha256` mismatch does. Each request then renders the template with
+[minijinja](https://docs.rs/minijinja) set up the way Hugging Face's `apply_chat_template` and
+david-codex's demo (`experiments/model-validation/live_demo.py`) set up Jinja:
+
+- `trim_blocks` and `lstrip_blocks` are on.
+- Python string methods such as `.strip()`, `.startswith()` and `.split()` work, through
+  `minijinja-contrib`'s pycompat.
+- The context is `messages` (each with `role` and `content`; text parts are joined),
+  `add_generation_prompt = true`, `enable_thinking` from the manifest, `tools = none`, and a
+  `raise_exception(msg)` function.
+
+Requests are validated the same way as with `chatml`. A template error, including a
+`raise_exception` call, answers HTTP 400 with the template's message; it never reaches a stage.
+
+The pinned template is what david-codex's experimental ring demo uses, and he asked for it in
+place of generic ChatML. His demo renders the GGUF's official Qwen template with
+`add_generation_prompt=True, enable_thinking=False, tools=None`. With `enable_thinking: false`,
+a system message `You are a helpful assistant.` and a user message `<q>` render exactly as in
+his run record (`experiments/model-validation/results/qwen38-three-device-2026-10-24/manifest.json`):
+
+```text
+<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n<q><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n
+```
+
+With `enable_thinking: true`, the official Qwen3 template leaves out the empty
+`<think>\n\n</think>\n\n` block and the prompt ends at `<|im_start|>assistant\n`.
+`tests/fixtures/qwen3-chat-template.jinja` is the official Qwen3 template, copied byte for byte
+from `Qwen/Qwen3-8B`'s `tokenizer_config.json` (SHA-256
+`a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8`). For a real model, pin the
+template embedded in that model's own GGUF.
+
 ## v1 limits
 
 - Topology: one remote prefix plus a local final stage, or a single local stage that runs the
-  whole model. Chained remote stages and a remote final stage need ring forwarding over
-  david-codex's `meshthing/shard-ring/1` (M-27). Hidden states never take an extra hop through
-  the leader ("hub forwarding"); that design was rejected.
+  whole model. Chained remote stages and a remote final stage need ring forwarding: see
+  [Experimental: ring execution](#experimental-ring-execution-shard-ring1) below. Hidden states
+  never take an extra hop through the leader ("hub forwarding"); that design was rejected.
 - Greedy decoding only. `temperature`, `top_p`, `seed` and similar fields are accepted and
   ignored.
-- `chatml` is the only chat template. The pinned official Qwen template is future work (M-27).
+- Chat templates: `chatml` or a pinned Jinja template (see [Chat templates](#chat-templates)).
+  `tools` is always `none`; tool calls are not supported.
 - One sequence per runner process and no reset, so every job starts fresh runner processes
   (and a fresh Iroh connection to the worker). Model load time is paid on every job.
 - One generation runs at a time, matching the job queue.
 
+## Experimental: ring execution (shard-ring/1)
+
+Ring execution runs chained remote stages and a remote final stage without sending hidden
+states back through the leader. It is opt-in (`"execution": "ring"` in the manifest) and
+EXPERIMENTAL: it is pending david-codex's production sign-off. Manifests without `execution`,
+or with `"execution": "pipeline"`, behave exactly as described above.
+
+### Wire compatibility
+
+The leader and `llm-cluster shard-ring-worker` speak `meshthing/shard-ring/1` byte for byte as
+david-codex's diagnostic `experiments/mobile-probe/iroh-core/src/ring.rs` does (see
+[QWEN38_RING.md](../experiments/model-validation/QWEN38_RING.md)): the same ALPN, one bounded
+JSON line per control message (at most 65,536 bytes), raw little-endian `f32` payloads of at
+most 16 MiB, a 32-hex job id consumed once, strict step and position order, batches of 1 to
+128 rows, and the same chain checks (contiguous ranges; the same layers, hidden size,
+vocabulary and 64-hex `source_sha256` throughout). Our leader and workers are designed to mix
+with his gateway and `mesh-ring worker` in one ring; that mix has not been run yet.
+
+### Topology
+
+- The leader is the ring's origin. It renders the prompt, runs stage 0 (`0..k`) in a local
+  runner that tokenizes it, and sends stage 0's hidden rows to the entry worker.
+- Each worker runs its own range in a fresh runner per session and forwards its rows straight
+  to the next worker. Only small progress lines travel back toward the leader, hop by hop.
+- The terminal worker (the one owning the last layer) opens a result channel straight back to
+  the leader and returns each step's token and text piece on it.
+- The leader never receives activations. Every byte it reads from ring streams is counted, and
+  the tests check that all of it was JSON control lines.
+
+For each generation the leader registers a fresh job id for the manifest's terminal, starts
+the session at the entry, checks the `ready` chain against the manifest (ranges and workers
+in order, `source_sha256` equal to `model_sha256`, and layers, hidden size and vocabulary
+matching stage 0), and waits for the terminal's result channel. Its endpoint also accepts the
+ring ALPN: result channels are accepted only from the manifest's terminal and only for a
+pending job, and any other peer is closed with code 3 ("peer not approved").
+
+### Worker commands
+
+Each hop names its neighbours by node ID: `--upstream` is the only peer allowed to start
+sessions, `--origin` is the leader, and `--next` is the following worker. A worker without
+`--next` is the terminal. Print the leader's node ID first with
+`llm-cluster --key leader.key listen`.
+
+Entry worker (layers `16..40`, upstream is the leader):
+
+```sh
+llm-cluster --key entry.key shard-ring-worker \
+  --runner /path/to/mesh-shard-runner --model /path/to/shard-16-40.gguf \
+  --range 16:40 --context 512 --gpu-layers 99 --budget-bytes 11811160064 \
+  --expected-sha256 <sha256 of the --model file> \
+  --source-sha256 <sha256 of the original full model> \
+  --upstream <leader node id> --origin <leader node id> --next <terminal node id>
+```
+
+Terminal worker (layers `40..64`, upstream is the entry worker, no `--next`):
+
+```sh
+llm-cluster --key terminal.key shard-ring-worker \
+  --runner /path/to/mesh-shard-runner --model /path/to/shard-40-64.gguf \
+  --range 40:64 --context 512 --gpu-layers 99 --budget-bytes 11811160064 \
+  --expected-sha256 <sha256 of the --model file> \
+  --source-sha256 <sha256 of the original full model> \
+  --upstream <entry node id> --origin <leader node id>
+```
+
+A middle worker takes `--upstream <previous worker>` and `--next <following worker>`. Every
+ring worker must load an exported shard whose runner reports the 64-hex `source_sha256`, as in
+ring.rs. Then start the leader as usual:
+`llm-cluster --key leader.key leader --backend shard --shard-manifest ring.json --worker-wait 5m`.
+
+### Manifest
+
+```json
+{
+  "runner": "/path/to/mesh-shard-runner",
+  "model_sha256": "<sha256 of the original full model>",
+  "layers": 64,
+  "context": 512,
+  "max_tokens": 64,
+  "chat_template": "chatml",
+  "execution": "ring",
+  "stages": [
+    {"begin": 0, "end": 16, "local": {
+      "model": "/path/to/shard-0-16.gguf", "gpu_layers": 99, "budget_bytes": 11811160064
+    }},
+    {"begin": 16, "end": 40, "remote": {"worker": "<entry node id>"}},
+    {"begin": 40, "end": 64, "remote": {"worker": "<terminal node id>"}}
+  ]
+}
+```
+
+Ring rules: `stages[0]` is local, begins at layer 0 and ends before the last layer (it
+tokenizes and runs the first layers); every later stage is remote, there is at least one,
+they are contiguous up to `layers`, and no worker appears twice. The last remote stage is the
+terminal. All the other manifest rules (hashes, context, `max_tokens`, `chat_template`,
+unknown fields) apply unchanged.
+
+### Diagnostics
+
+With the global `--debug` flag (or `RUST_LOG=llm_cluster::shard=debug`) the leader logs the
+origin side of each ring session, following the conventions in
+[runtime-diagnostics.md](runtime-diagnostics.md): `ring session ready` (the entry's and the
+terminal's selected Iroh path, and `ready_us` from the start to the result channel), then for
+every step `ring activations sent` (`input_bytes`, `write_us`) and `shard ring exchange`
+(`input_bytes`, `output_bytes`, `write_us`, `read_us` until the terminal's result arrived,
+`total_us`), plus the whole-step `shard pipeline step`. Each worker's relayed progress lines
+are logged as `ring progress`. A timeout error says whether sending the activations or waiting
+for the result ran out of the step deadline. At `info`, `ring session closed` reports the
+session's step count, activation bytes sent and bytes read (with `activation_bytes_read`,
+always 0). `read_us` includes every worker's compute time, so it is not a network latency.
+
+### Limits
+
+- Fixed order: the manifest's ranges and workers must match the running ring exactly. There is
+  no automatic placement yet.
+- One job per worker: a worker runs one session at a time and drops a concurrent one, and the
+  leader runs one generation at a time.
+- No retries, rerouting or re-prefill: any error (a bad chain, a missing result channel, a
+  worker failure) fails the job. A ring must become ready, including the terminal's result
+  channel, within 300 s by default (`RingSettings::result_channel_wait`).
+- Chat templates work as in pipeline mode: the leader renders the prompt for its local stage
+  0. To match david-codex's ring demo, use the pinned official Qwen template with
+  `enable_thinking: false` (see [Chat templates](#chat-templates)).
+- The manual multi-device run of ring execution through `llm-cluster prompt` is still pending
+  on hardware. It has only been tested on loopback with the fake runner.
+
 ## Tests
+
+`tests/shard_ring.rs` runs the job API end to end on a three-stage ring: the leader's local
+stage `0..1`, then two real `serve_ring_worker`s (entry `1..3`, terminal `3..4`) on the
+`fake_shard_runner` example. It checks buffered and streamed prompts, that no activation byte
+reached the leader, a `ready` chain that does not match the manifest, workers in the wrong
+order, a result channel from a peer that is not the terminal (and a replayed job), and a
+terminal that never opens its result channel, which fails within the bounded wait.
 
 `tests/shard_backend.rs` runs the job API end to end on the shard backend: a real
 `shard-serve` worker drives the `fake_shard_runner` example as the prefix, and the leader runs
@@ -135,6 +325,7 @@ first:
 ```sh
 cargo build --examples
 cargo test --test shard_backend
+cargo test --test shard_ring
 ```
 
 ## Reproducing the two-Mac 32B run through `llm-cluster prompt`
