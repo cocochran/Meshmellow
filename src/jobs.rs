@@ -17,6 +17,9 @@ use uuid::Uuid;
 /// Finished jobs kept for `GET /jobs`; older ones are forgotten so memory stays bounded.
 pub const MAX_RETAINED_FINISHED_JOBS: usize = 256;
 
+/// Active plus queued inference jobs admitted at once.
+pub const MAX_OUTSTANDING_JOBS: usize = 16;
+
 /// Jobs allowed to run at once: llama-server serves one generation at a time.
 const RUNNING_SLOTS: usize = 1;
 
@@ -64,6 +67,8 @@ pub struct JobInfo {
 
 /// Shared state behind a [`JobQueue`] and its permits.
 struct QueueInner {
+    /// Bounds parsed request bodies and active job records waiting for inference.
+    admission_slots: Arc<Semaphore>,
     /// Hands out the running slot; tokio's semaphore is fair, which gives FIFO order.
     slot: Arc<Semaphore>,
     /// Every active job plus the most recent finished ones, oldest first.
@@ -140,24 +145,47 @@ impl JobQueue {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(QueueInner {
+                admission_slots: Arc::new(Semaphore::new(MAX_OUTSTANDING_JOBS)),
                 slot: Arc::new(Semaphore::new(RUNNING_SLOTS)),
                 jobs: Mutex::new(VecDeque::new()),
             }),
         }
     }
 
-    /// Registers a job as Queued and waits (FIFO) until it's the single running job.
+    /// Registers a job and waits until it has both an outstanding-job slot and the running slot.
     ///
-    /// Cancel-safe: dropping the returned future while still queued marks the job Canceled
+    /// Cancel-safe: dropping the returned future while waiting marks a registered job Canceled
     /// and gives up its place in line.
     pub async fn acquire(&self, conversation_id: Option<String>) -> JobPermit {
+        let admission = Arc::clone(&self.inner.admission_slots)
+            .acquire_owned()
+            .await
+            .expect("job queue admission semaphore is never closed");
+        self.acquire_admitted(conversation_id, admission).await
+    }
+
+    /// Tries to admit an active or queued job, returning `None` immediately when the capacity is
+    /// full. Once admitted, waits FIFO for the single running slot. Cancel-safe after admission.
+    pub async fn try_acquire(&self, conversation_id: Option<String>) -> Option<JobPermit> {
+        let admission = Arc::clone(&self.inner.admission_slots)
+            .try_acquire_owned()
+            .ok()?;
+        Some(self.acquire_admitted(conversation_id, admission).await)
+    }
+
+    async fn acquire_admitted(
+        &self,
+        conversation_id: Option<String>,
+        admission: OwnedSemaphorePermit,
+    ) -> JobPermit {
         let waiting = QueuedGuard {
             inner: Arc::clone(&self.inner),
             request_id: self.inner.register(conversation_id),
+            admission: Some(admission),
             is_armed: true,
         };
         let slot = Arc::clone(&self.inner.slot).acquire_owned().await;
-        let request_id = waiting.disarm();
+        let (request_id, admission) = waiting.disarm();
         let Ok(slot) = slot else {
             // The semaphore is never closed, so this is unreachable; record it rather than panic.
             self.inner.finish(
@@ -165,6 +193,7 @@ impl JobQueue {
                 JobStatus::Failed,
                 Some("job queue closed".to_owned()),
             );
+            drop(admission);
             return JobPermit::detached(Arc::clone(&self.inner), request_id);
         };
         self.inner.mark_running(&request_id);
@@ -172,6 +201,7 @@ impl JobQueue {
             inner: Arc::clone(&self.inner),
             request_id,
             slot: Some(slot),
+            admission: Some(admission),
             is_finished: false,
         }
     }
@@ -192,14 +222,20 @@ impl Default for JobQueue {
 struct QueuedGuard {
     inner: Arc<QueueInner>,
     request_id: String,
+    admission: Option<OwnedSemaphorePermit>,
     is_armed: bool,
 }
 
 impl QueuedGuard {
     /// The job got the slot: stop guarding and hand back its request ID.
-    fn disarm(mut self) -> String {
+    fn disarm(mut self) -> (String, OwnedSemaphorePermit) {
         self.is_armed = false;
-        std::mem::take(&mut self.request_id)
+        (
+            std::mem::take(&mut self.request_id),
+            self.admission
+                .take()
+                .expect("queued job holds an admission slot"),
+        )
     }
 }
 
@@ -221,6 +257,8 @@ pub struct JobPermit {
     request_id: String,
     /// Released after the outcome is recorded, so the next job starts after this one finished.
     slot: Option<OwnedSemaphorePermit>,
+    /// Bounds total active and queued jobs until this outcome is recorded.
+    admission: Option<OwnedSemaphorePermit>,
     is_finished: bool,
 }
 
@@ -231,6 +269,7 @@ impl JobPermit {
             inner,
             request_id,
             slot: None,
+            admission: None,
             is_finished: true,
         }
     }
@@ -257,6 +296,7 @@ impl JobPermit {
         self.is_finished = true;
         self.inner.finish(&self.request_id, status, error);
         self.slot.take();
+        self.admission.take();
     }
 }
 
@@ -356,6 +396,36 @@ mod tests {
         assert_eq!(jobs[2].conversation_id.as_deref(), Some("third"));
         assert!(jobs[2].started_at_unix_ms.unwrap() >= jobs[1].finished_at_unix_ms.unwrap());
         third.complete();
+    }
+
+    #[tokio::test]
+    async fn outstanding_job_limit_rejects_without_registering_another_job() {
+        let queue = Arc::new(JobQueue::new());
+        let first = queue.acquire(None).await;
+        let waiters: Vec<_> = (0..MAX_OUTSTANDING_JOBS - 1)
+            .map(|index| spawn_acquire(&queue, &format!("queued-{index}")))
+            .collect();
+        tokio::time::sleep(SETTLE).await;
+
+        assert_eq!(queue.jobs().len(), MAX_OUTSTANDING_JOBS);
+        assert!(
+            queue
+                .try_acquire(Some("overflow".to_owned()))
+                .await
+                .is_none()
+        );
+        assert_eq!(queue.jobs().len(), MAX_OUTSTANDING_JOBS);
+
+        first.complete();
+        for waiter in waiters {
+            waiter.await.unwrap().complete();
+        }
+        assert_eq!(
+            queue.jobs().len(),
+            MAX_RETAINED_FINISHED_JOBS.min(MAX_OUTSTANDING_JOBS)
+        );
+        let final_permit = queue.acquire(None).await;
+        final_permit.complete();
     }
 
     #[tokio::test]

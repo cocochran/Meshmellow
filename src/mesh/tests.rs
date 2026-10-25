@@ -1,5 +1,13 @@
 use super::*;
 
+#[tokio::test]
+async fn oversized_membership_file_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("membership.json"), vec![b'x'; MAX_WIRE + 1]).unwrap();
+
+    assert!(Node::open_local(dir.path()).await.is_err());
+}
+
 async fn peer(node: &Node) -> Peer {
     let snapshot = node.snapshot().await.unwrap();
     Peer {
