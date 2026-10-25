@@ -34,9 +34,9 @@ use iroh::endpoint::{Connection, Incoming, RecvStream, SendStream, VarInt};
 use iroh::{Endpoint, EndpointId};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tokio::task::{self, JoinError, JoinSet};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::protocol::RPC_BRIDGE_ALPN;
 
@@ -60,6 +60,16 @@ pub const PEER_NOT_APPROVED_REASON: &[u8] = b"peer not approved";
 
 /// Pause after a failed TCP accept so a persistent error (such as fd exhaustion) cannot spin.
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// Maximum active local TCP clients across all leader-side worker bridges.
+const MAX_BRIDGE_CLIENTS: usize = 128;
+
+/// Maximum incoming worker-side connections and streams per connection.
+const MAX_BRIDGE_CONNECTIONS: usize = 128;
+const MAX_BRIDGE_STREAMS_PER_CONNECTION: usize = 64;
+
+/// Maximum active worker-side streams across all remote connections.
+const MAX_BRIDGE_STREAMS_TOTAL: usize = 256;
 
 /// Port that asks the OS for any free port; any number of mappings may use it at once.
 const ANY_PORT: u16 = 0;
@@ -147,9 +157,14 @@ impl LeaderBridges {
         let Self { endpoint, bridges } = self;
         let mut workers = HashMap::with_capacity(bridges.len());
         let mut accept_loops = JoinSet::new();
+        let client_slots = Arc::new(Semaphore::new(MAX_BRIDGE_CLIENTS));
         for bridge in bridges {
             let worker = bridge.worker;
-            let handle = accept_loops.spawn(accept_clients(endpoint.clone(), bridge));
+            let handle = accept_loops.spawn(accept_clients(
+                endpoint.clone(),
+                bridge,
+                Arc::clone(&client_slots),
+            ));
             workers.insert(handle.id(), worker);
         }
         tokio::select! {
@@ -203,14 +218,27 @@ fn validate_mappings(mappings: &[BridgeMapping]) -> anyhow::Result<()> {
 
 /// Leader side of one worker: accepts TCP clients on its listener forever, bridging each one to
 /// the worker over a shared Iroh connection. Dropping the future aborts every stream.
-async fn accept_clients(endpoint: Endpoint, bridge: BoundBridge) -> Infallible {
+async fn accept_clients(
+    endpoint: Endpoint,
+    bridge: BoundBridge,
+    client_slots: Arc<Semaphore>,
+) -> Infallible {
     let link = Arc::new(WorkerLink::new(endpoint, bridge.worker));
     let mut streams = JoinSet::new();
     loop {
         tokio::select! {
             accepted = bridge.listener.accept() => match accepted {
                 Ok((tcp, client)) => {
-                    streams.spawn(forward_to_worker(Arc::clone(&link), tcp, client));
+                    let Ok(permit) = client_slots.clone().try_acquire_owned() else {
+                        debug!(%client, limit = MAX_BRIDGE_CLIENTS, "rpc bridge client limit reached; dropping client");
+                        drop(tcp);
+                        continue;
+                    };
+                    let link = Arc::clone(&link);
+                    streams.spawn(async move {
+                        let _permit = permit;
+                        forward_to_worker(link, tcp, client).await;
+                    });
                 }
                 Err(error) => {
                     warn!(%error, "failed to accept rpc client");
@@ -271,6 +299,8 @@ pub async fn serve_worker(
     ensure_loopback(target, "target")?;
     info!(id = %endpoint.id(), %target, approved_peers = allowed.0.len(), "rpc bridge worker serving");
 
+    let connection_slots = Arc::new(Semaphore::new(MAX_BRIDGE_CONNECTIONS));
+    let stream_slots = Arc::new(Semaphore::new(MAX_BRIDGE_STREAMS_TOTAL));
     let mut connections = JoinSet::new();
     loop {
         tokio::select! {
@@ -279,7 +309,17 @@ pub async fn serve_worker(
                     info!("endpoint closed; rpc bridge worker stopping");
                     return Ok(());
                 };
-                connections.spawn(serve_connection(incoming, target, allowed.clone()));
+                let Ok(permit) = connection_slots.clone().try_acquire_owned() else {
+                    incoming.refuse();
+                    debug!(limit = MAX_BRIDGE_CONNECTIONS, "rpc bridge connection limit reached; refusing connection");
+                    continue;
+                };
+                let allowed = allowed.clone();
+                let stream_slots = Arc::clone(&stream_slots);
+                connections.spawn(async move {
+                    let _permit = permit;
+                    serve_connection(incoming, target, allowed, stream_slots).await;
+                });
             }
             Some(joined) = connections.join_next(), if !connections.is_empty() => {
                 log_task_panic(joined);
@@ -353,7 +393,12 @@ async fn forward_to_worker(link: Arc<WorkerLink>, tcp: TcpStream, client: Socket
 
 /// Worker side of one Iroh connection: bridge each incoming stream to `target`, but only for
 /// peers on `allowed`.
-async fn serve_connection(incoming: Incoming, target: SocketAddr, allowed: PeerAllowlist) {
+async fn serve_connection(
+    incoming: Incoming,
+    target: SocketAddr,
+    allowed: PeerAllowlist,
+    total_stream_slots: Arc<Semaphore>,
+) {
     let connection = match incoming.await {
         Ok(connection) => connection,
         Err(error) => {
@@ -376,12 +421,38 @@ async fn serve_connection(incoming: Incoming, target: SocketAddr, allowed: PeerA
     }
     info!(%remote, path = path_kind(&connection), "rpc bridge leader connected");
 
+    let stream_slots = Arc::new(Semaphore::new(MAX_BRIDGE_STREAMS_PER_CONNECTION));
     let mut streams = JoinSet::new();
+    let mut stream_limit_logged = false;
     loop {
         tokio::select! {
             accepted = connection.accept_bi() => match accepted {
                 Ok(pair) => {
-                    streams.spawn(forward_to_target(connection.clone(), pair, target));
+                    let Ok(connection_permit) = stream_slots.clone().try_acquire_owned() else {
+                        let (mut send, mut recv) = pair;
+                        abort_stream(&mut send, &mut recv);
+                        if !stream_limit_logged {
+                            warn!(%remote, limit = MAX_BRIDGE_STREAMS_PER_CONNECTION, "rpc bridge stream limit reached; refusing extra streams");
+                            stream_limit_logged = true;
+                        }
+                        continue;
+                    };
+                    let Ok(total_permit) = total_stream_slots.clone().try_acquire_owned() else {
+                        drop(connection_permit);
+                        let (mut send, mut recv) = pair;
+                        abort_stream(&mut send, &mut recv);
+                        if !stream_limit_logged {
+                            warn!(%remote, limit = MAX_BRIDGE_STREAMS_TOTAL, "rpc bridge total stream limit reached; refusing extra streams");
+                            stream_limit_logged = true;
+                        }
+                        continue;
+                    };
+                    let connection = connection.clone();
+                    streams.spawn(async move {
+                        let _connection_permit = connection_permit;
+                        let _total_permit = total_permit;
+                        forward_to_target(connection, pair, target).await;
+                    });
                 }
                 Err(error) => {
                     info!(%remote, %error, "rpc bridge connection closed");

@@ -2,6 +2,7 @@
 
 pub mod admission;
 pub mod api;
+pub mod config;
 pub mod evidence;
 pub mod history;
 pub mod history_sync;

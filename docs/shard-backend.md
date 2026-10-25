@@ -25,6 +25,13 @@ forwards to it just as it forwards to `llama-server`.
    samples the next token greedily, and the token is fed back to the prefix. Pieces stream back
    to the job API as OpenAI-style SSE.
 
+The frontend buffers at most 16 text events for a slow HTTP reader; generation applies
+backpressure instead of accumulating an unbounded queue. A disconnected client signals
+cooperative cancellation. Requests still waiting for the generation slot exit without starting
+workers; an active pipeline closes remote streams and waits for local runners to be killed and
+reaped before releasing the slot. If disconnect happens during stage startup, already-started
+links are closed as soon as startup finishes.
+
 ## Commands
 
 On the worker that serves the prefix:
@@ -134,9 +141,9 @@ A pinned Jinja template renders the model's official chat template:
 | `jinja.sha256` | SHA-256 of the file's bytes (64 hex digits). |
 | `enable_thinking` | Optional, default `false`. Passed to the template as `enable_thinking`. |
 
-When the front end starts, it reads the file once, checks its SHA-256 and compiles it. A
-missing file, a hash mismatch or a template that does not compile stops startup, as an
-`artifact_sha256` mismatch does. Each request then renders the template with
+When the front end starts, it reads at most 1 MiB of the file once, checks its SHA-256 and
+compiles it. A missing or oversized file, a hash mismatch or a template that does not compile
+stops startup, as an `artifact_sha256` mismatch does. Each request then renders the template with
 [minijinja](https://docs.rs/minijinja) set up the way Hugging Face's `apply_chat_template` and
 david-codex's demo (`experiments/model-validation/live_demo.py`) set up Jinja:
 

@@ -79,6 +79,14 @@ struct Snapshot {
     entries: Vec<Entry>,
 }
 
+/// Borrowed snapshot used for serialization so compaction doesn't clone the full history.
+#[derive(Serialize)]
+struct SnapshotRef<'a> {
+    generation: u64,
+    epoch: Epoch,
+    entries: &'a [Entry],
+}
+
 /// One line of `log.jsonl`, as read.
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -396,8 +404,7 @@ impl HistoryStore {
 
     /// Folds the log into the snapshot so loading stays fast and the log stays short.
     fn compact(&mut self) -> Result<(), StoreError> {
-        let history = self.history.clone();
-        self.write_snapshot(self.generation, self.epoch, &history)?;
+        self.write_snapshot(self.generation, self.epoch, &self.history)?;
         self.truncate_log()?;
         self.snapshot_len = self.history.len();
         Ok(())
@@ -409,10 +416,10 @@ impl HistoryStore {
         epoch: Epoch,
         history: &History,
     ) -> Result<(), StoreError> {
-        let snapshot = Snapshot {
+        let snapshot = SnapshotRef {
             generation,
             epoch,
-            entries: history.entries().to_vec(),
+            entries: history.entries(),
         };
         write_json_atomic(&self.dir.join(SNAPSHOT_FILE), &snapshot)
     }
