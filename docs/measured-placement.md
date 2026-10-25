@@ -122,6 +122,14 @@ peaks, and the operator-supplied thermal/power descriptions are not sensor
 measurements. It also has no shared compute admission, current availability,
 reservation, or directed-link evidence.
 
+Keep the producer's timing fields separate as well. `compute_ms` is the
+runner's synchronized native interval; `service_ms` includes local request
+write and response-pipe handling. Neither is mesh transfer time, and service
+time is not end-to-end request latency. A qualification record must preserve
+both distributions and identify the exact versioned cost objective used by a
+planner. For example, whole-range service p95 plus directed-link p95 is a
+predicted additive objective; it must not be labeled measured end-to-end p95.
+
 Therefore this diagnostic format is not a serialization of measured-planner
 v1 `RangeObservation`, and a passing report cannot be copied into that input.
 Promotion requires a separately versioned qualification record that links the
