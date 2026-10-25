@@ -13,6 +13,7 @@ pub mod placement;
 pub mod planning;
 pub mod process;
 pub mod protocol;
+pub mod replication;
 pub mod rpc_bridge;
 pub mod rpc_plan;
 pub mod shard;

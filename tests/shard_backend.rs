@@ -212,6 +212,8 @@ impl Leader {
             worker_wait: WORKER_WAIT,
             heartbeat_timeout: None,
             heartbeat_interval: None,
+            replication: None,
+            quorum: None,
         };
         Self {
             runner_log: dir.join("final-stage.log"),
