@@ -29,6 +29,7 @@ use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::admission::AdmittedChild as Child;
 use anyhow::{Context, bail, ensure};
 use iroh::endpoint::{Connection, Incoming, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointId};
@@ -37,7 +38,7 @@ use serde_json::{Map, Value};
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
-use tokio::process::{Child, ChildStdin, ChildStdout};
+use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
@@ -789,7 +790,7 @@ impl RingWorker {
         };
         validate_job_id(&job)?;
         stats.job.clone_from(&job);
-        let mut runner = NativeRunner::spawn(&self.shard)?;
+        let mut runner = NativeRunner::spawn(&self.shard).await?;
         let outcome: anyhow::Result<()> = async {
             let meta = runner.start(&self.shard).await?;
             let mut hop = self.ready_hop(job, meta, writer).await?;
@@ -876,8 +877,8 @@ struct NativeRunner {
 
 impl NativeRunner {
     /// Spawns a fresh runner with its stderr forwarded to the log.
-    fn spawn(shard: &Shard) -> anyhow::Result<Self> {
-        let mut child = shard.spawn_runner()?;
+    async fn spawn(shard: &Shard) -> anyhow::Result<Self> {
+        let mut child = shard.spawn_runner().await?;
         let mut logs = JoinSet::new();
         if let Some(stderr) = child.stderr.take() {
             logs.spawn(forward_stderr(stderr, child.id()));
