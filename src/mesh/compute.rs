@@ -36,8 +36,11 @@ pub struct ComputeOffer {
 fn host_memory() -> (Option<u64>, Option<u64>) {
     #[cfg(target_os = "macos")]
     {
-        let total = std::process::Command::new("/usr/sbin/sysctl").args(["-n", "hw.memsize"])
-            .output().ok().filter(|o| o.status.success())
+        let total = std::process::Command::new("/usr/sbin/sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
             .and_then(|o| String::from_utf8(o.stdout).ok())
             .and_then(|s| s.trim().parse().ok());
         (total, None)
@@ -45,10 +48,14 @@ fn host_memory() -> (Option<u64>, Option<u64>) {
     #[cfg(not(target_os = "macos"))]
     {
         let info = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
-        let bytes = |name: &str| info.lines().find_map(|line| {
-            let mut parts = line.split_whitespace();
-            (parts.next()? == name).then(|| parts.next()?.parse::<u64>().ok()?.checked_mul(1024)).flatten()
-        });
+        let bytes = |name: &str| {
+            info.lines().find_map(|line| {
+                let mut parts = line.split_whitespace();
+                (parts.next()? == name)
+                    .then(|| parts.next()?.parse::<u64>().ok()?.checked_mul(1024))
+                    .flatten()
+            })
+        };
         (bytes("MemTotal:"), bytes("MemAvailable:"))
     }
 }
@@ -273,7 +280,10 @@ impl Node {
     pub(super) async fn compute_offer(&self) -> Option<ComputeOffer> {
         let offer = self.compute.lock().await.as_ref()?.offer.clone();
         #[cfg(not(target_os = "macos"))]
-        let offer = ComputeOffer { available_memory_bytes: host_memory().1, ..offer };
+        let offer = ComputeOffer {
+            available_memory_bytes: host_memory().1,
+            ..offer
+        };
         Some(offer)
     }
 
@@ -322,15 +332,11 @@ impl Node {
             end,
         ))
         .await;
-        let loaded = self.load_assignment(origin, state, assignment, &mut epoch).await;
+        let loaded = self
+            .load_assignment(origin, state, assignment, &mut epoch)
+            .await;
         self.set_compute_status(match &loaded {
-            Ok(()) => ComputeStatus::range(
-                "ready",
-                "Serving the mesh.",
-                layers,
-                begin,
-                end,
-            ),
+            Ok(()) => ComputeStatus::range("ready", "Serving the mesh.", layers, begin, end),
             Err(error) => ComputeStatus::range(
                 "failed",
                 format!("Could not load layers {label}: {error:#}"),
@@ -510,7 +516,9 @@ impl Node {
             .is_some_and(|(key, _)| key == &signature);
         // A failed or cancelled preparation must never advertise the previous
         // route as ready after some workers have accepted different ranges.
-        if !unchanged { *self.compute_route.lock().await = None; }
+        if !unchanged {
+            *self.compute_route.lock().await = None;
+        }
         let speed: Vec<_> = offers.iter().map(|(_, o)| 1.0 / o.layer_ms).collect();
         let sum: f64 = speed.iter().sum();
         let remaining = base.layers as usize - offers.len();

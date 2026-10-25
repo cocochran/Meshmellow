@@ -562,10 +562,17 @@ async fn run_generation(
             return;
         }
     };
-    if let Some(ring) = &state.ring { ring.settings.channels.execution.begin(&state.manifest, &state.endpoint.id().to_string()); }
+    if let Some(ring) = &state.ring {
+        ring.settings
+            .channels
+            .execution
+            .begin(&state.manifest, &state.endpoint.id().to_string());
+    }
     let event = match generate(&state, &prompt, max_tokens, &events, cancel).await {
         Ok(generation) => {
-            if let Some(ring) = &state.ring { ring.settings.channels.execution.finish("done"); }
+            if let Some(ring) = &state.ring {
+                ring.settings.channels.execution.finish("done");
+            }
             info!(
                 finish = generation.finish.as_str(),
                 completion_tokens = generation.completion_tokens,
@@ -574,12 +581,16 @@ async fn run_generation(
             Event::Finished(generation)
         }
         Err(error) if error.downcast_ref::<GenerationCancelled>().is_some() => {
-            if let Some(ring) = &state.ring { ring.settings.channels.execution.finish("cancelled"); }
+            if let Some(ring) = &state.ring {
+                ring.settings.channels.execution.finish("cancelled");
+            }
             info!("client disconnected; shard generation canceled after cleanup");
             return;
         }
         Err(error) => {
-            if let Some(ring) = &state.ring { ring.settings.channels.execution.finish("error"); }
+            if let Some(ring) = &state.ring {
+                ring.settings.channels.execution.finish("error");
+            }
             warn!(error = %format!("{error:#}"), "shard generation failed");
             Event::Failed(Failure::from_error(&error))
         }

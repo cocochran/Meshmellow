@@ -478,7 +478,12 @@ async fn telemetry(State(app): State<Arc<App>>) -> Json<Value> {
     let active_manifest = app.node.active_compute_manifest().await;
     let manifest = active_manifest.as_ref().or(app.inference_manifest.as_ref());
     let sessions = app.node.inference_ring_settings().channels.traffic();
-    let execution = app.node.inference_ring_settings().channels.execution.snapshot();
+    let execution = app
+        .node
+        .inference_ring_settings()
+        .channels
+        .execution
+        .snapshot();
     let hardware = app.node.compute_hardware().await;
     let hardware: Vec<Value> = hardware.iter().filter(|(id, _)| membership["members"].as_array().is_some_and(|ms| ms.iter().any(|m| m["id"] == *id && m["online"] == true))).map(|(id, offer)| json!({"id":id,"totalBytes":offer.total_memory_bytes,"availableBytes":offer.available_memory_bytes})).collect();
     let executed: u64 = sessions

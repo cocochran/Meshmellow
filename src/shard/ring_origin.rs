@@ -692,8 +692,15 @@ impl RingLink {
         );
         let counter = Arc::new(TrafficCounter::default());
         let progress = Counted::new(stream.recv, Arc::clone(&counter));
-        settings.channels.execution.ready(&job, stream.stages.iter().map(|s| s.meta.clone()));
-        let drain = DrainTask(Some(tokio::spawn(drain_progress(progress, job.clone(), settings.channels.clone()))));
+        settings
+            .channels
+            .execution
+            .ready(&job, stream.stages.iter().map(|s| s.meta.clone()));
+        let drain = DrainTask(Some(tokio::spawn(drain_progress(
+            progress,
+            job.clone(),
+            settings.channels.clone(),
+        ))));
         let (result_connection, results) = channel.into_parts();
         Ok(Self {
             results: Counted::new(results, Arc::clone(&counter)),
@@ -752,7 +759,11 @@ impl RingLink {
         let read_started = Instant::now();
         let before = self.results.consumed;
         let result = self.await_result(step, deadline).await?;
-        self.channels.execution.token(&self.job, result.reply.eog, self.results.consumed.saturating_sub(before));
+        self.channels.execution.token(
+            &self.job,
+            result.reply.eog,
+            self.results.consumed.saturating_sub(before),
+        );
         debug!(
             session = %self.label,
             step,
