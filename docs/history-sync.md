@@ -331,7 +331,7 @@ On peer-table changes, the main process calls `node.set_peers(&peer_table)` and 
 
 **Missing pieces:**
 - **No control loop:** nothing yet reads `History` frames from control connections and calls the code above.
-- **HistorySink:** Yash's M-7/M-8 work proposes a `HistorySink { record(CompletedTurn) }` hook. It would sit on `start_job` / `complete_job` + `persist`.
+- **HistorySink:** `src/history.rs` has `HistorySink { started(&StartedTurn), record(CompletedTurn), ended(request_id, TurnOutcome) }`: every job that gets the run slot reports `started` once, then exactly one of `record` or `ended(Failed | Canceled)` (M-24). It would sit on `start_job` / `complete_job` + `persist`, with `ended` marking the job interrupted.
 - **PR #10 conflicts:** it adds heartbeats to `PeerTable` and conflicts with the `NodeId`-keyed table here. Reconciling them is task M-21.
 - **Heartbeat timeout (M-11):** the leader now drops a worker whose heartbeats stop, not only one whose connection closes (section 9), but nothing calls `set_peers` on a live node yet.
 
