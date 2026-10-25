@@ -45,13 +45,14 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::api::CHAT_COMPLETIONS_PATH;
-use crate::shard::manifest::{ChatTemplate, ShardManifest, StageLocation, StageSpec};
+use crate::shard::manifest::{ShardManifest, StageLocation, StageSpec};
 use crate::shard::manifest::{same_sha256, sha256_file};
 use crate::shard::pipeline::{
     FinishReason, Generation, GenerationLimits, LocalLaunch, METADATA_TIMEOUT, Pipeline,
     PromptTooLong, StageExpectation, StageIdentity, StageLink,
 };
 use crate::shard::ring_origin::{RingLink, RingPlan, RingSettings};
+use crate::shard::template::{ChatMessage, ChatRenderer};
 
 /// Liveness probe, as llama-server serves it.
 pub const HEALTH_PATH: &str = "/health";
@@ -94,7 +95,9 @@ struct RingRuntime {
 /// resolves, then finishes in-flight requests and returns.
 ///
 /// Before binding it validates the manifest and hashes every local stage file that has a
-/// configured `artifact_sha256` (once, on a blocking thread), failing on any mismatch.
+/// configured `artifact_sha256` (once, on a blocking thread), failing on any mismatch. It also
+/// loads the chat template once ([`ChatRenderer::load`]), refusing a pinned template that is
+/// missing, does not match its `sha256` or does not compile.
 pub async fn serve_frontend(
     config: FrontendConfig,
     shutdown: impl Future<Output = ()> + Send + 'static,
@@ -102,12 +105,14 @@ pub async fn serve_frontend(
     ensure_loopback(config.listen)?;
     config.manifest.validate()?;
     let ring = ring_runtime(&config.manifest, config.ring)?;
+    let renderer = ChatRenderer::load(&config.manifest.chat_template)?;
     verify_artifacts(&config.manifest).await?;
     let state = Arc::new(FrontendState {
         expectations: stage_expectations(&config.manifest),
         manifest: config.manifest,
         endpoint: config.endpoint,
         ring,
+        renderer,
         generation_lock: Arc::new(Mutex::new(())),
     });
     let router = Router::new()
@@ -135,6 +140,8 @@ struct FrontendState {
     expectations: Vec<StageExpectation>,
     /// Set for a ring manifest only.
     ring: Option<RingRuntime>,
+    /// The manifest's chat template, verified and compiled at startup.
+    renderer: ChatRenderer,
     /// Held for the whole of a generation, so only one runs at a time.
     generation_lock: Arc<Mutex<()>>,
 }
@@ -273,7 +280,7 @@ impl MessageContent {
 /// Parses a chat request, renders its prompt, and caps `max_tokens` at `max_tokens_cap`.
 fn parse_chat_request(
     body: &[u8],
-    template: ChatTemplate,
+    renderer: &ChatRenderer,
     max_tokens_cap: u32,
 ) -> Result<ChatRequest, String> {
     let raw: RawChatRequest = serde_json::from_slice(body).map_err(|error| {
@@ -288,31 +295,22 @@ fn parse_chat_request(
     if requested == Some(0) {
         return Err("max_tokens must be at least 1".to_owned());
     }
-    let messages = raw
+    let messages: Vec<ChatMessage> = raw
         .messages
         .into_iter()
-        .map(|message| (message.role, message.content.into_text()));
+        .map(|message| ChatMessage {
+            role: message.role,
+            content: message.content.into_text(),
+        })
+        .collect();
+    let prompt = renderer
+        .render(&messages)
+        .map_err(|error| error.to_string())?;
     Ok(ChatRequest {
-        prompt: render_prompt(template, messages),
+        prompt,
         stream: raw.stream.unwrap_or(false),
         max_tokens: requested.map_or(max_tokens_cap, |asked| asked.min(max_tokens_cap)),
     })
-}
-
-/// Renders `(role, content)` pairs into the prompt string the final stage tokenizes.
-fn render_prompt(
-    template: ChatTemplate,
-    messages: impl Iterator<Item = (String, String)>,
-) -> String {
-    match template {
-        ChatTemplate::Chatml => {
-            let mut prompt: String = messages
-                .map(|(role, content)| format!("<|im_start|>{role}\n{content}<|im_end|>\n"))
-                .collect();
-            prompt.push_str("<|im_start|>assistant\n");
-            prompt
-        }
-    }
 }
 
 /// Progress of one generation, sent from its task to the request handler.
@@ -418,7 +416,7 @@ impl Completion {
 
 async fn chat_completions(State(state): State<Arc<FrontendState>>, body: Bytes) -> Response {
     let manifest = &state.manifest;
-    let request = match parse_chat_request(&body, manifest.chat_template, manifest.max_tokens) {
+    let request = match parse_chat_request(&body, &state.renderer, manifest.max_tokens) {
         Ok(request) => request,
         Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
     };
@@ -668,11 +666,13 @@ fn error_response(status: StatusCode, message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shard::manifest::ChatTemplate;
 
     const CAP: u32 = 64;
 
     fn parse(body: Value) -> Result<ChatRequest, String> {
-        parse_chat_request(body.to_string().as_bytes(), ChatTemplate::Chatml, CAP)
+        let renderer = ChatRenderer::load(&ChatTemplate::Chatml).unwrap();
+        parse_chat_request(body.to_string().as_bytes(), &renderer, CAP)
     }
 
     #[test]

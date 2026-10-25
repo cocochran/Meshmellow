@@ -100,7 +100,7 @@ so it exists only on the llama backend.
 | `layers` | Total layers in the model. |
 | `context` | Context window passed to every stage, 32 to 4096. A prompt longer than this is refused with HTTP 400. |
 | `max_tokens` | Cap on completion tokens (default 512); a request may ask for fewer. |
-| `chat_template` | Required. `chatml` is the only v1 value; the template is never guessed. |
+| `chat_template` | Required: `"chatml"` or a pinned Jinja template object; the template is never guessed. See [Chat templates](#chat-templates). |
 | `stages` | Layer ranges in order, half-open, covering `0..layers` with no gaps. Each has `begin`, `end` and exactly one of `remote` or `local`. |
 | `remote.worker` | Node ID of the `shard-serve` worker for this range. The leader dials it by ID: through Iroh's n0 discovery in production, or in-memory address lookup in tests. |
 | `local.model` | Model or exported shard file the local runner loads. |
@@ -111,6 +111,62 @@ so it exists only on the llama backend.
 
 Unknown fields are refused everywhere, so a typo cannot silently drop a setting.
 
+### Chat templates
+
+The front end renders a request's `messages` into the prompt the tokenizing stage tokenizes
+(the local final stage, or stage 0 in a ring). `chat_template` takes one of two forms.
+
+`"chatml"` writes `<|im_start|>{role}\n{content}<|im_end|>\n` for each message, then
+`<|im_start|>assistant\n`.
+
+A pinned Jinja template renders the model's official chat template:
+
+```json
+"chat_template": {
+  "jinja": {"path": "qwen3-chat-template.jinja", "sha256": "<64 hex digits: SHA-256 of the file>"},
+  "enable_thinking": false
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `jinja.path` | The template file, for example a GGUF's `tokenizer.chat_template` metadata saved as text. A relative path is resolved against the manifest file's directory. (A manifest built in memory rather than loaded from a file keeps it relative to the working directory, as model paths are.) |
+| `jinja.sha256` | SHA-256 of the file's bytes (64 hex digits). |
+| `enable_thinking` | Optional, default `false`. Passed to the template as `enable_thinking`. |
+
+When the front end starts, it reads the file once, checks its SHA-256 and compiles it. A
+missing file, a hash mismatch or a template that does not compile stops startup, as an
+`artifact_sha256` mismatch does. Each request then renders the template with
+[minijinja](https://docs.rs/minijinja) set up the way Hugging Face's `apply_chat_template` and
+david-codex's demo (`experiments/model-validation/live_demo.py`) set up Jinja:
+
+- `trim_blocks` and `lstrip_blocks` are on.
+- Python string methods such as `.strip()`, `.startswith()` and `.split()` work, through
+  `minijinja-contrib`'s pycompat.
+- The context is `messages` (each with `role` and `content`; text parts are joined),
+  `add_generation_prompt = true`, `enable_thinking` from the manifest, `tools = none`, and a
+  `raise_exception(msg)` function.
+
+Requests are validated the same way as with `chatml`. A template error, including a
+`raise_exception` call, answers HTTP 400 with the template's message; it never reaches a stage.
+
+The pinned template is what david-codex's experimental ring demo uses, and he asked for it in
+place of generic ChatML. His demo renders the GGUF's official Qwen template with
+`add_generation_prompt=True, enable_thinking=False, tools=None`. With `enable_thinking: false`,
+a system message `You are a helpful assistant.` and a user message `<q>` render exactly as in
+his run record (`experiments/model-validation/results/qwen38-three-device-2026-10-24/manifest.json`):
+
+```text
+<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n<q><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n
+```
+
+With `enable_thinking: true`, the official Qwen3 template leaves out the empty
+`<think>\n\n</think>\n\n` block and the prompt ends at `<|im_start|>assistant\n`.
+`tests/fixtures/qwen3-chat-template.jinja` is the official Qwen3 template, copied byte for byte
+from `Qwen/Qwen3-8B`'s `tokenizer_config.json` (SHA-256
+`a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8`). For a real model, pin the
+template embedded in that model's own GGUF.
+
 ## v1 limits
 
 - Topology: one remote prefix plus a local final stage, or a single local stage that runs the
@@ -119,8 +175,8 @@ Unknown fields are refused everywhere, so a typo cannot silently drop a setting.
   never take an extra hop through the leader ("hub forwarding"); that design was rejected.
 - Greedy decoding only. `temperature`, `top_p`, `seed` and similar fields are accepted and
   ignored.
-- `chatml` is the only chat template so far. The pinned official Qwen template is still open;
-  it is being added later in the same M-27 run.
+- Chat templates: `chatml` or a pinned Jinja template (see [Chat templates](#chat-templates)).
+  `tools` is always `none`; tool calls are not supported.
 - One sequence per runner process and no reset, so every job starts fresh runner processes
   (and a fresh Iroh connection to the worker). Model load time is paid on every job.
 - One generation runs at a time, matching the job queue.
@@ -245,8 +301,9 @@ always 0). `read_us` includes every worker's compute time, so it is not a networ
 - No retries, rerouting or re-prefill: any error (a bad chain, a missing result channel, a
   worker failure) fails the job. A ring must become ready, including the terminal's result
   channel, within 300 s by default (`RingSettings::result_channel_wait`).
-- `chatml` only. The pinned official Qwen template remains open; it is being added later in
-  the same M-27 run.
+- Chat templates work as in pipeline mode: the leader renders the prompt for its local stage
+  0. To match david-codex's ring demo, use the pinned official Qwen template with
+  `enable_thinking: false` (see [Chat templates](#chat-templates)).
 - The manual multi-device run of ring execution through `llm-cluster prompt` is still pending
   on hardware. It has only been tested on loopback with the fake runner.
 

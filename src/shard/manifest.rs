@@ -20,6 +20,9 @@
 //! Each stage object carries `begin`, `end` and exactly one location key (`remote` or `local`).
 //! Unknown fields are refused everywhere, so a typo cannot silently drop a setting.
 //!
+//! `chat_template` is either `"chatml"` or a pinned Jinja template object (see [`ChatTemplate`]).
+//! [`ShardManifest::load`] resolves a relative template path against the manifest's directory.
+//!
 //! [`ShardManifest::validate`] enforces the structural rules (contiguous coverage of
 //! `0..layers`, bounds on `context` and `max_tokens`, well-formed hashes, no duplicate worker)
 //! and the topology of the manifest's [`Execution`] mode:
@@ -31,6 +34,7 @@
 //!   remote stage is the terminal, which returns tokens straight to the leader.
 
 use std::collections::{BTreeMap, HashSet};
+use std::fmt;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -38,6 +42,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, bail, ensure};
 use iroh::EndpointId;
 use serde::Deserialize;
+use serde::de::{self, MapAccess, Visitor, value::MapAccessDeserializer};
 use sha2::{Digest, Sha256};
 
 use crate::shard::wire::{self, MAX_CONTEXT};
@@ -53,6 +58,9 @@ const SHA256_HEX_LEN: usize = 64;
 
 /// Bytes read per chunk while hashing a model file.
 const HASH_CHUNK_BYTES: usize = 1 << 20;
+
+/// Name of the built-in ChatML template in `chat_template`.
+const CHATML: &str = "chatml";
 
 /// Where pipeline-mode topology errors point: the experimental ring execution mode (M-27).
 const RING_ALTERNATIVE: &str =
@@ -98,14 +106,84 @@ pub enum Execution {
 }
 
 /// How chat messages become the prompt string the tokenizing stage (the final stage, or stage 0
-/// in a ring) tokenizes. New templates are added as new variants.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// in a ring) tokenizes. Written as the string `"chatml"` or as a pinned Jinja template object;
+/// [`crate::shard::template::ChatRenderer`] renders both. New templates are added as new variants.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChatTemplate {
-    /// `<|im_start|>{role}\n{content}<|im_end|>\n` per message, then
-    /// `<|im_start|>assistant\n`. The only template so far; the pinned official Qwen template
-    /// is still open and is being added later in the same M-27 run.
+    /// `"chatml"`: `<|im_start|>{role}\n{content}<|im_end|>\n` per message, then
+    /// `<|im_start|>assistant\n`.
     Chatml,
+    /// `{"jinja": {"path": ..., "sha256": ...}, "enable_thinking": false}`: an official Jinja
+    /// chat template (such as a GGUF's `tokenizer.chat_template`), pinned by its SHA-256 and
+    /// checked once when the front end starts.
+    Jinja(PinnedTemplate),
+}
+
+/// The object form of `chat_template`.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PinnedTemplate {
+    /// The template file and its pinned hash.
+    pub jinja: JinjaFile,
+    /// Passed to the template as `enable_thinking`; `false` when absent.
+    #[serde(default)]
+    pub enable_thinking: bool,
+}
+
+/// A Jinja template file pinned by its SHA-256.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JinjaFile {
+    /// The template file. [`ShardManifest::load`] resolves a relative path against the
+    /// manifest's directory; a manifest built in memory keeps it relative to the working
+    /// directory, as model paths are.
+    pub path: PathBuf,
+    /// SHA-256 of the file's bytes, as 64 hex digits.
+    pub sha256: String,
+}
+
+impl<'de> Deserialize<'de> for ChatTemplate {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(ChatTemplateVisitor)
+    }
+}
+
+/// Accepts `"chatml"` or a [`PinnedTemplate`] object, with errors that name both forms.
+struct ChatTemplateVisitor;
+
+impl<'de> Visitor<'de> for ChatTemplateVisitor {
+    type Value = ChatTemplate;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str(
+            "\"chatml\" or a pinned template {\"jinja\": {\"path\": ..., \"sha256\": ...}}",
+        )
+    }
+
+    fn visit_str<E: de::Error>(self, name: &str) -> Result<ChatTemplate, E> {
+        if name == CHATML {
+            return Ok(ChatTemplate::Chatml);
+        }
+        Err(E::custom(format!(
+            "unknown chat_template {name:?}: expected \"{CHATML}\" or a pinned \
+             {{\"jinja\": {{\"path\": ..., \"sha256\": ...}}}} object"
+        )))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<ChatTemplate, A::Error> {
+        PinnedTemplate::deserialize(MapAccessDeserializer::new(map)).map(ChatTemplate::Jinja)
+    }
+}
+
+impl ChatTemplate {
+    /// Makes a relative Jinja template path relative to `dir` instead.
+    fn resolve_relative_to(&mut self, dir: &Path) {
+        if let Self::Jinja(pinned) = self
+            && pinned.jinja.path.is_relative()
+        {
+            pinned.jinja.path = dir.join(&pinned.jinja.path);
+        }
+    }
 }
 
 /// One contiguous layer range and where it runs.
@@ -230,8 +308,11 @@ impl ShardManifest {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read shard manifest {}", path.display()))?;
-        let manifest: Self = serde_json::from_str(&text)
+        let mut manifest: Self = serde_json::from_str(&text)
             .with_context(|| format!("invalid shard manifest {}", path.display()))?;
+        if let Some(dir) = path.parent() {
+            manifest.chat_template.resolve_relative_to(dir);
+        }
         manifest
             .validate()
             .with_context(|| format!("invalid shard manifest {}", path.display()))?;
@@ -269,7 +350,11 @@ impl ShardManifest {
             self.context
         );
         ensure!(self.max_tokens >= 1, "max_tokens must be at least 1");
-        check_sha256(&self.model_sha256, "model_sha256")
+        check_sha256(&self.model_sha256, "model_sha256")?;
+        if let ChatTemplate::Jinja(pinned) = &self.chat_template {
+            check_sha256(&pinned.jinja.sha256, "chat_template.jinja.sha256")?;
+        }
+        Ok(())
     }
 
     fn validate_coverage(&self) -> anyhow::Result<()> {
@@ -495,7 +580,76 @@ mod tests {
         value.as_object_mut().unwrap().remove("chat_template");
         assert!(parse(value.clone()).is_err());
         value["chat_template"] = json!("llama2");
+        let error = parse(value.clone()).unwrap_err().to_string();
+        assert!(
+            error.contains("llama2") && error.contains("jinja"),
+            "{error}"
+        );
+        value["chat_template"] = json!(7);
         assert!(parse(value).is_err());
+    }
+
+    fn pinned_template(template: Value) -> Value {
+        let mut value = manifest_json(vec![local(0, 4)]);
+        value["chat_template"] = template;
+        value
+    }
+
+    #[test]
+    fn pinned_jinja_template_parses_with_thinking_off_by_default() {
+        let jinja = json!({"path": "qwen.jinja", "sha256": HASH});
+        let manifest = validate(pinned_template(json!({"jinja": jinja}))).unwrap();
+        let expected = ChatTemplate::Jinja(PinnedTemplate {
+            jinja: JinjaFile {
+                path: PathBuf::from("qwen.jinja"),
+                sha256: HASH.to_owned(),
+            },
+            enable_thinking: false,
+        });
+        assert_eq!(manifest.chat_template, expected);
+        let thinking = pinned_template(json!({"jinja": jinja, "enable_thinking": true}));
+        let ChatTemplate::Jinja(pinned) = validate(thinking).unwrap().chat_template else {
+            panic!("expected a pinned template");
+        };
+        assert!(pinned.enable_thinking);
+    }
+
+    #[test]
+    fn pinned_jinja_template_is_strict() {
+        let jinja = json!({"path": "qwen.jinja", "sha256": HASH});
+        for bad in [
+            json!({}),
+            json!({"jinja": {"path": "qwen.jinja"}}),
+            json!({"jinja": {"sha256": HASH}}),
+            json!({"jinja": jinja, "tools": []}),
+            json!({"jinja": {"path": "qwen.jinja", "sha256": HASH, "url": "x"}}),
+            json!({"jinja": jinja, "enable_thinking": "no"}),
+        ] {
+            assert!(parse(pinned_template(bad.clone())).is_err(), "{bad}");
+        }
+        let short = json!({"jinja": {"path": "qwen.jinja", "sha256": "abc"}});
+        assert!(error_of(pinned_template(short)).contains("chat_template.jinja.sha256"));
+    }
+
+    #[test]
+    fn load_resolves_a_relative_template_path_against_the_manifest() {
+        let dir = std::env::temp_dir().join(format!("shard-template-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let absolute = dir.join("elsewhere.jinja");
+        for (given, expected) in [
+            (PathBuf::from("qwen.jinja"), dir.join("qwen.jinja")),
+            (absolute.clone(), absolute),
+        ] {
+            let path = dir.join("manifest.json");
+            let template = json!({"jinja": {"path": given, "sha256": HASH}});
+            std::fs::write(&path, pinned_template(template).to_string()).unwrap();
+            let ChatTemplate::Jinja(pinned) = ShardManifest::load(&path).unwrap().chat_template
+            else {
+                panic!("expected a pinned template");
+            };
+            assert_eq!(pinned.jinja.path, expected);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
