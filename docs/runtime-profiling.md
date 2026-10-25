@@ -15,8 +15,13 @@ ineligible for placement.
 
 ## Ownership
 
-- Runtime coordinator owns bounded probe execution/cancellation, profile
-  lifecycle, local admission, reservation orchestration, and evidence handoff.
+- Aarush (`aarush-codex`) owns the M-5 measured-placement planner and its
+  versioned evidence input contract. That scope consumes measurements; it does
+  not implement the runtime profiler or coordinator.
+- Runtime coordinator ownership for bounded probe execution/cancellation,
+  profile lifecycle, admission, reservation orchestration, and evidence
+  handoff must be confirmed by the runtime owner (David) before implementation
+  is assigned.
 - Apps own explicit compute opt-in, progress, and cancellation controls. Mesh
   membership alone never opts a device into compute or profiling.
 - The planner consumes versioned evidence and returns advisory assignments.
@@ -24,10 +29,10 @@ ineligible for placement.
 - Survivor replanning still needs explicit confirmation from the recovery
   owner. It is separate from profiling and from the current planner.
 
-This runtime workstream owns the coordinator contract and local inference
-admission gate. Remote reservation and worker-side probe execution depend on
-the participant lease/readiness contract; neither is implemented yet. Plan
-activation remains with the runtime integration.
+No runtime coordinator or admission gate is claimed by the M-5 planner work.
+Remote reservation and worker-side probe execution depend on the participant
+lease/readiness contract; neither is implemented yet. Plan activation remains
+with the runtime integration.
 
 The initial runtime interface is `start(request) -> run_id`,
 `status(run_id)`, and `cancel(run_id)`. Transport and app command names remain
