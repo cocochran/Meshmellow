@@ -1,0 +1,68 @@
+name: Build executables
+
+on:
+  push:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'src/**'
+      - 'scripts/package-executable.py'
+      - '.github/workflows/build-executables.yml'
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'src/**'
+      - 'scripts/package-executable.py'
+      - '.github/workflows/build-executables.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: executables-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: CLI (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: executable-${{ matrix.target }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Build release executable
+        run: cargo build --release --locked --bin llm-cluster --target ${{ matrix.target }}
+      - name: Smoke test executable
+        run: cargo run --release --locked --bin llm-cluster --target ${{ matrix.target }} -- --help
+      - name: Package executable and checksums
+        run: python scripts/package-executable.py --target ${{ matrix.target }} --revision ${{ github.sha }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: meshthing-cli-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
