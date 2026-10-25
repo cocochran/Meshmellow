@@ -19,26 +19,46 @@ object EnrollmentNative {
 }
 
 data class NodeAPI(val baseURL: String, val ready: Boolean, val message: String)
-data class TrustedMember(val id: String, val name: String, val online: Boolean = false, val api: NodeAPI? = null)
+/** A device's own report of its native model: verifying, benchmarking, standby, loading, ready or failed. */
+data class ComputeStatus(val phase: String, val message: String, val begin: Int?, val end: Int?) {
+    private val range get() = if (begin != null && end != null) "$begin–${end - 1}" else null
+    val ready get() = phase == "ready"
+    val working get() = phase in setOf("verifying", "benchmarking", "loading")
+    val label get() = when (phase) {
+        "verifying" -> "Checking model file…"
+        "benchmarking" -> "Benchmarking…"
+        "standby" -> "Model ready · no layers assigned"
+        "loading" -> range?.let { "Loading layers $it…" } ?: "Loading layers…"
+        "ready" -> range?.let { "Layers $it loaded" } ?: "Loaded"
+        "failed" -> "Model failed to load"
+        else -> phase
+    }
+    companion object {
+        fun parse(json: JSONObject?): ComputeStatus? = json?.let {
+            ComputeStatus(it.getString("phase"), it.optString("message"),
+                if (it.isNull("begin")) null else it.optInt("begin"), if (it.isNull("end")) null else it.optInt("end"))
+        }
+    }
+}
+data class TrustedMember(val id: String, val name: String, val online: Boolean = false, val api: NodeAPI? = null, val compute: ComputeStatus? = null)
 data class JoinRequest(val id: String, val issuer: String, val applicant: String, val name: String)
 data class EnrollmentState(
     val id: String, val port: Int, val meshName: String?, val joiningName: String?,
     val inviteID: String, val expires: Long,
     val members: List<TrustedMember>, val pending: List<JoinRequest>, val notice: String,
     val ticket: String = "",
-    val workerBegin: Int? = null,
-    val workerEnd: Int? = null
+    val compute: ComputeStatus? = null
 ) {
     companion object {
         fun parse(json: JSONObject): EnrollmentState {
-            val worker = json.optJSONObject("inference")?.optJSONObject("worker")
+            val compute = ComputeStatus.parse(json.optJSONObject("inference")?.optJSONObject("compute"))
             val members = json.getJSONArray("members")
             val pending = json.getJSONArray("pending")
             val invite = json.optJSONObject("invite")
             return EnrollmentState(json.getString("id"), json.getInt("port"), json.optJSONObject("mesh")?.getString("name"), json.optJSONObject("joining")?.getString("name"),
                 invite?.getString("id") ?: "", invite?.getLong("expires") ?: 0,
-                (0 until members.length()).map { members.getJSONObject(it).let { m -> TrustedMember(m.getString("id"), m.getString("name"), m.optBoolean("online"), m.optJSONObject("api")?.let { a -> NodeAPI(a.getString("base_url"), a.getBoolean("inference_ready"), a.getString("message")) }) } },
-                (0 until pending.length()).map { pending.getJSONObject(it).let { p -> JoinRequest(p.getString("id"), p.getString("issuer"), p.getString("applicant"), p.getString("name")) } }, json.getString("notice"), invite?.optString("ticket") ?: "", worker?.getInt("begin"), worker?.getInt("end"))
+                (0 until members.length()).map { members.getJSONObject(it).let { m -> TrustedMember(m.getString("id"), m.getString("name"), m.optBoolean("online"), m.optJSONObject("api")?.let { a -> NodeAPI(a.getString("base_url"), a.getBoolean("inference_ready"), a.getString("message")) }, ComputeStatus.parse(m.optJSONObject("compute"))) } },
+                (0 until pending.length()).map { pending.getJSONObject(it).let { p -> JoinRequest(p.getString("id"), p.getString("issuer"), p.getString("applicant"), p.getString("name")) } }, json.getString("notice"), invite?.optString("ticket") ?: "", compute)
         }
     }
 }

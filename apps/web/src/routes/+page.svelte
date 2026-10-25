@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import Enrollment from '#lib/Enrollment.svelte';
   import NetworkView from '#lib/NetworkView.svelte';
+  import ModelStatus from '#lib/ModelStatus.svelte';
   import type { EnrollmentState } from '#lib/enrollment.ts';
   import Icon from '#lib/Icon.svelte';
   import { defaultPreferences, type MeshSnapshot, type Preferences, type Device } from '#lib/types.ts';
@@ -60,6 +61,7 @@
   let mounted = false;
   const devices = $derived(snapshot?.devices ?? []);
   const peers = $derived(snapshot?.peers ?? []);
+  const inferenceReady = $derived(snapshot?.inferenceReady ?? snapshot?.event === 'ready');
   const deviceCount = $derived(membership?.members.length ?? devices.length);
   const connected = $derived(snapshot?.connected === true && !error);
   const runHeading = $derived(!connected ? 'Runtime unavailable' : snapshot?.active ? 'A generation is running' : snapshot?.event === 'done' ? 'Latest run finished' : snapshot?.event === 'error' ? 'Latest run failed' : snapshot?.event === 'paused' ? 'Runtime is paused' : 'Runtime is idle');
@@ -156,43 +158,40 @@
     <main id="main-content">
       <div class="page-heading"><div><h1>{section === 'overview' ? 'Overview' : section === 'devices' ? 'Devices' : section === 'model' ? 'Model distribution' : section === 'activity' ? 'Activity' : 'Settings'}</h1><p>{section === 'overview' ? 'Your model, and the devices running it.' : section === 'devices' ? 'Inspect layer assignments and compare stage compute times.' : section === 'model' ? 'Layer placement across the configured route.' : section === 'activity' ? 'Requests and the latest runtime state.' : 'Manage local preferences and runtime connection.'}</p></div>{#if membership?.mesh}<button class="button secondary" onclick={showPairing}><Icon name="plus" size={16} /> Add device</button>{/if}</div>
 
+      <Enrollment bind:this={enrollmentPanel} stages={devices} showMembers={section === 'overview' || section === 'devices'} onchange={value => membership = value}/>
       {#if membership?.mesh || section === 'settings'}
       {#if notice}<div class="notice" role="status">{notice}<button aria-label="Dismiss message" onclick={() => notice = ''}><Icon name="close" size={16}/></button></div>{/if}
       {#if error || (!loading && !connected)}<div class="connection-message" role="status"><Icon name="info" /><div><strong>{error ? 'Refresh interrupted' : 'Your runtime isn’t connected'}</strong><p>{error || snapshot?.message}</p>{#if !snapshot?.endpoint}<code>./mesh-ui</code>{/if}</div><button class="text-button" disabled={refreshing} onclick={refresh}>Retry <Icon name="refresh" size={15}/></button></div>{/if}
 
       {#if section === 'overview'}
-        <NetworkView {snapshot} {membership} {connected}/>
-        <section class="panel" aria-labelledby="inference-title">
-          <div class="panel-heading"><div><h2 id="inference-title">Ask the mesh</h2><p>{snapshot?.message || 'Waiting for contributing clients.'}</p></div></div>
-          <form class="settings-form" onsubmit={generate}>
-            <label for="mesh-prompt">Prompt</label>
-            <textarea id="mesh-prompt" bind:value={prompt} rows="3" maxlength="2048" required></textarea>
-            <div><button class="button primary" disabled={generating || !(snapshot?.inferenceReady ?? snapshot?.event === 'ready')}>{generating ? 'Running across devices…' : 'Run shared inference'}</button>
-            {#if generating}<button type="button" class="button secondary" onclick={() => generationController?.abort()}>Cancel</button>{/if}</div>
-            {#if generationError}<p role="alert">{generationError}</p>{/if}
-            {#if completion}<div class="completion" role="status">{completion}</div>{/if}
+        <section class="panel ask-panel" aria-labelledby="inference-title">
+          <div class="panel-heading"><div><h2 id="inference-title">Ask the mesh</h2><p>{inferenceReady ? 'Runs across every device in the execution route.' : snapshot?.message || 'Waiting for contributing devices.'}</p></div></div>
+          <form class="ask-form" onsubmit={generate}>
+            <label class="visually-hidden" for="mesh-prompt">Prompt</label>
+            <textarea id="mesh-prompt" bind:value={prompt} rows="2" maxlength="2048" required></textarea>
+            <div class="ask-actions">{#if generating}<button type="button" class="button secondary" onclick={() => generationController?.abort()}>Cancel</button>{/if}<button class="button primary" disabled={generating || !inferenceReady}>{generating ? 'Running across devices…' : 'Run'}</button></div>
           </form>
+          {#if generationError}<p class="ask-result error" role="alert">{generationError}</p>{/if}
+          {#if completion}<div class="ask-result" role="status">{completion}</div>{/if}
         </section>
+        <NetworkView {snapshot} {membership} {connected}/>
       {/if}
 
-      {#if section === 'overview' || section === 'devices'}
-        <section class="panel device-panel"><div class="panel-heading"><div><h2>{'Devices'} <span class="count-pill">{snapshot?.source === 'core' && !snapshot.peerStatusAvailable ? '—' : deviceCount}</span></h2><p>{snapshot?.source === 'core' ? 'Joined devices appear automatically. Slice assignments appear after native compute is ready.' : snapshot?.active ? 'Current run · latest reported measurement per stage' : 'Last reported measurements · not a live availability check'}</p></div><button class="text-button" disabled={refreshing} onclick={refresh}><Icon name="refresh" size={15}/>{refreshing ? 'Refreshing…' : 'Refresh'}</button></div>
-          {#if snapshot?.source !== 'core' && devices.length}<div class="table-toolbar"><label class="device-search"><Icon name="devices" size={16}/><input aria-label="Filter devices" type="search" bind:value={deviceQuery} placeholder="Filter devices…" /></label><select aria-label="Device order" bind:value={deviceOrder}><option value="route">Route order</option><option value="compute">Slowest compute first</option></select></div>{/if}
+      {#if (section === 'overview' || section === 'devices') && snapshot?.source !== 'core'}
+        <section class="panel device-panel"><div class="panel-heading"><div><h2>{'Devices'} <span class="count-pill">{deviceCount}</span></h2><p>{snapshot?.active ? 'Current run · latest reported measurement per stage' : 'Last reported measurements · not a live availability check'}</p></div><button class="text-button" disabled={refreshing} onclick={refresh}><Icon name="refresh" size={15}/>{refreshing ? 'Refreshing…' : 'Refresh'}</button></div>
+          {#if devices.length}<div class="table-toolbar"><label class="device-search"><Icon name="devices" size={16}/><input aria-label="Filter devices" type="search" bind:value={deviceQuery} placeholder="Filter devices…" /></label><select aria-label="Device order" bind:value={deviceOrder}><option value="route">Route order</option><option value="compute">Slowest compute first</option></select></div>{/if}
           {#if loading}<div class="empty-state"><span class="loading-orbit"></span><h3>Reading runtime</h3><p>Waiting for the first observation.</p></div>
-          {:else if snapshot?.source === 'core' && !snapshot.peerStatusAvailable}<div class="empty-state"><Icon name="info" size={35}/><h3>Peer status isn’t available</h3><p>This core version exposes its job queue, but not connected-peer status.</p></div>
-          {:else if snapshot?.source === 'core' && !membership?.members.length}<div class="empty-state"><Icon name="devices" size={35}/><h3>No peers connected</h3><p>Peers appear here when they establish an authenticated control link.</p></div>
-          {:else if snapshot?.source === 'core'}<div class="job-list">{#each membership?.members ?? [] as member}{@const stage = devices.find(d => d.id === member.id)}<div class="job-row"><strong>{member.name}{member.self ? ' (this device)' : ''}</strong><span class="status-pill">{member.online ? 'Connected' : 'Offline'}</span><span>{stage ? `Layers ${rangeLabel(stage)}` : 'No model slice assigned yet'}</span><code>{member.id.slice(0, 12)}</code></div>{/each}</div>
           {:else if !devices.length}<div class="empty-state"><Icon name="devices" size={30}/><h3>No devices reported</h3><p>Connect the runtime to see its configured devices and layer assignments.</p></div>
           {:else if !visibleDevices.length}<div class="empty-state compact"><h3>No matching devices</h3><p>Try a different device name or hardware type.</p><button class="text-button" onclick={() => deviceQuery = ''}>Clear filter</button></div>
           {:else}
           <!-- The table scrolls horizontally on narrow screens; keyboard users need to focus its scroll region. -->
           <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
           <div class="device-table" tabindex="0" role="region" aria-label="Device measurements"><div class="table-head"><span>Device</span><span>State</span><span>Layers</span><span>Native compute <span class="column-hint">latest</span></span><span>Buffers</span><span></span></div>{#each visibleDevices as device}<button class="device-row" onclick={() => showDevice(device)} aria-label={`View ${device.name}`}><span class="device-name"><span class="device-icon" style={`--device-color: ${colors[devices.indexOf(device) % colors.length]}`}><Icon name={iconFor(device)} size={20}/></span><span><strong>{device.name}</strong><small>{device.hardware}</small></span></span><span class="status-pill" class:computing={snapshot?.active && device.status === 'inflight'}><span class="dot"></span>{statusLabel(device)}</span><span class="mono range-cell">{rangeLabel(device)}</span><span class="compute-cell"><span class="mono">{device.computeMs?.toFixed(1) ?? '—'}<small>{device.computeMs !== null ? ' ms' : ''}</small></span><span class="compute-track" aria-hidden="true"><i style={`width: ${device.computeMs === null ? 0 : device.computeMs / maxCompute * 100}%`}></i></span></span><span class="mono buffer-cell">{sizeLabel(device.bufferBytes)}</span><Icon name="chevron" size={15}/></button>{/each}</div>{/if}
-          {#if snapshot?.source !== 'core'}<div class="panel-footer"><Icon name="info" size={14}/><span>Compute time excludes network transfer and waiting. Buffers are reported allocations, not total device memory.</span></div>{/if}
+          <div class="panel-footer"><Icon name="info" size={14}/><span>Compute time excludes network transfer and waiting. Buffers are reported allocations, not total device memory.</span></div>
         </section>
       {/if}
 
-      {#if section === 'overview' || section === 'model'}
+      {#if section === 'model' || (section === 'overview' && devices.length)}
         <section class="panel model-panel"><div class="panel-heading"><div><h2>Layer allocation</h2><p>{snapshot?.model || 'No model configured'} · {snapshot?.layers ? `${snapshot.layers} decoder layers` : 'Layer count not reported'}</p></div><span class="subtle-tag">{connected ? 'Runtime configuration' : 'Not connected'}</span></div>
           {#if devices.length}<div class="layer-map" aria-label="Layer distribution">{#each devices as device, i}<button style={`--device-color: ${colors[i % colors.length]}; flex: ${device.end !== null && device.begin !== null ? Math.max(1, device.end - device.begin) : 1}`} aria-label={`${device.name}, layers ${rangeLabel(device)}`} onclick={() => showDevice(device)}><span>{rangeLabel(device)}</span></button>{/each}</div><div class="layer-legend">{#each devices as device, i}<span><i style={`background: ${colors[i % colors.length]}`}></i>{device.name}</span>{/each}</div>{:else}<div class="empty-inline">Layer assignments appear when your runtime reports a configured model.</div>{/if}
           {#if section === 'model'}<div class="info-grid"><div><span class="eyebrow">PLACEMENT</span><h3>Placement</h3><p>Device benchmarks will determine which layers fit and which route runs best. Current assignments come from your runtime configuration.</p></div><div><span class="eyebrow">MODEL MANAGEMENT</span><h3>Model management</h3><p>Each contributing client loads its assigned slice. The execution route above shows the configured layer ranges.</p></div></div>{/if}
@@ -212,14 +211,16 @@
       {/if}
 
       {/if}
-      <Enrollment bind:this={enrollmentPanel} stages={devices} onchange={value => membership = value}/>
       <footer class="page-footer"><span>Local mesh · Iroh</span><span>{snapshot ? `Last checked ${new Date(snapshot.checkedAt).toLocaleTimeString()}` : 'Waiting for first observation'}</span></footer>
     </main>
   </div>
 </div>
 
-<dialog bind:this={detailDialog} onclose={() => selectedId = null} aria-labelledby="device-title"><div class="dialog-heading"><span class="eyebrow">DEVICE DETAILS</span><button aria-label="Close device details" onclick={() => detailDialog.close()}><Icon name="close"/></button></div>{#if selectedDevice}<div class="dialog-device-icon"><Icon name={iconFor(selectedDevice)} size={36}/></div><h2 id="device-title">{selectedDevice.name}</h2><p>{selectedDevice.hardware}</p><dl class="detail-list"><div><dt>Layer range</dt><dd>{rangeLabel(selectedDevice)}</dd></div><div><dt>Observation</dt><dd>{statusLabel(selectedDevice)}</dd></div><div><dt>Last native compute</dt><dd>{selectedDevice.computeMs?.toFixed(1) ?? '—'} ms</dd></div><div><dt>Observed buffers</dt><dd>{sizeLabel(selectedDevice.bufferBytes)}</dd></div><div><dt>Stage executions</dt><dd>{selectedDevice.executions}</dd></div></dl><div class="soft-note"><Icon name="info" size={18}/><p>These are runtime measurements, not a full memory budget or a device benchmark. Trust status is not reported yet.</p></div>{:else}<h2 id="device-title">Device no longer reported</h2><p>Refresh the mesh to see the current route.</p>{/if}<button class="button secondary full-width" onclick={() => detailDialog.close()}>Done</button></dialog>
+<dialog bind:this={detailDialog} onclose={() => selectedId = null} aria-labelledby="device-title"><div class="dialog-heading"><span class="eyebrow">DEVICE DETAILS</span><button aria-label="Close device details" onclick={() => detailDialog.close()}><Icon name="close"/></button></div>{#if selectedDevice}<div class="dialog-device-icon"><Icon name={iconFor(selectedDevice)} size={36}/></div><h2 id="device-title">{selectedDevice.name}</h2><p>{selectedDevice.hardware}</p><dl class="detail-list"><div><dt>Layer range</dt><dd>{rangeLabel(selectedDevice)}</dd></div><div><dt>Observation</dt><dd>{statusLabel(selectedDevice)}</dd></div>{#if selectedDevice.compute}<div><dt>Model</dt><dd><ModelStatus compute={selectedDevice.compute} detail/></dd></div>{/if}<div><dt>Last native compute</dt><dd>{selectedDevice.computeMs?.toFixed(1) ?? '—'} ms</dd></div><div><dt>Observed buffers</dt><dd>{sizeLabel(selectedDevice.bufferBytes)}</dd></div><div><dt>Stage executions</dt><dd>{selectedDevice.executions}</dd></div></dl><div class="soft-note"><Icon name="info" size={18}/><p>These are runtime measurements, not a full memory budget or a device benchmark. Trust status is not reported yet.</p></div>{:else}<h2 id="device-title">Device no longer reported</h2><p>Refresh the mesh to see the current route.</p>{/if}<button class="button secondary full-width" onclick={() => detailDialog.close()}>Done</button></dialog>
 
 <style>
-textarea{font:inherit;width:100%;box-sizing:border-box;border:1px solid #d9ccc0;border-radius:8px;padding:12px;background:#fffaf3;color:#4d3326;resize:vertical}.completion{white-space:pre-wrap;padding:16px;border-radius:8px;background:#f1f5ef;line-height:1.6}
+.ask-form{display:flex;gap:12px;align-items:flex-end;padding:0 22px 20px}.ask-form textarea{flex:1;font:inherit;font-size:13px;min-height:42px;border:1px solid #d9d4cd;border-radius:5px;padding:10px 12px;background:#fff;color:var(--ink);resize:vertical}.ask-form textarea:focus-visible{outline:2px solid var(--accent);outline-offset:1px}.ask-actions{display:flex;gap:8px}.ask-actions .button{min-width:76px}
+.ask-result{margin:0 22px 20px;white-space:pre-wrap;padding:14px 16px;border:1px solid var(--line);border-radius:6px;background:#faf9f7;font-size:13px;line-height:1.6}.ask-result.error{border-color:#e5c3bd;background:#fbf3f1;color:#a14336}
+.visually-hidden{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+@media(max-width:760px){.ask-form{flex-direction:column;align-items:stretch;padding:0 16px 16px}.ask-actions{justify-content:flex-end}.ask-result{margin:0 16px 16px}}
 </style>

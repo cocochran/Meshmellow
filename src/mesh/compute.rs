@@ -177,9 +177,52 @@ async fn probe(config: &LocalCompute, begin: u32, end: u32) -> Result<f64> {
 }
 
 impl Node {
+    /// True once this device has a native compute configuration, even while it
+    /// is still being verified in the background.
     pub async fn compute_enabled(&self) -> bool {
-        self.compute.lock().await.is_some()
+        self.compute_status.lock().await.is_some()
     }
+
+    pub async fn compute_status(&self) -> Option<ComputeStatus> {
+        self.compute_status.lock().await.clone()
+    }
+
+    async fn set_compute_status(&self, status: ComputeStatus) {
+        *self.compute_status.lock().await = Some(status);
+    }
+
+    /// Verify and benchmark in the background so dashboards can show progress
+    /// instead of waiting for a multi-gigabyte hash before the node opens.
+    pub(super) async fn start_compute(&self, config: LocalCompute) {
+        let layers = config.layers;
+        self.set_compute_status(ComputeStatus::new(
+            "verifying",
+            "Checking the local model file.",
+            Some(layers),
+        ))
+        .await;
+        let node = self.clone();
+        let task = tokio::spawn(async move {
+            if let Err(error) = node.enable_compute(config).await {
+                warn!(error = %format!("{error:#}"), "native compute unavailable");
+                node.set_compute_status(ComputeStatus::new(
+                    "failed",
+                    format!("{error:#}"),
+                    Some(layers),
+                ))
+                .await;
+            }
+        });
+        if let Some(previous) = self
+            .control_tasks
+            .lock()
+            .await
+            .insert("native-compute".into(), task)
+        {
+            previous.abort();
+        }
+    }
+
     pub async fn enable_compute(&self, config: LocalCompute) -> Result<()> {
         ensure!(
             config.layers >= 2
@@ -196,6 +239,12 @@ impl Node {
             actual == config.model_sha256,
             "Automatic compute requires the pinned whole-model artifact"
         );
+        self.set_compute_status(ComputeStatus::new(
+            "benchmarking",
+            "Model verified. Measuring native layer speed.",
+            Some(config.layers),
+        ))
+        .await;
         let layer_ms = probe(&config, 1, 2).await?;
         let (total_memory_bytes, available_memory_bytes) = host_memory();
         let offer = ComputeOffer {
@@ -206,11 +255,18 @@ impl Node {
             total_memory_bytes,
             available_memory_bytes,
         };
+        let layers = config.layers;
         *self.compute.lock().await = Some(ComputeState {
             config,
             offer,
             assignment: None,
         });
+        self.set_compute_status(ComputeStatus::new(
+            "standby",
+            "Model verified. Waiting for a layer assignment.",
+            Some(layers),
+        ))
+        .await;
         Ok(())
     }
 
@@ -256,6 +312,44 @@ impl Node {
         if state.assignment.as_ref() == Some(&assignment) {
             return Ok(());
         }
+        let (layers, begin, end) = (state.config.layers, assignment.begin, assignment.end);
+        let label = format!("{}–{}", begin, end - 1);
+        self.set_compute_status(ComputeStatus::range(
+            "loading",
+            "Checking the assigned range, then loading it.",
+            layers,
+            begin,
+            end,
+        ))
+        .await;
+        let loaded = self.load_assignment(origin, state, assignment, &mut epoch).await;
+        self.set_compute_status(match &loaded {
+            Ok(()) => ComputeStatus::range(
+                "ready",
+                "Serving the mesh.",
+                layers,
+                begin,
+                end,
+            ),
+            Err(error) => ComputeStatus::range(
+                "failed",
+                format!("Could not load layers {label}: {error:#}"),
+                layers,
+                begin,
+                end,
+            ),
+        })
+        .await;
+        loaded
+    }
+
+    async fn load_assignment(
+        &self,
+        origin: &str,
+        state: &mut ComputeState,
+        assignment: Assignment,
+        epoch: &mut tokio::sync::watch::Receiver<u64>,
+    ) -> Result<()> {
         tokio::select! {
             _ = epoch.changed() => bail!("Membership changed during native admission"),
             result = probe(&state.config, assignment.begin, assignment.end) => { result?; }
@@ -287,6 +381,41 @@ impl Node {
     /// New members are discovered from the authenticated control table, never a
     /// fixed list of device IDs. Existing requests keep their current route.
     pub async fn prepare_compute_ring(&self, base: &ShardManifest) -> Result<ShardManifest> {
+        // Workers report their own assignment, and until local verification
+        // finishes the coordinator keeps showing that progress instead.
+        let coordinator = self
+            .record
+            .lock()
+            .await
+            .ledger
+            .as_ref()
+            .is_some_and(|l| l.genesis.root == self.id());
+        ensure!(coordinator, "This device is not the model coordinator");
+        let Some(layers) = self.compute.lock().await.as_ref().map(|s| s.config.layers) else {
+            bail!("Local automatic compute is not ready yet");
+        };
+        let result = self.build_compute_ring(base).await;
+        let status = match &result {
+            Ok(manifest) => {
+                let local = &manifest.stages[0];
+                ComputeStatus::range(
+                    "ready",
+                    format!(
+                        "Coordinating {} devices. This slice loads for each request.",
+                        manifest.stages.len()
+                    ),
+                    layers,
+                    local.begin,
+                    local.end,
+                )
+            }
+            Err(error) => ComputeStatus::new("standby", format!("{error:#}"), Some(layers)),
+        };
+        self.set_compute_status(status).await;
+        result
+    }
+
+    async fn build_compute_ring(&self, base: &ShardManifest) -> Result<ShardManifest> {
         let root = self
             .record
             .lock()
@@ -405,6 +534,14 @@ impl Node {
             let end = begin + count;
             let location = if index == 0 {
                 if !unchanged {
+                    self.set_compute_status(ComputeStatus::range(
+                        "loading",
+                        "Checking this slice before assigning the mesh.",
+                        base.layers,
+                        begin,
+                        end,
+                    ))
+                    .await;
                     probe(&local.0, begin, end).await?;
                 }
                 StageLocation::Local {

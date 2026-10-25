@@ -25,7 +25,24 @@ enum BonjourTXT {
 struct EnrollmentState: Decodable {
     struct API: Decodable { let base_url: String; let scope: String; let inference_ready: Bool; let message: String }
     struct Mesh: Decodable { let id: String; let name: String }
-    struct Member: Decodable, Identifiable { let id: String; let name: String; let online: Bool?; let api: API? }
+    /// A device's own report of its native model progress.
+    struct Compute: Decodable, Equatable {
+        let phase: String; let message: String; let begin: Int?; let end: Int?
+        var range: String? { if let begin, let end { "\(begin)–\(end - 1)" } else { nil } }
+        var label: String {
+            switch phase {
+            case "verifying": "Checking model file…"
+            case "benchmarking": "Benchmarking…"
+            case "standby": "Model ready · no layers assigned"
+            case "loading": range.map { "Loading layers \($0)…" } ?? "Loading layers…"
+            case "ready": range.map { "Layers \($0) loaded" } ?? "Loaded"
+            case "failed": "Model failed to load"
+            default: phase
+            }
+        }
+    }
+    struct Inference: Decodable { let compute: Compute? }
+    struct Member: Decodable, Identifiable { let id: String; let name: String; let online: Bool?; let api: API?; let compute: Compute? }
     struct Invitation: Decodable {
         let id: String; let expires: Double; let ticket: String
     }
@@ -41,4 +58,5 @@ struct EnrollmentState: Decodable {
     let invite: Invitation?
     let joining: Joining?
     let notice: String
+    let inference: Inference?
 }

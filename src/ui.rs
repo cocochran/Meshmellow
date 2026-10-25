@@ -495,6 +495,7 @@ async fn telemetry(State(app): State<Arc<App>>) -> Json<Value> {
         json!({"id": id, "name": member.and_then(|m| m["name"].as_str()).unwrap_or("Assigned peer"),
             "hardware": "Native model worker", "begin": stage.begin, "end": stage.end,
             "status": if member.is_some_and(|m| m["online"] == true) {"connected"} else {"offline"},
+            "compute": member.map(|m| m["compute"].clone()).unwrap_or(Value::Null),
             "executions": executed, "computeMs": null, "bufferBytes": null})
     }).collect()).unwrap_or_default();
     Json(
@@ -505,6 +506,7 @@ async fn telemetry(State(app): State<Arc<App>>) -> Json<Value> {
         "devices":devices, "peers":peers, "peerStatusAvailable":peer_status_available,
         "layers":app.inference_manifest.as_ref().map(|m| m.layers), "decodeRate":execution.as_ref().and_then(|e| e.decode_tps),
         "execution":execution, "hardware":hardware, "inferenceReady":api.inference_ready,
+        "localCompute":membership["inference"]["compute"],
         "outputSteps":sessions.last().map(|s| s.steps),
         "jobs": jobs.iter().map(|j| json!({"id":j.request_id,"status":j.status,"createdAt":j.created_at_unix_ms})).collect::<Vec<_>>() }),
     )

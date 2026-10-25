@@ -147,7 +147,8 @@ struct MeshView: View {
             VStack(alignment: .leading, spacing: 16) {
                 Image(systemName: "square.stack.3d.up").font(.title2).foregroundStyle(MeshPalette.accent)
                 Text("One shared model.").font(MeshType.display(23))
-                Text(store.snapshot?.model ?? "Membership is ready. Model execution is still being connected.")
+                ModelStatusLabel(compute: enrollment.state?.inference?.compute, online: true)
+                Text(enrollment.state?.inference?.compute?.message ?? store.snapshot?.model ?? "No native model is configured on this device.")
                     .font(.subheadline).foregroundStyle(MeshPalette.muted).lineSpacing(3)
                 Button(action: openModel) { Label("View model", systemImage: "arrow.up.right") }.buttonStyle(MeshButtonStyle(primary: false))
             }
@@ -197,6 +198,7 @@ struct StageView: View {
 }
 
 struct DeviceView: View {
+    @EnvironmentObject private var enrollment: EnrollmentStore
     @AppStorage("deviceName") private var name = "My device"
     @AppStorage("contributionMiB") private var budget = 1024
     @AppStorage("powerOnly") private var powerOnly = true
@@ -221,7 +223,8 @@ struct DeviceView: View {
                     Text("Contribution preferences").font(MeshType.display(24))
                     Picker("Memory contribution", selection: $budget) { ForEach([512, 1024, 2048, 4096], id: \.self) { Text("\($0) MiB").tag($0) } }
                     Toggle("Only while plugged in", isOn: $powerOnly)
-                    StatusNote(symbol: "pause.circle", text: "Saved for future compute setup. Benchmarking and contribution limits are not active yet.")
+                    ModelStatusLabel(compute: enrollment.state?.inference?.compute, online: true)
+                    StatusNote(symbol: "pause.circle", text: enrollment.state?.inference?.compute?.message ?? "No native model is configured on this device. These preferences are saved for future compute setup.")
                 }
             }
         }.toolbar(.hidden, for: .navigationBar)

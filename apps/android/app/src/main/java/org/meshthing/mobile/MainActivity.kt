@@ -198,7 +198,8 @@ class MainActivity : ComponentActivity() {
     Row(verticalAlignment = Alignment.CenterVertically) { Text("Only while plugged in", Modifier.weight(1f)); Switch(checked = power, onCheckedChange = { power = it }) }
     Button(onClick = { try { store.saveDevice(name, budget, power); notice = "Preferences saved on this device." } catch (e: Exception) { notice = e.message.orEmpty() } }) { Text("Save preferences") }
     if (notice.isNotEmpty()) Text(notice)
-    InfoCard("Native compute", store.enrollment.state?.let { state -> if (state.workerBegin != null && state.workerEnd != null) "Contributing layers ${state.workerBegin}–${state.workerEnd - 1}. The native runner checked this range before assignment." else "Waiting for a local model and automatic assignment." } ?: "Join a mesh to contribute.")
+    InfoCard("Native compute", store.enrollment.state?.let { state -> state.compute?.let { "${it.label}. ${it.message}" } ?: "No native model is configured on this device." } ?: "Join a mesh to contribute.")
+    store.enrollment.state?.let { ModelStatusLine(it.compute, true) }
     Text("The native configuration currently sets the memory limit. These preference controls do not change a running worker.", style = MaterialTheme.typography.bodySmall)
 }
 
