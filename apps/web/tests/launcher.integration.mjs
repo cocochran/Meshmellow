@@ -6,8 +6,10 @@ import { once } from 'node:events';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { requireCoreBinary, runtimeReady, stopChild } from './runtime-process.mjs';
 
-test('one runtime owns static UI, enrollment, API queue, settings and shutdown', { timeout: 60000 }, async () => {
+test('one runtime owns static UI, enrollment, API queue, settings and shutdown', { timeout: 60000 }, async (t) => {
+  const binary = await requireCoreBinary();
   const state = await mkdtemp(join(tmpdir(), 'layercake-runtime-'));
   const requests = []; let active = 0; let maxActive = 0;
   const fixture = createServer(async (req, res) => {
@@ -23,17 +25,19 @@ test('one runtime owns static UI, enrollment, API queue, settings and shutdown',
     else res.end('{"choices":[{"message":{"role":"assistant","content":"hello"}}]}');
   });
   fixture.listen(0, '127.0.0.1'); await once(fixture,'listening');
-  let child, origin, stderr = '';
+  let child, origin;
   async function start(upstream = true) {
-    child = spawn(process.env.LAYERCAKE_CORE_BIN || resolve('../../target/debug/llm-cluster'), ['ui','--no-open','--port','0','--state-dir',state,'--assets',resolve('build'),...(upstream ? ['--upstream',`127.0.0.1:${fixture.address().port}`] : [])], { stdio: ['ignore','pipe','pipe'] });
-    child.stderr.on('data', b => stderr += b);
-    origin = await new Promise((ok, fail) => {
-      const timer = setTimeout(() => fail(new Error('startup timed out '+stderr)), 15000);
-      child.stdout.on('data', b => { const match = /Layercake: (http:\/\/127.0.0.1:\d+)/.exec(b.toString()); if(match) { clearTimeout(timer); ok(match[1]); } });
-      child.once('exit', code => { clearTimeout(timer); fail(new Error(`exit ${code}: ${stderr}`)); });
-    });
+    child = spawn(binary, ['ui','--no-open','--port','0','--state-dir',state,'--assets',resolve('build'),...(upstream ? ['--upstream',`127.0.0.1:${fixture.address().port}`] : [])], { stdio: ['ignore','pipe','pipe'] });
+    origin = await runtimeReady(child, /Layercake: (http:\/\/127\.0\.0\.1:\d+)/);
   }
-  async function stop() { if(child && child.exitCode === null) { const ended = once(child,'exit'); child.kill('SIGTERM'); await ended; } }
+  async function stop() { await stopChild(child); }
+  t.after(async () => {
+    try { await stop(); } finally {
+      fixture.closeAllConnections();
+      await new Promise(r => fixture.close(r));
+      await rm(state, { recursive: true, force: true });
+    }
+  });
   const get = async path => (await fetch(origin+path)).json();
   const send = (path, body, method = 'POST', extra = {}) => fetch(origin+path, {method,headers:{Origin:origin,'Content-Type':'application/json',...extra},body:JSON.stringify(body)});
   try {
@@ -73,5 +77,5 @@ test('one runtime owns static UI, enrollment, API queue, settings and shutdown',
     assert.equal((await get('/api/status')).api.inference_ready,false); assert.equal((await send('/v1/chat/completions',{})).status,503);
     assert.equal((await send('/api/enrollment',{op:'leave'})).status,200);
     await stop(); await start(false); assert.equal((await get('/api/enrollment')).mesh,null);
-  } finally { await stop(); fixture.closeAllConnections(); await new Promise(r=>fixture.close(r)); await rm(state,{recursive:true,force:true}); }
+  } finally { await stop(); }
 });
