@@ -22,18 +22,11 @@ import kotlinx.coroutines.launch
 import java.text.DateFormat
 import java.util.Date
 
-@Composable fun MembershipSummary(enrollment: EnrollmentController) {
-    val state = enrollment.state
+@Composable fun LeaveMeshButton(enrollment: EnrollmentController) {
     var confirmingLeave by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
-    state?.meshName?.let { name ->
-        Text(name, style = MaterialTheme.typography.titleLarge)
-        Text("Trusted devices", fontWeight = FontWeight.SemiBold)
-        state.members.forEach { member ->
-            Text("${member.name}${if (member.id == state.id) " (this device)" else ""} · Trusted · ${if (member.online) "Connected" else "Disconnected"}")
-        }
-        Text("Devices are enrolled. Model benchmarking and compute setup are still pending.", style = MaterialTheme.typography.bodySmall)
-        TextButton(onClick = { confirmingLeave = true }, enabled = !enrollment.busy) { Text("Leave mesh", color = MaterialTheme.colorScheme.error) }
+    OutlinedButton(onClick = { confirmingLeave = true }, enabled = !enrollment.busy) {
+        Text("Leave mesh", color = MaterialTheme.colorScheme.error)
     }
     if (confirmingLeave) AlertDialog(
         onDismissRequest = { confirmingLeave = false },
@@ -42,6 +35,20 @@ import java.util.Date
         confirmButton = { TextButton(onClick = { confirmingLeave = false; scope.launch { enrollment.perform("leave") } }) { Text("Leave mesh") } },
         dismissButton = { TextButton(onClick = { confirmingLeave = false }) { Text("Stay in mesh") } }
     )
+}
+
+@Composable fun MembershipSummary(enrollment: EnrollmentController) {
+    val state = enrollment.state
+    val scope = rememberCoroutineScope()
+    state?.meshName?.let { name ->
+        Text(name, style = MaterialTheme.typography.titleLarge)
+        Text("Trusted devices", fontWeight = FontWeight.SemiBold)
+        state.members.forEach { member ->
+            Text("${member.name}${if (member.id == state.id) " (this device)" else ""} · Trusted · ${if (member.online) "Connected" else "Disconnected"}")
+        }
+        Text("Devices are enrolled. Model benchmarking and compute setup are still pending.", style = MaterialTheme.typography.bodySmall)
+        LeaveMeshButton(enrollment)
+    }
     state?.joiningName?.let { name ->
         Text("Waiting to join $name", style = MaterialTheme.typography.titleMedium)
         Text("Ask any trusted member to approve this device. Keep both apps open.")
