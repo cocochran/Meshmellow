@@ -35,6 +35,10 @@ struct MembershipSummary: View {
         let isSelf = member.id == enrollment.state?.id
         return DisclosureGroup {
             VStack(alignment: .leading, spacing: 8) {
+                if let compute = member.compute, isSelf || member.online == true {
+                    Eyebrow(text: "Model")
+                    Text(compute.message).font(.caption).foregroundStyle(MeshPalette.muted)
+                }
                 Eyebrow(text: "OpenAI-compatible API")
                 if let api = member.api {
                     Text(api.inference_ready ? "Ready" : "Listening · inference unavailable").font(.subheadline)
@@ -58,6 +62,7 @@ struct MembershipSummary: View {
                 VStack(alignment: .leading, spacing: 5) {
                     Text(member.name).font(.subheadline.weight(.semibold)).foregroundStyle(MeshPalette.ink)
                     Text(isSelf ? "This device · Trusted" : (member.online == true ? "Trusted · Connected" : "Trusted · Disconnected")).font(.caption).foregroundStyle(MeshPalette.muted)
+                    ModelStatusLabel(compute: member.compute, online: isSelf || member.online == true)
                 }
             }
         }.tint(MeshPalette.muted)
@@ -95,6 +100,27 @@ struct MembershipSummary: View {
     }
     private func decide(_ request: EnrollmentState.Pending, approve: Bool) {
         Task { await enrollment.perform(["op": "decide", "issuer": request.issuer, "request": request.id, "approve": approve]) }
+    }
+}
+
+/// Coloured dot plus label so a loaded slice is visible at a glance.
+struct ModelStatusLabel: View {
+    let compute: EnrollmentState.Compute?
+    let online: Bool
+    var body: some View {
+        HStack(spacing: 6) {
+            Circle().fill(color).frame(width: 7, height: 7)
+            Text(!online ? "Offline" : compute?.label ?? "No local model").font(.caption.weight(.semibold)).foregroundStyle(MeshPalette.ink)
+        }.accessibilityElement(children: .combine)
+    }
+    private var color: Color {
+        guard online, let compute else { return MeshPalette.muted.opacity(0.5) }
+        switch compute.phase {
+        case "ready": return .green
+        case "failed": return MeshPalette.strawberry
+        case "verifying", "benchmarking", "loading": return .orange
+        default: return .blue
+        }
     }
 }
 

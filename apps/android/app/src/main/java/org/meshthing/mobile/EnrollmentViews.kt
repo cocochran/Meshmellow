@@ -37,6 +37,21 @@ import java.util.Date
     )
 }
 
+/** Coloured dot plus label so a loaded slice is visible at a glance. */
+@Composable fun ModelStatusLine(compute: ComputeStatus?, online: Boolean) {
+    val color = when {
+        !online || compute == null -> androidx.compose.ui.graphics.Color(0xFFB3A99D)
+        compute.ready -> androidx.compose.ui.graphics.Color(0xFF43895C)
+        compute.phase == "failed" -> MaterialTheme.colorScheme.error
+        compute.working -> androidx.compose.ui.graphics.Color(0xFFD18A2C)
+        else -> androidx.compose.ui.graphics.Color(0xFF8CC9E1)
+    }
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Box(Modifier.size(8.dp).background(color, RoundedCornerShape(4.dp)))
+        Text(if (!online) "Offline" else compute?.label ?: "No local model", fontWeight = FontWeight.SemiBold)
+    }
+}
+
 @Composable fun MembershipSummary(enrollment: EnrollmentController) {
     val context = LocalContext.current
     val state = enrollment.state
@@ -45,7 +60,8 @@ import java.util.Date
         Text(name, style = MaterialTheme.typography.titleLarge)
         Text("Trusted devices", fontWeight = FontWeight.SemiBold)
         state.members.forEach { member ->
-            Text("${member.name}${if (member.id == state.id) " (this device)" else ""} · Trusted · ${if (member.online) "Connected" else "Disconnected"}")
+            Text("${member.name}${if (member.id == state.id) " (this device)" else ""} · Trusted · ${if (member.online || member.id == state.id) "Connected" else "Disconnected"}")
+            ModelStatusLine(member.compute, member.online || member.id == state.id)
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("OpenAI-compatible API", fontWeight = FontWeight.SemiBold)
@@ -67,7 +83,7 @@ import java.util.Date
             }
 
         }
-        Text(if (state.workerBegin != null && state.workerEnd != null) "Contributing layers ${state.workerBegin}–${state.workerEnd - 1}. Assignments update automatically as native workers join or leave." else "Connected to the mesh. Waiting for a native model and compute assignment.", style = MaterialTheme.typography.bodySmall)
+        Text(state.compute?.message ?: "Connected to the mesh. No native model is configured on this device.", style = MaterialTheme.typography.bodySmall)
         LeaveMeshButton(enrollment)
     }
     state?.joiningName?.let { name ->

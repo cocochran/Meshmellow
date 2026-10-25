@@ -1,3 +1,4 @@
+import type { ComputeStatus } from './enrollment.ts';
 export type Source = 'live-demo' | 'core';
 export interface Device {
   id: string;
@@ -9,6 +10,7 @@ export interface Device {
   executions: number;
   computeMs: number | null;
   bufferBytes: number | null;
+  compute?: ComputeStatus | null;
 }
 export interface Job { id: string; status: string; createdAt: number | null }
 export interface Peer {
@@ -17,6 +19,7 @@ export interface Peer {
   lastHeartbeat: number | null;
 }
 export interface MeshSnapshot {
+  localCompute?: ComputeStatus | null;
   inferenceReady?: boolean;
   execution?: Execution | null;
   hardware?: { id: string; totalBytes: number | null; availableBytes: number | null }[];

@@ -126,6 +126,8 @@ struct Reply {
     #[serde(default)]
     compute: Option<compute::ComputeOffer>,
     #[serde(default)]
+    compute_status: Option<compute::ComputeStatus>,
+    #[serde(default)]
     api: Option<ApiEndpoint>,
     error: Option<String>,
     ledger: Option<Ledger>,
@@ -137,6 +139,7 @@ impl Reply {
     fn empty() -> Self {
         Self {
             compute: None,
+            compute_status: None,
             api: None,
             error: None,
             ledger: None,
@@ -157,6 +160,7 @@ pub struct Node {
     failed_sync_members: Arc<Mutex<HashSet<String>>>,
     local_api: Arc<Mutex<Option<ApiEndpoint>>>,
     peer_apis: Arc<Mutex<BTreeMap<String, ApiEndpoint>>>,
+    peer_compute: Arc<Mutex<BTreeMap<String, compute::ComputeStatus>>>,
     internet: bool,
     artifact_seed: Arc<Mutex<Option<Arc<crate::artifact::Seed>>>>,
     inference_worker: Arc<Mutex<Option<Arc<crate::shard::ring::RingWorker>>>>,
@@ -260,6 +264,7 @@ impl Node {
             compute_route: Default::default(),
             local_api: Default::default(),
             peer_apis: Default::default(),
+            peer_compute: Default::default(),
             membership_epoch: tokio::sync::watch::channel(0).0,
             control_peers: Default::default(),
             control_tasks: Default::default(),
@@ -269,7 +274,7 @@ impl Node {
         let compute_path = dir.join("compute.json");
         if compute_path.exists() {
             let config = serde_json::from_slice(&read_file_limited(&compute_path, 64 * 1024)?)?;
-            node.enable_compute(config).await?;
+            node.start_compute(config).await;
         }
         Ok(node)
     }
@@ -415,6 +420,7 @@ impl Node {
     /// their signed trust history; rejoining still requests explicit approval.
     pub async fn leave(&self) -> Result<()> {
         self.peer_apis.lock().await.clear();
+        self.peer_compute.lock().await.clear();
         self.change(|r| {
             ensure!(r.ledger.is_some(), "This device has no mesh to leave.");
             *r = Record::default();
@@ -457,6 +463,7 @@ impl Node {
         })
         .await?;
         self.peer_apis.lock().await.remove(member);
+        self.peer_compute.lock().await.remove(member);
         *self.compute_route.lock().await = None;
         let ledger = self.record.lock().await.ledger.clone().context("No mesh")?;
         let mut deliveries = tokio::task::JoinSet::new();
@@ -748,6 +755,7 @@ impl Node {
         }
         let mut pending = vec![];
         let mut apis = BTreeMap::new();
+        let mut computes = BTreeMap::new();
         while let Some(result) = jobs.join_next().await {
             match result {
                 Ok(Ok((issuer, response))) => {
@@ -756,6 +764,9 @@ impl Node {
                     }
                     if let Some(api) = response.api {
                         apis.insert(issuer.clone(), api);
+                    }
+                    if let Some(status) = response.compute_status {
+                        computes.insert(issuer.clone(), status.bounded());
                     }
                     if let Some(next) = response.ledger {
                         self.merge(&next).await?;
@@ -780,6 +791,7 @@ impl Node {
         if current.ledger.as_ref().map(|l| l.genesis.id()) == Some(ledger.genesis.id()) {
             *self.remote_pending.lock().await = pending;
             *self.peer_apis.lock().await = apis;
+            *self.peer_compute.lock().await = computes;
         }
         Ok(())
     }
@@ -810,17 +822,20 @@ impl Node {
             .collect();
         let local_api = self.local_api.lock().await.clone();
         let apis = self.peer_apis.lock().await;
+        let local_compute = self.compute_status().await;
+        let computes = self.peer_compute.lock().await;
         let members = if let Some(ledger) = &r.ledger {
             ledger
                 .members()?
                 .into_iter()
-                .map(|(id, name)| json!({"id": id, "name": name, "self": id == self.id(), "online": id == self.id() || connected.contains(&id), "api": if id == self.id() { local_api.as_ref() } else { apis.get(&id) }}))
+                .map(|(id, name)| json!({"id": id, "name": name, "self": id == self.id(), "online": id == self.id() || connected.contains(&id), "api": if id == self.id() { local_api.as_ref() } else { apis.get(&id) }, "compute": if id == self.id() { local_compute.as_ref() } else { computes.get(&id) }}))
                 .collect::<Vec<_>>()
         } else {
             vec![]
         };
         Ok(json!({
             "inference": {
+                "compute": local_compute,
                 "worker": self.inference_worker.lock().await.as_ref().map(|worker| worker.status()),
                 "completed_sessions": self.inference_ring.channels.traffic(),
             },
@@ -1038,6 +1053,7 @@ impl Node {
             }
             Ok(Reply {
                 compute: None,
+                compute_status: None,
                 api: None,
                 error: None,
                 ledger: Some(current.clone()),
@@ -1083,6 +1099,7 @@ impl Node {
                 }
                 let mut reply = self.handle_trusted(remote, ledger, None).await?;
                 reply.api = self.local_api.lock().await.clone();
+                reply.compute_status = self.compute_status().await;
                 Ok(reply)
             }
             Wire::Decide {
