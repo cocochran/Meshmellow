@@ -604,7 +604,11 @@ impl SseTextAssembler {
         };
         let data = data.trim_start();
         if data == SSE_DONE {
-            self.done = true;
+            if self.done {
+                self.invalid = true;
+            } else {
+                self.done = true;
+            }
             return;
         }
         if self.done {
@@ -732,6 +736,12 @@ mod tests {
                 false,
             )
             .await;
+        }
+        for trailing in [
+            "data: [DONE]\n\ndata: [DONE]\n\n",
+            "data: [DONE]\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\n",
+        ] {
+            check_stream(&format!("{}{trailing}", delta_event("Hello")), false).await;
         }
     }
 
