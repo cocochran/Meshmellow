@@ -45,10 +45,10 @@ outage while keeping the normal two-second polling loop from flooding warning lo
 The shared control listener accepts at most 128 concurrent sessions, and each session reads at
 most 16 concurrent heartbeat streams; excess connections are refused and excess streams are
 stopped. This bounds task growth from peers that open many idle streams.
-RPC bridges cap each worker bridge at 128 local clients, each worker endpoint at 128 incoming
-connections, and each remote connection at 128 streams. When a cap is reached, new clients are
-dropped or streams are reset; limit events are logged at debug level, with one warning per
-connection for repeated excess streams.
+RPC bridges cap local clients at 128 across the leader's worker bridges, worker endpoints at 128
+incoming connections, and worker-side streams at 64 per connection and 256 total. When a cap is
+reached, new clients are dropped or streams are reset; connection limits log at debug level and
+excess streams generate at most one warning per connection.
 The shard relay caps incoming connections at 128, including sessions waiting for the single
 runner slot. Experimental ring workers cap them at 16. Excess connections are refused and
 logged at debug level.
