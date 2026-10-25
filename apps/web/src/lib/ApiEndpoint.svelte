@@ -11,7 +11,7 @@
 <div class="api-endpoint">
   <strong>OpenAI-compatible API</strong>
   {#if api}
-    <span class:ready={api.inference_ready}>{api.inference_ready ? 'Ready' : 'Listening · inference unavailable'}</span>
+    <span class:ready={api.inference_ready}>{api.inference_ready ? 'Ready' : 'Local prompt API unavailable'}</span>
     <code>{api.base_url}</code>
     <small>Base URL · {local ? 'on this device' : 'on that device'} only</small>
     <button type="button" class="button secondary" onclick={copy}>{copied ? 'Copied' : 'Copy URL'}</button>

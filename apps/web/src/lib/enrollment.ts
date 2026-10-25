@@ -1,5 +1,6 @@
 export interface NodeApi { base_url: string; scope: string; inference_ready: boolean; message: string }
 export interface EnrollmentState {
+  can_kick?: boolean;
   api?: NodeApi | null;
   id: string;
   mesh: { id: string; name: string } | null;

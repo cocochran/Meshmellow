@@ -190,7 +190,7 @@ impl StageLink {
     }
 
     /// Sends one request and reads its reply, all within `step_timeout`.
-    async fn exchange(
+    pub(crate) async fn exchange(
         &mut self,
         step: u32,
         position: u32,
@@ -250,7 +250,7 @@ impl StageLink {
 
     /// Ends the session: closes the request stream, then lets a local runner exit (killing
     /// it after a grace period, or at once when `kill` is set) or closes the connection.
-    async fn close(self, kill: bool) {
+    pub(crate) async fn close(self, kill: bool) {
         let Self {
             mut writer,
             guard,
@@ -411,6 +411,7 @@ impl Pipeline {
         check_metadata(&local, expected, meta.embd, false)?;
         check_origin_stage(meta, ring.stages())
             .with_context(|| format!("{} does not continue into the ring", local.label))?;
+        ring.observe_origin(meta);
         ensure!(
             !meta.tokens.is_empty(),
             "{} reported no prompt tokens",
@@ -586,9 +587,15 @@ impl Pipeline {
             };
             let is_final = final_link == Some(index);
             let max_floats = if is_final { 0 } else { row_values };
+            if let Some(ring) = &self.ring {
+                ring.origin_progress(serde_json::json!({"event":"stage_start","begin":link.metadata.begin,"step":step,"input_bytes":tokens.len()*4}));
+            }
             let output = link
                 .exchange(step, position, &input, max_floats, self.step_timeout)
                 .await?;
+            if let Some(ring) = &self.ring {
+                ring.origin_progress(serde_json::json!({"event":"stage_end","begin":link.metadata.begin,"step":step,"output_bytes":output.floats.len()*4,"result":output.reply}));
+            }
             if is_final {
                 decoder.advance(count);
                 debug!(
