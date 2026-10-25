@@ -44,7 +44,9 @@ debug logs for continuing failures, and logs when refresh recovers; this avoids 
 outage while keeping the normal two-second polling loop from flooding warning logs.
 The shared control listener accepts at most 128 concurrent sessions, and each session reads at
 most 16 concurrent heartbeat streams; excess connections are refused and excess streams are
-stopped. This bounds task growth from peers that open many idle streams.
+stopped. Handshake frames are capped at 64 KiB and heartbeat frames at 1 KiB, below the general
+16 MiB protocol frame limit. This bounds task and frame-buffer growth from peers that open many
+idle streams.
 RPC bridges cap local clients at 128 across the leader's worker bridges, worker endpoints at 128
 incoming connections, and worker-side streams at 64 per connection and 256 total. When a cap is
 reached, new clients are dropped or streams are reset; connection limits log at debug level and

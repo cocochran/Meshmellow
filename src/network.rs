@@ -52,6 +52,12 @@ const MAX_CONTROL_SESSIONS: usize = 128;
 /// Maximum concurrent unidirectional streams accepted within one control session.
 const MAX_CONTROL_STREAM_READERS: usize = 16;
 
+/// Control handshakes contain only identity fields; keep them far below the general wire limit.
+const MAX_HELLO_FRAME_LEN: usize = 64 * 1024;
+
+/// Heartbeat streams carry only a node ID, epoch, and sequence number.
+const MAX_HEARTBEAT_FRAME_LEN: usize = 1024;
+
 /// QUIC application close code for a connection dropped because its hello exchange failed.
 const HELLO_REJECTED_CODE: u32 = 1;
 
@@ -601,7 +607,7 @@ impl StreamReader {
     async fn run(self, mut recv: RecvStream) {
         let peer = self.peer;
         loop {
-            match protocol::read_frame(&mut recv).await {
+            match protocol::read_frame_with_limit(&mut recv, MAX_HEARTBEAT_FRAME_LEN).await {
                 Ok(Some(Message::Heartbeat(heartbeat))) => self.on_heartbeat(&heartbeat),
                 Ok(Some(other)) => {
                     warn!(%peer, kind = message_kind(&other), "ignoring unexpected control message");
@@ -740,7 +746,7 @@ impl Drop for PendingPeerRegistration<'_> {
 }
 
 async fn read_hello(recv: &mut RecvStream) -> anyhow::Result<Hello> {
-    match protocol::read_frame(recv).await? {
+    match protocol::read_frame_with_limit(recv, MAX_HELLO_FRAME_LEN).await? {
         Some(Message::Hello(hello)) => Ok(hello),
         Some(other) => bail!("expected Hello, got {other:?}"),
         None => bail!("peer closed the stream before sending Hello"),
