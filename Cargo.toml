@@ -1,5 +1,6 @@
 [package]
 name = "llm-cluster"
+default-run = "llm-cluster"
 version = "0.1.0"
 edition = "2024"
 
