@@ -42,6 +42,9 @@ hello, address, dial and timeout failures; the member ID is included in each eve
 enrollment CLI warns on the first periodic membership refresh failure or timeout, uses
 debug logs for continuing failures, and logs when refresh recovers; this avoids hiding an
 outage while keeping the normal two-second polling loop from flooding warning logs.
+The shared control listener accepts at most 128 concurrent sessions, and each session reads at
+most 16 concurrent heartbeat streams; excess connections are refused and excess streams are
+stopped. This bounds task growth from peers that open many idle streams.
 Readiness-probe error excerpts are capped at 512 characters (at most 2 KiB read), and the
 external run-evidence file is capped at 1 MiB per poll.
 The CLI rejects plan, profile and shard-manifest JSON files larger than 64 MiB before parsing;

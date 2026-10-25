@@ -31,7 +31,7 @@ use anyhow::{Context, anyhow, bail, ensure};
 use iroh::endpoint::presets::{self, Preset};
 use iroh::endpoint::{Connection, ConnectionError, Incoming, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, info, warn};
@@ -45,6 +45,12 @@ pub type SharedPeerTable = Arc<Mutex<PeerTable>>;
 
 /// Longest a peer may take to complete the hello exchange before the connection is dropped.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum control sessions served by one endpoint.
+const MAX_CONTROL_SESSIONS: usize = 128;
+
+/// Maximum concurrent unidirectional streams accepted within one control session.
+const MAX_CONTROL_STREAM_READERS: usize = 16;
 
 /// QUIC application close code for a connection dropped because its hello exchange failed.
 const HELLO_REJECTED_CODE: u32 = 1;
@@ -284,17 +290,30 @@ pub async fn serve_control_with(
         heartbeat_timeout: nonzero(options.heartbeat_timeout),
         heartbeat_interval: nonzero(options.heartbeat_interval),
     };
+    let session_slots = Arc::new(Semaphore::new(MAX_CONTROL_SESSIONS));
     let mut sessions = JoinSet::new();
-    while let Some(incoming) = endpoint.accept().await {
-        let local = Arc::clone(&local);
-        let peers = Arc::clone(&peers);
-        sessions.spawn(async move {
-            run_control_session(incoming, &local, &peers, options).await;
-        });
-        // Reap finished sessions so a long-running listener does not accumulate them.
-        while let Some(result) = sessions.try_join_next() {
-            if let Err(error) = result {
-                warn!(%error, "control session task failed");
+    loop {
+        tokio::select! {
+            incoming = endpoint.accept() => match incoming {
+                Some(incoming) => {
+                    let Ok(permit) = session_slots.clone().try_acquire_owned() else {
+                        incoming.refuse();
+                        debug!(limit = MAX_CONTROL_SESSIONS, "control session limit reached; refusing connection");
+                        continue;
+                    };
+                    let local = Arc::clone(&local);
+                    let peers = Arc::clone(&peers);
+                    sessions.spawn(async move {
+                        let _permit = permit;
+                        run_control_session(incoming, &local, &peers, options).await;
+                    });
+                }
+                None => break,
+            },
+            Some(result) = sessions.join_next(), if !sessions.is_empty() => {
+                if let Err(error) = result {
+                    warn!(%error, "control session task failed");
+                }
             }
         }
     }
@@ -513,18 +532,31 @@ async fn receive_control_streams(
     mut watchdog: HeartbeatWatchdog,
 ) -> ConnectionError {
     let accepted_heartbeat = Arc::new(Notify::new());
+    let stream_slots = Arc::new(Semaphore::new(MAX_CONTROL_STREAM_READERS));
     let mut streams = JoinSet::new();
+    let mut stream_limit_logged = false;
     loop {
         tokio::select! {
             accepted = session.connection().accept_uni() => match accepted {
-                Ok(recv) => {
+                Ok(mut recv) => {
+                    let Ok(permit) = stream_slots.clone().try_acquire_owned() else {
+                        let _ = recv.stop(0u32.into());
+                        if !stream_limit_logged {
+                            warn!(peer = %session.node_id(), limit = MAX_CONTROL_STREAM_READERS, "control stream reader limit reached; refusing extra streams");
+                            stream_limit_logged = true;
+                        }
+                        continue;
+                    };
                     let reader = StreamReader {
                         peer: session.node_id(),
                         connection_token: session.connection_token(),
                         peers: Arc::clone(peers),
                         accepted_heartbeat: Arc::clone(&accepted_heartbeat),
                     };
-                    streams.spawn(reader.run(recv));
+                    streams.spawn(async move {
+                        let _permit = permit;
+                        reader.run(recv).await;
+                    });
                 }
                 Err(reason) => return reason,
             },
