@@ -96,7 +96,7 @@
 
 <div class="app-shell">
   <aside class="sidebar">
-    <a class="brand" href="/" aria-label="Layercake overview"><img src="/layercake-logo.png" width="33" height="33" alt="" /><span>layercake<span class="brand-dot">.</span></span></a>
+    <a class="brand" href="/" aria-label="Layercake overview"><span class="brand-mark" aria-hidden="true"><img src="/layercake-logo.png" width="41" height="41" alt="" /></span><span>layercake<span class="brand-dot">.</span></span></a>
     <div class="workspace"><span class="workspace-icon">L</span><div><strong>{preferences.displayName}</strong><span>Local workspace</span></div><span class="workspace-dot"></span></div>
     <span class="eyebrow sidebar-label">WORKSPACE</span>
     <nav aria-label="Main navigation">

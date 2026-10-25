@@ -141,3 +141,8 @@ nav button:hover { background: #f5eee7; }
 .art-caption { color: #a38b76; }
 button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible { outline-color: #b76b64; }
 @media(max-width:760px) { .brand { font-size: 23px; }.topbar { padding-top: 3px; }.cake-trim { top: 7px; left: 46%; gap: 6px; }.cake-trim img { width: 23px; height: 23px; }.cake-trim i { display: none; } }
+
+/* Center the painted cake (alpha bounds), rather than its padded 300px canvas. */
+.brand { line-height: 1; }
+.brand-mark { position: relative; display: block; width: 32px; height: 28px; flex: 0 0 32px; }
+.brand .brand-mark img { position: absolute; width: 41px; height: 41px; max-width: none; left: 50%; top: 50%; transform: translate(-50%, -63.6667%); image-rendering: pixelated; }
