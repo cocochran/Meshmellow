@@ -13,6 +13,10 @@
 # Claude Code agent worktrees
 .claude/worktrees/
 
+/dist/
+
+__pycache__/
+
 # Local secrets / per-person MCP config
 .mcp.json
 .claude/settings.local.json
