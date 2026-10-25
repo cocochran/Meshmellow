@@ -41,7 +41,7 @@ use tokio::io::{
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
-use tokio::time::timeout;
+use tokio::time::{timeout, timeout_at};
 use tracing::{info, warn};
 
 use crate::rpc_bridge::{PEER_NOT_APPROVED, PEER_NOT_APPROVED_REASON};
@@ -80,6 +80,30 @@ pub const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// After a clean session end, how long the next hop may take to finish its own streams.
 pub const STREAM_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bounds on a ring worker's writes to its peers. A write that misses its deadline fails the
+/// session like any other error: the upstream stream is reset, the downstream or result
+/// connection is closed with code 1 and the session's runner is killed and reaped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RingWriteTimeouts {
+    /// One control line: `start` to the next worker, `ready` or a progress line upstream, the
+    /// result-channel hello or a result to the origin.
+    pub control_line: Duration,
+    /// One execute frame plus its activations to the next worker, which reads them within
+    /// [`CONTROL_LINE_TIMEOUT`] and then [`PAYLOAD_TIMEOUT`].
+    pub execute: Duration,
+}
+
+impl Default for RingWriteTimeouts {
+    /// The bounds a peer has to read each write: [`CONTROL_LINE_TIMEOUT`] per control line and
+    /// [`NATIVE_STEP_TIMEOUT`] (control line plus payload) per execute frame.
+    fn default() -> Self {
+        Self {
+            control_line: CONTROL_LINE_TIMEOUT,
+            execute: NATIVE_STEP_TIMEOUT,
+        }
+    }
+}
 
 const CONTROL_LINE_TIMEOUT_SECS: u64 = 240;
 const PAYLOAD_TIMEOUT_SECS: u64 = 120;
@@ -261,7 +285,7 @@ pub async fn next_control<R: AsyncBufRead + Unpin>(r: &mut R) -> anyhow::Result<
 }
 
 /// Writes one control line and returns its size, refusing (before writing anything) one longer
-/// than [`MAX_CONTROL_LINE_BYTES`].
+/// than [`MAX_CONTROL_LINE_BYTES`]. Applies no timeout.
 pub async fn write_control<W: AsyncWrite + Unpin>(
     w: &mut W,
     msg: &RingMessage,
@@ -284,7 +308,7 @@ pub async fn write_control<W: AsyncWrite + Unpin>(
 }
 
 /// Writes an execute frame followed by its payload, which must be `frame.payload_bytes` long.
-/// Returns the payload size.
+/// Returns the payload size. Applies no timeout.
 pub async fn write_execute<W: AsyncWrite + Unpin>(
     w: &mut W,
     frame: &ExecuteFrame,
@@ -305,6 +329,40 @@ pub async fn write_execute<W: AsyncWrite + Unpin>(
         .await
         .with_context(|| format!("failed to flush step {} activations", frame.step))?;
     Ok(payload.len())
+}
+
+/// [`write_control`] that must finish by `deadline`; `to` names the peer for the timeout error.
+async fn write_control_by<W: AsyncWrite + Unpin>(
+    deadline: tokio::time::Instant,
+    to: &str,
+    w: &mut W,
+    msg: &RingMessage,
+) -> anyhow::Result<usize> {
+    timeout_at(deadline, write_control(w, msg))
+        .await
+        .with_context(|| format!("timed out sending a {} line to {to}", msg.kind()))?
+}
+
+/// [`write_execute`] that must finish by `deadline`.
+async fn write_execute_by<W: AsyncWrite + Unpin>(
+    deadline: tokio::time::Instant,
+    w: &mut W,
+    frame: &ExecuteFrame,
+    payload: &[u8],
+) -> anyhow::Result<usize> {
+    timeout_at(deadline, write_execute(w, frame, payload))
+        .await
+        .with_context(|| {
+            format!(
+                "timed out sending step {} activations to the next ring worker",
+                frame.step
+            )
+        })?
+}
+
+/// The deadline for a write that may take `bound` from now.
+fn deadline_in(bound: Duration) -> tokio::time::Instant {
+    tokio::time::Instant::now() + bound
 }
 
 /// Reads the `len`-byte activation payload of a checked frame within [`PAYLOAD_TIMEOUT`].
@@ -467,35 +525,58 @@ pub struct RingStream {
 /// Connects to `peer` on [`RING_ALPN`], sends `start` for `job` and waits for its `ready`.
 ///
 /// Used by a worker for its next hop and by an origin for the entry worker; the caller
-/// validates the returned stages ([`validate_chain`] plus its own expectations).
+/// validates the returned stages ([`validate_chain`] plus its own expectations). The `start`
+/// line must be sent within [`CONTROL_LINE_TIMEOUT`]. On failure the connection is closed with
+/// code 1 ("ring session failed").
 pub async fn open_ring_session(
     endpoint: &Endpoint,
     peer: EndpointId,
     job: &str,
 ) -> anyhow::Result<RingStream> {
+    open_ring_session_by(endpoint, peer, job, CONTROL_LINE_TIMEOUT).await
+}
+
+/// [`open_ring_session`] whose `start` line must be sent within `write_timeout`.
+async fn open_ring_session_by(
+    endpoint: &Endpoint,
+    peer: EndpointId,
+    job: &str,
+    write_timeout: Duration,
+) -> anyhow::Result<RingStream> {
     let connection = connect(endpoint, peer).await?;
-    let (mut send, recv) = connection
-        .open_bi()
-        .await
-        .with_context(|| format!("failed to open a ring stream to {peer}"))?;
-    let start = RingMessage::Start {
-        job: job.to_owned(),
-    };
-    write_control(&mut send, &start).await?;
-    let mut recv = BufReader::new(recv);
-    let stages = match next_control(&mut recv)
-        .await
-        .with_context(|| format!("waiting for ring readiness from {peer}"))?
-    {
-        RingMessage::Ready { job: ready, stages } if ready == job => stages,
-        other => bail!("wrong ring readiness from {peer}: got {}", other.kind()),
-    };
-    Ok(RingStream {
-        connection,
-        send,
-        recv,
-        stages,
-    })
+    let started = async {
+        let (mut send, recv) = connection
+            .open_bi()
+            .await
+            .with_context(|| format!("failed to open a ring stream to {peer}"))?;
+        let start = RingMessage::Start {
+            job: job.to_owned(),
+        };
+        let to = format!("ring peer {peer}");
+        write_control_by(deadline_in(write_timeout), &to, &mut send, &start).await?;
+        let mut recv = BufReader::new(recv);
+        let stages = match next_control(&mut recv)
+            .await
+            .with_context(|| format!("waiting for ring readiness from {peer}"))?
+        {
+            RingMessage::Ready { job: ready, stages } if ready == job => stages,
+            other => bail!("wrong ring readiness from {peer}: got {}", other.kind()),
+        };
+        Ok((send, recv, stages))
+    }
+    .await;
+    match started {
+        Ok((send, recv, stages)) => Ok(RingStream {
+            connection,
+            send,
+            recv,
+            stages,
+        }),
+        Err(error) => {
+            connection.close(SESSION_ABORTED, SESSION_FAILED_REASON);
+            Err(error)
+        }
+    }
 }
 
 /// Origin: reads the opening line of a result-channel stream the terminal opened and returns
@@ -514,12 +595,14 @@ pub async fn read_result_channel_hello<R: AsyncBufRead + Unpin>(
 }
 
 /// Origin: accepts a result channel for `job` and finishes the send side, as ring.rs's gateway
-/// does. Results then arrive on the stream's receive side ([`read_result`]).
+/// does. The `accepted` line must be sent within [`CONTROL_LINE_TIMEOUT`]. Results then arrive
+/// on the stream's receive side ([`read_result`]).
 pub async fn accept_result_channel(send: &mut SendStream, job: &str) -> anyhow::Result<()> {
     let accepted = RingMessage::Accepted {
         job: job.to_owned(),
     };
-    write_control(send, &accepted).await?;
+    let deadline = deadline_in(CONTROL_LINE_TIMEOUT);
+    write_control_by(deadline, "the ring terminal", send, &accepted).await?;
     send.finish().context("failed to finish the result channel")
 }
 
@@ -644,8 +727,20 @@ impl RingWorkerConfig {
 /// sees the stream end without `ready`). A runner's metadata must match the configured range
 /// and carry a 64-hex model identity, and the terminal must own the model's final layer.
 ///
+/// Every write to a peer is bounded by [`RingWriteTimeouts::default`]; a write that misses its
+/// deadline fails the session.
+///
 /// Cancel-safe: dropping the future aborts every session and kills every runner.
 pub async fn serve_ring_worker(endpoint: Endpoint, config: RingWorkerConfig) -> anyhow::Result<()> {
+    serve_ring_worker_with(endpoint, config, RingWriteTimeouts::default()).await
+}
+
+/// [`serve_ring_worker`] with explicit bounds on the worker's writes to its peers.
+pub async fn serve_ring_worker_with(
+    endpoint: Endpoint,
+    config: RingWorkerConfig,
+    timeouts: RingWriteTimeouts,
+) -> anyhow::Result<()> {
     let shard = Shard::load(config.shard_config()).await?;
     info!(
         id = %endpoint.id(),
@@ -664,6 +759,7 @@ pub async fn serve_ring_worker(endpoint: Endpoint, config: RingWorkerConfig) -> 
         origin: config.origin,
         next: config.next,
         gate: Semaphore::new(1),
+        timeouts,
     });
 
     let mut connections = JoinSet::new();
@@ -683,7 +779,8 @@ pub async fn serve_ring_worker(endpoint: Endpoint, config: RingWorkerConfig) -> 
     }
 }
 
-/// A serving ring worker: its stage, its place in the ring and the one-session gate.
+/// A serving ring worker: its stage, its place in the ring, the one-session gate and the bounds
+/// on its writes.
 struct RingWorker {
     endpoint: Endpoint,
     shard: Shard,
@@ -691,6 +788,7 @@ struct RingWorker {
     origin: EndpointId,
     next: Option<EndpointId>,
     gate: Semaphore,
+    timeouts: RingWriteTimeouts,
 }
 
 /// One Iroh connection: refuse anyone but the upstream, then serve its streams in turn.
@@ -736,6 +834,19 @@ struct SessionStats {
 
 /// The stream back to the upstream peer, shared with the task relaying downstream progress.
 type Upstream = Arc<Mutex<SendStream>>;
+
+/// Writes one control line upstream by `deadline`, which also bounds waiting for the stream
+/// while the other writer (the progress relay or the session) holds it.
+async fn write_upstream(
+    deadline: tokio::time::Instant,
+    writer: &Upstream,
+    msg: &RingMessage,
+) -> anyhow::Result<usize> {
+    let write = async { write_control(&mut *writer.lock().await, msg).await };
+    timeout_at(deadline, write)
+        .await
+        .with_context(|| format!("timed out sending a {} line upstream", msg.kind()))?
+}
 
 impl RingWorker {
     /// Runs one session and reports how it ended: finished upstream stream on success, reset
@@ -825,12 +936,17 @@ impl RingWorker {
             job: job.clone(),
             stages,
         };
-        write_control(&mut *writer.lock().await, &ready).await?;
+        let deadline = deadline_in(self.timeouts.control_line);
+        if let Err(error) = write_upstream(deadline, writer, &ready).await {
+            downstream.close(false).await?;
+            return Err(error);
+        }
         Ok(Hop {
             job,
             info,
             writer: Arc::clone(writer),
             downstream,
+            timeouts: self.timeouts,
             step: 0,
             pos: 0,
         })
@@ -854,10 +970,14 @@ impl RingWorker {
                 meta.end,
                 meta.layers
             );
-            let downstream = Downstream::origin(&self.endpoint, self.origin, job).await?;
+            let write_timeout = self.timeouts.control_line;
+            let downstream =
+                Downstream::origin(&self.endpoint, self.origin, job, write_timeout).await?;
             return Ok((downstream, stages));
         };
-        let (downstream, rest) = Downstream::next(&self.endpoint, next, job, writer).await?;
+        let write_timeout = self.timeouts.control_line;
+        let (downstream, rest) =
+            Downstream::next(&self.endpoint, next, job, writer, write_timeout).await?;
         stages.extend(rest);
         if let Err(error) = validate_chain(&stages) {
             downstream.close(false).await?;
@@ -913,15 +1033,15 @@ impl NativeRunner {
         expected_floats: usize,
     ) -> anyhow::Result<StepOutput> {
         let stdin = self.stdin.as_mut().context("shard runner has no stdin")?;
-        let input = StageInput::Hidden { rows, embd };
-        wire::write_request(stdin, frame.step, frame.pos, &input).await?;
         let stdout = self.stdout.as_mut().context("shard runner has no stdout")?;
-        let output = timeout(
-            NATIVE_STEP_TIMEOUT,
-            wire::read_step(stdout, expected_floats),
-        )
-        .await
-        .with_context(|| format!("timed out waiting for the runner's step {}", frame.step))??;
+        let input = StageInput::Hidden { rows, embd };
+        let exchange = async {
+            wire::write_request(stdin, frame.step, frame.pos, &input).await?;
+            wire::read_step(stdout, expected_floats).await
+        };
+        let output = timeout(NATIVE_STEP_TIMEOUT, exchange)
+            .await
+            .with_context(|| format!("timed out waiting for the runner's step {}", frame.step))??;
         ensure!(
             output.reply.step == frame.step,
             "wrong native step: runner answered {} for {}",
@@ -965,22 +1085,26 @@ enum Downstream {
 impl Downstream {
     /// Starts the session on `next`, checks it reports our next worker first, and starts
     /// relaying its progress upstream. Returns the link and the rest of the chain.
+    /// Every control line (`start`, relayed progress) must be sent within `write_timeout`.
     async fn next(
         endpoint: &Endpoint,
         next: EndpointId,
         job: &str,
         writer: &Upstream,
+        write_timeout: Duration,
     ) -> anyhow::Result<(Self, Vec<RingStageInfo>)> {
-        let stream = open_ring_session(endpoint, next, job).await?;
-        let first = stream.stages.first().context("empty downstream chain")?;
-        ensure!(
-            first.node_id == next.to_string(),
-            "downstream chain starts at {}, not the configured next worker {next}",
-            first.node_id
-        );
+        let stream = open_ring_session_by(endpoint, next, job, write_timeout).await?;
+        let first = stream.stages.first().map(|stage| stage.node_id.clone());
+        if first != Some(next.to_string()) {
+            stream
+                .connection
+                .close(SESSION_ABORTED, SESSION_FAILED_REASON);
+            bail!("downstream chain starts at {first:?}, not the configured next worker {next}");
+        }
         let relay = RelayTask(tokio::spawn(relay_progress(
             stream.recv,
             Arc::clone(writer),
+            write_timeout,
         )));
         let link = Self::Next {
             connection: stream.connection,
@@ -990,27 +1114,43 @@ impl Downstream {
         Ok((link, stream.stages))
     }
 
-    /// Opens the result channel to the origin and waits for it to be accepted.
-    async fn origin(endpoint: &Endpoint, origin: EndpointId, job: &str) -> anyhow::Result<Self> {
+    /// Opens the result channel to the origin and waits for it to be accepted. The hello must be
+    /// sent within `write_timeout`; on failure the connection is closed with code 1.
+    async fn origin(
+        endpoint: &Endpoint,
+        origin: EndpointId,
+        job: &str,
+        write_timeout: Duration,
+    ) -> anyhow::Result<Self> {
         let connection = connect(endpoint, origin).await?;
-        let (mut send, recv) = connection
-            .open_bi()
-            .await
-            .context("failed to open the result channel")?;
-        let hello = RingMessage::ResultChannel {
-            job: job.to_owned(),
-        };
-        write_control(&mut send, &hello).await?;
-        let mut recv = BufReader::new(recv);
-        match next_control(&mut recv)
-            .await
-            .context("waiting for the origin to accept the result channel")?
-        {
-            RingMessage::Accepted { job: accepted } if accepted == job => {}
-            other => bail!("result channel not accepted: got {}", other.kind()),
+        let opened = async {
+            let (mut send, recv) = connection
+                .open_bi()
+                .await
+                .context("failed to open the result channel")?;
+            let hello = RingMessage::ResultChannel {
+                job: job.to_owned(),
+            };
+            let deadline = deadline_in(write_timeout);
+            write_control_by(deadline, "the origin", &mut send, &hello).await?;
+            let mut recv = BufReader::new(recv);
+            match next_control(&mut recv)
+                .await
+                .context("waiting for the origin to accept the result channel")?
+            {
+                RingMessage::Accepted { job: accepted } if accepted == job => Ok(send),
+                other => bail!("result channel not accepted: got {}", other.kind()),
+            }
         }
-        // Like ring.rs, nothing more is read: the origin finishes its side after `accepted`.
-        Ok(Self::Origin { connection, send })
+        .await;
+        match opened {
+            // Like ring.rs, nothing more is read: the origin finishes its side after `accepted`.
+            Ok(send) => Ok(Self::Origin { connection, send }),
+            Err(error) => {
+                connection.close(SESSION_ABORTED, SESSION_FAILED_REASON);
+                Err(error)
+            }
+        }
     }
 
     /// Resolves only if the next worker ends its stream to us, which mid-session means the
@@ -1086,16 +1226,22 @@ impl Drop for RelayTask {
 }
 
 /// Copies the next worker's progress lines upstream until its stream ends cleanly. Anything
-/// but progress fails the relay. No timeout applies: the next worker is legitimately silent
-/// while the origin is.
-async fn relay_progress(mut recv: BufReader<RecvStream>, writer: Upstream) -> anyhow::Result<()> {
+/// but progress fails the relay, and so does a line not sent upstream within `write_timeout`.
+/// No read timeout applies: the next worker is legitimately silent while the origin is.
+async fn relay_progress(
+    mut recv: BufReader<RecvStream>,
+    writer: Upstream,
+    write_timeout: Duration,
+) -> anyhow::Result<()> {
     while let Some(message) = read_control(&mut recv).await? {
         ensure!(
             matches!(message, RingMessage::Progress(_)),
             "unexpected downstream {} line",
             message.kind()
         );
-        write_control(&mut *writer.lock().await, &message).await?;
+        write_upstream(deadline_in(write_timeout), &writer, &message)
+            .await
+            .context("failed to relay progress")?;
     }
     Ok(())
 }
@@ -1106,6 +1252,7 @@ struct Hop {
     info: RingStageInfo,
     writer: Upstream,
     downstream: Downstream,
+    timeouts: RingWriteTimeouts,
     step: u32,
     pos: u32,
 }
@@ -1194,23 +1341,26 @@ impl Hop {
         match &mut self.downstream {
             Downstream::Next { send, .. } => {
                 frame.payload_bytes = u64::try_from(hidden.len()).context("payload too large")?;
-                stats.activation_out += write_execute(send, &frame, hidden).await?;
+                let deadline = deadline_in(self.timeouts.execute);
+                stats.activation_out += write_execute_by(deadline, send, &frame, hidden).await?;
             }
             Downstream::Origin { send, .. } => {
-                let result = RingResult {
+                let result = RingMessage::Result(RingResult {
                     job: self.job.clone(),
                     reply,
                     chain_metrics: frame.metrics,
-                };
+                });
+                let deadline = deadline_in(self.timeouts.control_line);
                 stats.token_reply_bytes +=
-                    write_control(send, &RingMessage::Result(result)).await?;
+                    write_control_by(deadline, "the origin", send, &result).await?;
             }
         }
         Ok(())
     }
 
     async fn progress(&self, message: RingMessage) -> anyhow::Result<()> {
-        write_control(&mut *self.writer.lock().await, &message).await?;
+        let deadline = deadline_in(self.timeouts.control_line);
+        write_upstream(deadline, &self.writer, &message).await?;
         Ok(())
     }
 }

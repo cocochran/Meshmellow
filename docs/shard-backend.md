@@ -301,6 +301,11 @@ always 0). `read_us` includes every worker's compute time, so it is not a networ
 - No retries, rerouting or re-prefill: any error (a bad chain, a missing result channel, a
   worker failure) fails the job. A ring must become ready, including the terminal's result
   channel, within 300 s by default (`RingSettings::result_channel_wait`).
+- Every worker write to a peer has a deadline (`RingWriteTimeouts`): 240 s per control line
+  (`start`, `ready`, progress, the result-channel hello, results) and 360 s per execute frame
+  with its activations. A peer that stops reading fails the session like any other error: the
+  upstream stream is reset, the downstream or result connection is closed with code 1 ("ring
+  session failed"), the runner is killed and reaped, and the worker takes the next session.
 - Chat templates work as in pipeline mode: the leader renders the prompt for its local stage
   0. To match david-codex's ring demo, use the pinned official Qwen template with
   `enable_thinking: false` (see [Chat templates](#chat-templates)).
