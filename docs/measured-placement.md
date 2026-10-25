@@ -75,6 +75,10 @@ against refreshed inputs and rejects changed or expired profiles.
 The v1 shard backend currently accepts one remote prefix followed by a local
 final stage. M-27 must supply the production ring manifest and validation for
 arbitrary stage order and remote finals before this plan can drive that backend.
+The published Qwen3.8 ring summaries have fixed routes and scoped buffer and
+per-stage compute observations. They do not include fresh per-device usable
+capacity, total contribution peaks, or matching directed transfer costs for
+each candidate edge, so they cannot populate an eligible live profile yet.
 The run must then use the same model source, artifacts, runtime, context,
 batch, ranges, path and workload as the observations. Reserve capacity on each
 destination before starting, and collect trustworthy total contribution peaks
