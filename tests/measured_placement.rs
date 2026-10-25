@@ -105,6 +105,25 @@ fn chooses_peer_order_and_exact_ranges_with_ingress_cost() {
 }
 
 #[test]
+fn peers_without_eligible_ranges_do_not_count_against_search_limit() {
+    let mut input = request();
+    for index in 0..7 {
+        input.peers.push(peer(&format!("empty-{index}"), vec![]));
+    }
+    assert_eq!(input.peers.len(), 9);
+
+    let output = plan(&input).unwrap();
+    assert_eq!(
+        output
+            .assignments
+            .iter()
+            .map(|assignment| assignment.peer_id.as_str())
+            .collect::<Vec<_>>(),
+        ["b", "a"]
+    );
+}
+
+#[test]
 fn requires_fresh_matching_range_and_feedback_measurements() {
     let mut input = request();
     input.peers[1].ranges[0].measured_at_unix_ms = 1;
