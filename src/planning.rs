@@ -14,15 +14,32 @@ pub struct PlanningRequest {
     /// One discovered device for every candidate peer; order is immaterial.
     pub devices: Vec<RuntimeDevice>,
     pub model_path: String,
+    /// Objective for candidate selection; older profiles default to decode latency.
+    #[serde(default)]
+    pub objective: PlanningObjective,
     /// Require the final block group on this peer (for example, the local device).
     #[serde(default)]
     pub final_peer_id: Option<String>,
+}
+
+/// Optimization target requested from the planner.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanningObjective {
+    /// Minimize measured single-request decode time.
+    #[default]
+    SequentialDecodeLatency,
+    /// Maximize measured steady-state throughput across concurrent requests.
+    MultiRequestThroughput,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanningOutput {
     pub advisory: bool,
+    /// Objective used to score the selected placement.
+    #[serde(default)]
+    pub objective: PlanningObjective,
     pub placement: Placement,
     /// Pass as individual process arguments, not as a shell command.
     pub server_args: Vec<String>,
@@ -52,6 +69,11 @@ pub fn validate_output(
 ) -> Result<(), VerificationError> {
     use VerificationError::{IdentityMismatch, InvalidPlan};
     let placement = &output.placement;
+    if request.objective != PlanningObjective::SequentialDecodeLatency
+        || output.objective != request.objective
+    {
+        return Err(InvalidPlan);
+    }
     if placement.model_hash != request.model.model_hash
         || placement.runtime_id != request.model.runtime_id
         || placement.context_tokens != request.model.context_tokens
@@ -71,23 +93,24 @@ pub fn validate_output(
         return Err(InvalidPlan);
     }
     verification::validate_placement(placement, &request.peers, min_peers)?;
-    let mut previous: Option<(usize, &str)> = None;
+    let mut previous_peer: Option<&str> = None;
     for assignment in &placement.assignments {
-        let index = request
+        if !request
             .peers
             .iter()
-            .position(|p| p.id == assignment.peer_id)
-            .ok_or(InvalidPlan)?;
-        if let Some((last_index, last_id)) = previous
-            && (index <= last_index
-                || !request
-                    .links
-                    .iter()
-                    .any(|link| link.from == last_id && link.to == assignment.peer_id))
+            .any(|peer| peer.id == assignment.peer_id)
         {
             return Err(InvalidPlan);
         }
-        previous = Some((index, &assignment.peer_id));
+        if let Some(last_id) = previous_peer
+            && !request
+                .links
+                .iter()
+                .any(|link| link.from == last_id && link.to == assignment.peer_id)
+        {
+            return Err(InvalidPlan);
+        }
+        previous_peer = Some(&assignment.peer_id);
     }
     let mut devices = Vec::new();
     for assignment in &placement.assignments {
@@ -140,6 +163,12 @@ pub fn build_plan(
     request: &PlanningRequest,
     min_peers: usize,
 ) -> Result<PlanningOutput, PlanError> {
+    if request.objective == PlanningObjective::MultiRequestThroughput {
+        return Err(PlanError::InvalidInput(
+            "multi-request throughput needs concurrent execution and measured stage/link throughput"
+                .to_owned(),
+        ));
+    }
     let mut ids = HashSet::new();
     for device in &request.devices {
         if !ids.insert(&device.peer_id)
@@ -177,6 +206,7 @@ pub fn build_plan(
     let server_args = rpc_plan::server_args(&placement, &devices, &request.model_path)?;
     Ok(PlanningOutput {
         advisory: true,
+        objective: request.objective,
         placement,
         server_args,
         runtime_devices: devices,

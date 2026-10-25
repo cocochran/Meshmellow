@@ -74,7 +74,7 @@ ownership still requires runtime allocation evidence.
 Before starting child processes, use
 `planning::validate_output(&request, &output, min_peers)` to check the saved
 plan against current inputs without requiring runtime evidence. It validates
-eligibility, topology and allowed peer order as well as coverage, memory and
+eligibility, directed topology transitions as well as coverage, memory and
 launch mappings. `verify_output` performs the same preflight and then validates
 fresh evidence; do not fabricate telemetry to call it before inference.
 
@@ -97,8 +97,9 @@ This checks the fixture and prints the bridge mapping without starting services.
    batch/slot assumptions when measuring. This version assumes one slot; a
    recurrent/hybrid model needs its additional state included conservatively in
    reservations. Do not reuse a dense-model estimate for Qwen3.5 blindly.
-2. Supply `PeerProfile` for each candidate device, ordered by allowed stage
-   order. Set explicit authorization, current health, opt-in memory budget,
+2. Supply `PeerProfile` for each candidate device. Profile order has no effect
+   on selected topology. Set explicit authorization, current health, opt-in
+   memory budget,
    measured per-layer decode costs and conservative reserved bytes. Reserve
    embedding/output tensors, scratch, non-KV state and headroom wherever the
    backend may allocate them. Profiles must match model/runtime/context.
@@ -125,13 +126,21 @@ This checks the fixture and prints the bridge mapping without starting services.
    Review environment/default runtime options separately. Caller verifies model
    file hash and runtime ID before launching. No process is launched by this API.
 
-The DP minimizes predicted sequential decode time across the supplied order,
-subject to per-device estimated memory and minimum contributor count. It tracks
-the last device, completed layer prefix and contributor count (saturated at the
-minimum). It does not search permutations of devices or benchmark them itself.
-Intended for small hackathon clusters; worst-case transition work grows roughly
-with peers squared times layers squared times minimum contributors, plus plan
-copying. Integer overflow and malformed identities/profiles fail explicitly.
+The exact DP minimizes predicted sequential decode time while choosing both a
+directed peer order and contiguous layer ranges, subject to per-device memory
+budgets and the minimum contributor count. It tracks the selected peer subset,
+last peer and completed layer prefix. Missing directed links make transitions
+infeasible. To keep exact search bounded, at most eight eligible peers are
+accepted. Integer overflow and malformed identities/profiles fail explicitly.
+
+The current objective is sequential decode latency: measured per-layer decode
+times plus measured per-token transfer overhead for each selected directed link.
+The leader's job queue runs one generation at a time, so the current service and
+profiles do not support a multi-request-throughput objective. Set
+`"objective": "multi_request_throughput"` only to receive a validation error
+until a concurrent pipeline and workload-matched stage/link throughput
+measurements are available. The planner does not benchmark devices or links
+itself. The default is `"sequential_decode_latency"`.
 
 ## Runtime verification gate
 
