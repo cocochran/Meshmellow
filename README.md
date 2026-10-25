@@ -71,6 +71,9 @@ The leader can also run jobs on david-codex's shard runner (`leader --backend sh
 
 ## Browser client
 
+For opt-in step and stage timings while debugging a run, use `llm-cluster
+--debug ...`; see [runtime diagnostics](docs/runtime-diagnostics.md).
+
 When the leader is running, open `http://127.0.0.1:8080` for the built-in chat
 client. It streams replies from the leader and shows recent queued, running,
 completed, failed, and canceled jobs. The client is served by the leader itself;

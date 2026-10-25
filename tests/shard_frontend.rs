@@ -709,6 +709,42 @@ async fn pipeline_drives_three_stages_with_chunked_prefill() {
 }
 
 #[tokio::test]
+async fn step_timeout_identifies_the_read_phase() {
+    let model = fixture_model();
+    let runner = example_bin("fake_shard_runner");
+    let env = BTreeMap::from([("FAKE_SHARD_DELAY_AT_STEP_MS".into(), "200".into())]);
+    let launch = LocalLaunch {
+        runner: &runner,
+        model: &model,
+        begin: 0,
+        end: LAYERS,
+        context: CONTEXT,
+        gpu_layers: 0,
+        budget_bytes: BUDGET_BYTES,
+        prompt: "hi",
+        env: &env,
+    };
+    let link = StageLink::spawn_local(&launch, IO_TIMEOUT).await.unwrap();
+    let pipeline = Pipeline::new(vec![link], &expectations(&[(0, LAYERS)], false))
+        .unwrap()
+        .with_step_timeout(Duration::from_millis(50));
+    let error = pipeline
+        .generate(
+            GenerationLimits {
+                max_tokens: 1,
+                context: CONTEXT,
+            },
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("timed out reading step 0"),
+        "{error:#}"
+    );
+}
+
+#[tokio::test]
 async fn pipeline_stops_at_max_tokens_and_at_the_context_limit() {
     init_tracing();
     let whole = [(0, LAYERS)];

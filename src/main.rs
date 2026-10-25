@@ -68,6 +68,10 @@ const SECONDS_PER_MINUTE: u64 = 60;
     about = "Peer-to-peer mesh for splitting one LLM across devices"
 )]
 struct Cli {
+    /// Enable detailed MeshThing diagnostics on stderr (also works with RUST_LOG).
+    #[arg(long, global = true)]
+    debug: bool,
+
     /// File holding this node's secret key; created on first run.
     #[arg(long, global = true, default_value = "meshthing.key")]
     key: PathBuf,
@@ -106,6 +110,18 @@ enum Command {
         /// Require at least this many contributors.
         #[arg(long, default_value_t = 2)]
         min_peers: usize,
+    },
+    /// Search exact measured shard ranges and directed links; advisory JSON only.
+    MeasuredPlan {
+        /// Versioned JSON with fresh range, link and memory observations.
+        profile: PathBuf,
+    },
+    /// Recheck a saved measured plan against refreshed observations; no runtime verification.
+    ValidateMeasured {
+        /// JSON produced by `measured-plan`.
+        plan: PathBuf,
+        /// Versioned measured profile with current capacity and time.
+        profile: PathBuf,
     },
     /// Print this node's ID and accept control connections from peers.
     Listen,
@@ -389,8 +405,8 @@ enum HistoryCommand {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_logging();
     let cli = Cli::parse();
+    init_logging(cli.debug);
     match cli.command {
         Command::Mesh { state_dir } => llm_cluster::mesh::cli::run(state_dir).await,
         Command::Verify {
@@ -411,10 +427,39 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Plan { profile, min_peers } => {
             let input = std::fs::read_to_string(profile)?;
-            let request = serde_json::from_str(&input)?;
+            let request: llm_cluster::planning::PlanningRequest = serde_json::from_str(&input)?;
+            tracing::debug!(
+                peers = request.peers.len(),
+                links = request.links.len(),
+                min_peers,
+                "building placement plan"
+            );
             let output = llm_cluster::planning::build_plan(&request, min_peers)
                 .map_err(|error| anyhow::anyhow!("planning failed: {error:?}"))?;
+            tracing::debug!(
+                assignments = output.placement.assignments.len(),
+                predicted_decode_us = output.placement.predicted_decode_us,
+                "placement plan ready"
+            );
             println!("{}", serde_json::to_string_pretty(&output)?);
+            Ok(())
+        }
+        Command::MeasuredPlan { profile } => {
+            let request: llm_cluster::measured_placement::MeasuredRequest =
+                serde_json::from_str(&std::fs::read_to_string(profile)?)?;
+            let output = llm_cluster::measured_placement::plan(&request)
+                .map_err(|error| anyhow::anyhow!("measured planning failed: {error:?}"))?;
+            println!("{}", serde_json::to_string_pretty(&output)?);
+            Ok(())
+        }
+        Command::ValidateMeasured { plan, profile } => {
+            let request: llm_cluster::measured_placement::MeasuredRequest =
+                serde_json::from_str(&std::fs::read_to_string(profile)?)?;
+            let output: llm_cluster::measured_placement::MeasuredPlacement =
+                serde_json::from_str(&std::fs::read_to_string(plan)?)?;
+            llm_cluster::measured_placement::validate_output(&request, &output)
+                .map_err(|error| anyhow::anyhow!("measured plan validation failed: {error:?}"))?;
+            println!("{{\"validated\":true}}");
             Ok(())
         }
         Command::Listen => listen(&cli.key, &cli.cluster).await,
@@ -526,12 +571,18 @@ fn history(command: HistoryCommand) -> anyhow::Result<()> {
 }
 
 /// Sends logs to stderr so stdout carries only intentional CLI output such as the node ID.
-fn init_logging() {
-    let filter =
+fn init_logging(debug: bool) {
+    let mut filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
+    if debug {
+        filter = filter.add_directive("llm_cluster=debug".parse().expect("constant log directive"));
+    }
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        .with_thread_ids(debug)
+        .with_file(debug)
+        .with_line_number(debug)
         .init();
 }
 

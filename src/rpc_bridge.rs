@@ -499,7 +499,7 @@ fn abort_stream(send: &mut SendStream, recv: &mut RecvStream) {
 }
 
 /// Describes the connection's selected network path for logs: `direct`, `relay` or `custom`.
-fn path_kind(connection: &Connection) -> &'static str {
+pub(crate) fn path_kind(connection: &Connection) -> &'static str {
     let paths = connection.paths();
     let Some(selected) = paths.iter().find(|path| path.is_selected()) else {
         return "unknown";
