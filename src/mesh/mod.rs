@@ -145,6 +145,7 @@ pub struct Node {
     local_api: Arc<Mutex<Option<ApiEndpoint>>>,
     peer_apis: Arc<Mutex<BTreeMap<String, ApiEndpoint>>>,
     internet: bool,
+    artifact_seed: Arc<Mutex<Option<Arc<crate::artifact::Seed>>>>,
     membership_epoch: tokio::sync::watch::Sender<u64>,
     control_peers: crate::network::SharedPeerTable,
     control_tasks: Arc<Mutex<BTreeMap<String, tokio::task::JoinHandle<()>>>>,
@@ -156,7 +157,7 @@ impl Node {
     }
 
     #[cfg(test)]
-    async fn open_local(directory: impl AsRef<Path>) -> Result<Self> {
+    pub(crate) async fn open_local(directory: impl AsRef<Path>) -> Result<Self> {
         Self::open_with(directory.as_ref(), false).await
     }
 
@@ -198,7 +199,11 @@ impl Node {
         let endpoint = if internet {
             let builder = crate::network::endpoint_builder_with_key(
                 key.clone(),
-                vec![ALPN.to_vec(), crate::protocol::CONTROL_ALPN.to_vec()],
+                vec![
+                    ALPN.to_vec(),
+                    crate::protocol::CONTROL_ALPN.to_vec(),
+                    crate::artifact::transport::ALPN.to_vec(),
+                ],
             );
             // Internet integration tests deliberately have no IP transport, so
             // successful pairing cannot accidentally use loopback or the LAN.
@@ -208,7 +213,11 @@ impl Node {
         } else {
             Endpoint::builder(iroh::endpoint::presets::Minimal)
                 .secret_key(key.clone())
-                .alpns(vec![ALPN.to_vec(), crate::protocol::CONTROL_ALPN.to_vec()])
+                .alpns(vec![
+                    ALPN.to_vec(),
+                    crate::protocol::CONTROL_ALPN.to_vec(),
+                    crate::artifact::transport::ALPN.to_vec(),
+                ])
                 .bind()
                 .await?
         };
@@ -220,6 +229,7 @@ impl Node {
             peers: Default::default(),
             remote_pending: Default::default(),
             internet,
+            artifact_seed: Default::default(),
             local_api: Default::default(),
             peer_apis: Default::default(),
             membership_epoch: tokio::sync::watch::channel(0).0,
@@ -229,6 +239,28 @@ impl Node {
         node.serve();
         node.maintain_mesh();
         Ok(node)
+    }
+
+    /// Attach verified exports to this node; membership still gates every transfer.
+    pub async fn set_artifact_seed(&self, seed: Option<Arc<crate::artifact::Seed>>) {
+        *self.artifact_seed.lock().await = seed;
+    }
+
+    pub(crate) async fn artifact_connection(
+        &self,
+        peer: &Peer,
+    ) -> Result<(
+        iroh::endpoint::Connection,
+        tokio::sync::watch::Receiver<u64>,
+    )> {
+        let epoch = self.membership_epoch.subscribe();
+        self.control_hello(&peer.id).await?;
+        let connection = self
+            .endpoint
+            .connect(peer.addr()?, crate::artifact::transport::ALPN)
+            .await?;
+        self.control_hello(&peer.id).await?;
+        Ok((connection, epoch))
     }
 
     pub async fn set_api_endpoint(&self, api: Option<ApiEndpoint>) {
@@ -998,12 +1030,14 @@ impl Node {
         tokio::spawn(async move {
             // At most 63 member control links plus bounded enrollment/handshake work.
             let permits = Arc::new(Semaphore::new(96));
+            let artifact_permits = Arc::new(Semaphore::new(2));
             while let Some(incoming) = node.endpoint.accept().await {
                 let Ok(permit) = permits.clone().try_acquire_owned() else {
                     incoming.refuse();
                     continue;
                 };
                 let node = node.clone();
+                let artifact_permits = artifact_permits.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     let Ok(Ok(connection)) =
@@ -1012,6 +1046,26 @@ impl Node {
                         return;
                     };
                     let remote = connection.remote_id().to_string();
+                    if connection.alpn() == crate::artifact::transport::ALPN {
+                        let mut epoch = node.membership_epoch.subscribe();
+                        if node.control_hello(&remote).await.is_err() {
+                            connection.close(1u32.into(), b"membership required");
+                            return;
+                        }
+                        let Ok(_transfer_permit) = artifact_permits.try_acquire_owned() else {
+                            connection.close(1u32.into(), b"seed busy");
+                            return;
+                        };
+                        let Some(seed) = node.artifact_seed.lock().await.clone() else {
+                            connection.close(1u32.into(), b"no seed catalog");
+                            return;
+                        };
+                        tokio::select! {
+                            _ = epoch.changed() => {},
+                            _ = crate::artifact::transport::serve(&seed, connection) => {},
+                        }
+                        return;
+                    }
                     if connection.alpn() == crate::protocol::CONTROL_ALPN {
                         let mut epoch = node.membership_epoch.subscribe();
                         let Ok(hello) = node.control_hello(&remote).await else {
