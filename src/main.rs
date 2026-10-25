@@ -21,6 +21,7 @@ use llm_cluster::protocol::{CONTROL_ALPN, RPC_BRIDGE_ALPN};
 use llm_cluster::shard::serve::{ShardServeConfig, serve_shard};
 use llm_cluster::worker::{self, WorkerConfig};
 use llm_cluster::{api, rpc_bridge};
+use serde::Serialize;
 use tracing_subscriber::EnvFilter;
 
 /// Log filter used when `RUST_LOG` is unset.
@@ -104,13 +105,23 @@ enum Command {
         #[arg(long = "allow-peer", required = true)]
         allow_peers: Vec<String>,
     },
-    /// Leader side of the RPC bridge: expose a remote worker's RPC server on a local port.
+    /// Leader side of the RPC bridge: expose remote workers' RPC servers on local ports.
+    ///
+    /// Give either one worker (`NODE_ID [--listen ADDR]`) or several (`--worker NODE_ID=ADDR`,
+    /// repeated) to bridge them all from one process over one endpoint. Once every listener is
+    /// bound, prints one JSON line with the address each worker is reachable on:
+    /// `{"bridges":[{"worker":"<id>","listen":"127.0.0.1:50053"},...]}`. A listen port of 0
+    /// picks a free port, reported in that line.
     BridgeConnect {
         /// Node ID printed by the worker's `bridge-serve`.
-        node_id: String,
+        #[arg(required_unless_present = "workers", conflicts_with = "workers")]
+        node_id: Option<String>,
         /// Local address to accept RPC clients on.
-        #[arg(long, default_value = "127.0.0.1:50052")]
+        #[arg(long, default_value = "127.0.0.1:50052", conflicts_with = "workers")]
         listen: SocketAddr,
+        /// Worker to bridge, as `NODE_ID=ADDR` with a loopback ADDR; repeatable.
+        #[arg(long = "worker", value_name = "NODE_ID=ADDR", value_parser = parse_worker_mapping)]
+        workers: Vec<rpc_bridge::BridgeMapping>,
     },
     /// Serve one layer range of a model to leaders through a local shard runner.
     ShardServe {
@@ -374,7 +385,11 @@ async fn main() -> anyhow::Result<()> {
         Command::BridgeConnect {
             ref node_id,
             listen,
-        } => bridge_connect(&cli.key, node_id, listen).await,
+            ref workers,
+        } => {
+            let mappings = bridge_mappings(node_id.as_deref(), listen, workers)?;
+            bridge_connect(&cli.key, &mappings).await
+        }
         Command::ShardServe {
             runner,
             model,
@@ -548,11 +563,70 @@ fn parse_node_ids(ids: &[String]) -> anyhow::Result<Vec<iroh::EndpointId>> {
     ids.iter().map(|id| network::parse_node_id(id)).collect()
 }
 
-async fn bridge_connect(key: &Path, node_id: &str, listen: SocketAddr) -> anyhow::Result<()> {
-    let worker = network::parse_node_id(node_id)?;
+/// Parses `--worker NODE_ID=ADDR`. The loopback check happens when the listener is bound.
+fn parse_worker_mapping(text: &str) -> Result<rpc_bridge::BridgeMapping, String> {
+    let (id, addr) = text.split_once('=').ok_or_else(|| {
+        format!("invalid worker {text:?}: expected NODE_ID=ADDR, e.g. <node id>=127.0.0.1:50053")
+    })?;
+    let worker = network::parse_node_id(id.trim())
+        .map_err(|error| format!("invalid worker {text:?}: bad node ID: {error:#}"))?;
+    let listen = addr.trim().parse().map_err(|error| {
+        format!("invalid worker {text:?}: bad listen address {addr:?}: {error}")
+    })?;
+    Ok(rpc_bridge::BridgeMapping { worker, listen })
+}
+
+/// The bridges `bridge-connect` should run: the single positional worker on `listen`, or every
+/// `--worker` mapping. Clap guarantees exactly one form was given.
+fn bridge_mappings(
+    node_id: Option<&str>,
+    listen: SocketAddr,
+    workers: &[rpc_bridge::BridgeMapping],
+) -> anyhow::Result<Vec<rpc_bridge::BridgeMapping>> {
+    match node_id {
+        Some(node_id) => Ok(vec![rpc_bridge::BridgeMapping {
+            worker: network::parse_node_id(node_id)?,
+            listen,
+        }]),
+        None => Ok(workers.to_vec()),
+    }
+}
+
+async fn bridge_connect(key: &Path, mappings: &[rpc_bridge::BridgeMapping]) -> anyhow::Result<()> {
     let endpoint = network::bind_endpoint(key, vec![RPC_BRIDGE_ALPN.to_vec()]).await?;
-    let lead = rpc_bridge::run_leader(endpoint.clone(), worker, listen);
+    let lead = async {
+        let bridges = rpc_bridge::LeaderBridges::bind(endpoint.clone(), mappings).await?;
+        println!("{}", bridges_report(&bridges.addrs())?);
+        bridges.serve().await
+    };
     run_until_ctrl_c(&endpoint, lead).await
+}
+
+/// The line `bridge-connect` prints once bound: `{"bridges":[{"worker":..,"listen":..},..]}`.
+#[derive(Serialize)]
+struct BridgesReport {
+    bridges: Vec<BridgeReport>,
+}
+
+/// One worker in [`BridgesReport`], fields in the documented order.
+#[derive(Serialize)]
+struct BridgeReport {
+    worker: String,
+    listen: String,
+}
+
+/// Renders the bound mapping as the single JSON line placement scripts read.
+fn bridges_report(bound: &[rpc_bridge::BridgeMapping]) -> anyhow::Result<String> {
+    let report = BridgesReport {
+        bridges: bound
+            .iter()
+            .map(|bridge| BridgeReport {
+                worker: bridge.worker.to_string(),
+                listen: bridge.listen.to_string(),
+            })
+            .collect(),
+    };
+    serde_json::to_string(&report).context("failed to render the bridge mapping")
 }
 
 /// Runs `task` until it finishes or Ctrl-C arrives, then closes `endpoint` so peers see a clean shutdown.
@@ -694,6 +768,128 @@ mod tests {
             panic!("expected bridge-serve, got {:?}", cli.command);
         };
         assert_eq!(allow_peers, ["a", "b"]);
+    }
+
+    fn parse_bridge_connect(args: &[&str]) -> Result<Command, clap::Error> {
+        let prefix = ["meshthing", "bridge-connect"];
+        Cli::try_parse_from(prefix.iter().chain(args)).map(|cli| cli.command)
+    }
+
+    fn node_id() -> String {
+        iroh::SecretKey::generate().public().to_string()
+    }
+
+    #[test]
+    fn bridge_connect_single_worker_form_is_unchanged() {
+        let id = node_id();
+        let default = parse_bridge_connect(&[&id]).expect("positional node id");
+        let Command::BridgeConnect {
+            node_id,
+            listen,
+            workers,
+        } = default
+        else {
+            panic!("expected bridge-connect, got {default:?}");
+        };
+        assert_eq!(node_id.as_deref(), Some(id.as_str()));
+        assert_eq!(listen, "127.0.0.1:50052".parse().expect("addr"));
+        assert!(workers.is_empty());
+
+        let custom = parse_bridge_connect(&[&id, "--listen", "127.0.0.1:50053"])
+            .expect("positional node id with --listen");
+        let Command::BridgeConnect { listen, .. } = custom else {
+            panic!("expected bridge-connect, got {custom:?}");
+        };
+        assert_eq!(listen, "127.0.0.1:50053".parse().expect("addr"));
+    }
+
+    #[test]
+    fn bridge_connect_collects_repeated_workers_in_order() {
+        let (first, second) = (node_id(), node_id());
+        let command = parse_bridge_connect(&[
+            "--worker",
+            &format!("{first}=127.0.0.1:50053"),
+            "--worker",
+            &format!("{second}=127.0.0.1:0"),
+        ])
+        .expect("repeated --worker");
+        let Command::BridgeConnect {
+            node_id, workers, ..
+        } = command
+        else {
+            panic!("expected bridge-connect, got {command:?}");
+        };
+        assert_eq!(node_id, None);
+        let parsed: Vec<(String, String)> = workers
+            .iter()
+            .map(|mapping| (mapping.worker.to_string(), mapping.listen.to_string()))
+            .collect();
+        assert_eq!(
+            parsed,
+            [
+                (first, "127.0.0.1:50053".to_owned()),
+                (second, "127.0.0.1:0".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn bridge_connect_requires_exactly_one_form() {
+        let id = node_id();
+        let worker = format!("{}=127.0.0.1:50053", node_id());
+        let refused: [&[&str]; 3] = [
+            &[],
+            &[&id, "--worker", &worker],
+            &["--listen", "127.0.0.1:50053", "--worker", &worker],
+        ];
+        for args in refused {
+            assert!(
+                parse_bridge_connect(args).is_err(),
+                "bridge-connect {args:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_mapping_errors_name_the_problem() {
+        let id = node_id();
+        let cases = [
+            ("127.0.0.1:50053".to_owned(), "expected NODE_ID=ADDR"),
+            ("nonsense=127.0.0.1:50053".to_owned(), "bad node ID"),
+            (format!("{id}=localhost"), "bad listen address"),
+        ];
+        for (text, expected) in cases {
+            let error = parse_worker_mapping(&text).expect_err("invalid mapping");
+            assert!(error.contains(expected), "{text:?}: {error}");
+            assert!(error.contains(&format!("{text:?}")), "{text:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn bridges_report_lists_each_worker_with_its_address_in_order() {
+        let (first, second) = (
+            iroh::SecretKey::generate().public(),
+            iroh::SecretKey::generate().public(),
+        );
+        let bound = [
+            rpc_bridge::BridgeMapping {
+                worker: first,
+                listen: "127.0.0.1:50053".parse().expect("addr"),
+            },
+            rpc_bridge::BridgeMapping {
+                worker: second,
+                listen: "[::1]:50054".parse().expect("addr"),
+            },
+        ];
+
+        let report = bridges_report(&bound).expect("report");
+
+        assert_eq!(
+            report,
+            format!(
+                r#"{{"bridges":[{{"worker":"{first}","listen":"127.0.0.1:50053"}},{{"worker":"{second}","listen":"[::1]:50054"}}]}}"#
+            )
+        );
     }
 
     /// `shard-serve` over `range` with its other required flags (except `--allow-peer`) plus

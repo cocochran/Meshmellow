@@ -52,7 +52,7 @@ use crate::network::{self, SharedPeerTable};
 use crate::node::PeerTable;
 use crate::process::{self, ChildSpec, Readiness, RestartPolicy, Supervised};
 use crate::protocol::CONTROL_ALPN;
-use crate::rpc_bridge;
+use crate::rpc_bridge::{BridgeMapping, LeaderBridges};
 use crate::shard::frontend::{FrontendConfig, serve_frontend};
 use crate::shard::manifest::ShardManifest;
 
@@ -113,10 +113,7 @@ const SHARD_FRONTEND_READY_TIMEOUT: Duration = Duration::from_secs(300);
 /// How often the worker wait re-checks the peer table.
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// How long a freshly spawned RPC bridge may take to start listening.
-const BRIDGE_READY_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// How often to check whether an RPC bridge or the shard front end listens yet.
+/// How often to check whether the shard front end listens yet.
 const LISTEN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// How long the job API (or the shard front end) may take to finish in-flight requests at
@@ -612,29 +609,28 @@ fn join_ids(ids: &[EndpointId]) -> String {
         .join(", ")
 }
 
-/// Spawns one bridge per worker on the shared endpoint and waits until each one listens, so
-/// `llama-server` finds every RPC port open when it starts.
+/// Binds one bridge per worker on the shared endpoint, then serves them all in the background.
+/// Every listener is bound before this returns, so `llama-server` finds every RPC port open
+/// when it starts. A plan without remote workers needs no bridges.
 async fn start_bridges(
     endpoint: &Endpoint,
     workers: &[RemoteWorker],
 ) -> anyhow::Result<JoinSet<anyhow::Result<()>>> {
     let mut bridges = JoinSet::new();
-    for worker in workers {
-        bridges.spawn(rpc_bridge::run_leader(
-            endpoint.clone(),
-            worker.id,
-            worker.rpc_endpoint,
-        ));
+    if workers.is_empty() {
+        return Ok(bridges);
     }
-    for worker in workers {
-        wait_until_listening(
-            &mut bridges,
-            RPC_BRIDGE_NAME,
-            worker.rpc_endpoint,
-            BRIDGE_READY_TIMEOUT,
-        )
-        .await?;
-    }
+    let mappings: Vec<BridgeMapping> = workers
+        .iter()
+        .map(|worker| BridgeMapping {
+            worker: worker.id,
+            listen: worker.rpc_endpoint,
+        })
+        .collect();
+    let bound = LeaderBridges::bind(endpoint.clone(), &mappings)
+        .await
+        .with_context(|| format!("{RPC_BRIDGE_NAME} failed to start"))?;
+    bridges.spawn(bound.serve());
     Ok(bridges)
 }
 
