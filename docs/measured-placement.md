@@ -90,3 +90,34 @@ The proposed bounded profiling lifecycle, cancellation contract, admission
 requirements, and ownership boundaries are documented in
 [runtime profiling](runtime-profiling.md). That contract does not imply a
 candidate-range executor or remote reservation is implemented.
+
+## Version 2 evidence contract (proposal)
+
+Version 1 remains advisory and is not complete profiler evidence. The next
+input version should keep three independently refreshed inputs separate:
+
+- **Reusable range evidence:** profile ID and schema version; model source and
+  exported-artifact hashes; backend, runtime, build and configuration identity;
+  exact `[begin,end)`; fixture ID/hash and correctness result; prefill and
+  decode timings with token counts; context occupancy/limit, batch and sequence
+  count; scoped peak memory for load and inference by `ram`, `vram`, and
+  `shared`; measurement sample count and local monotonic durations; and thermal
+  and power state. Failed, canceled, or incomplete trials retain their outcome
+  and cannot be promoted to successful observations by retry.
+- **Current peer availability:** authorized/healthy state, owner-approved
+  per-pool budget, fresh usable capacity and existing reservations. These
+  values are not reusable range-profile evidence and must be refreshed for
+  each placement decision.
+- **Directed transfer evidence:** source/destination, transport and protocol,
+  actual direct/relay path, exact payload size, workload identity, sample
+  distribution (including tail), profile ID and freshness. Do not infer an
+  edge from RTT, a whole-ring residual, or another payload/path.
+
+The planner should return advisory assignments, ordered profile IDs, predicted
+prefill/decode costs and the objective used. It must keep whole-range costs
+intact and keep current availability and links separate from reusable compute
+evidence. M-27 adds a backend constraint: stage 0 is the leader-local range
+starting at layer 0, followed by one or more contiguous remote ring stages.
+The current v1 search does not enforce that constraint, so its output must not
+be translated directly into an M-27 manifest. A versioned planner/manifest
+adapter must reject plans that violate stage ownership and readiness rules.
