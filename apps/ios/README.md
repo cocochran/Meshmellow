@@ -95,3 +95,18 @@ capture. NSCameraUsageDescription is included in the installed bundle.
 Trusted device details show reported OpenAI API URLs, copy controls and inference
 readiness. Loopback URLs belong to the named device. Mobile membership currently
 has no HTTP inference listener and reports that explicitly.
+
+## Background limits
+
+iOS/iPadOS membership currently follows the visible app lifecycle. It is not an
+always-on peer after the OS suspends the application. Do not use silent audio,
+location or unrelated background modes to keep a mesh endpoint alive.
+
+On iOS/iPadOS 26+, Apple's BGContinuedProcessingTask can continue a **finite,
+user-started job** after the app enters the background. It requires progress,
+completion and expiration/cancellation handling; it is not an indefinite peer
+listener. Once managed native inference exists, a bounded generation/profiling
+job can use that mechanism and release its resources when canceled or expired.
+No task is registered here while there is no such executor to run.
+
+[Apple: performing long-running tasks](https://developer.apple.com/documentation/BackgroundTasks/performing-long-running-tasks-on-ios-and-ipados)

@@ -33,8 +33,6 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
-import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.withContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -75,16 +73,16 @@ private val Canvas: Color @Composable get() = MaterialTheme.colorScheme.backgrou
 private fun bytes(value: Double?) = value?.let { "%.1f GiB".format(it / 1_073_741_824) } ?: "Not reported"
 
 class MainActivity : ComponentActivity() {
+    private val runtime get() = (application as LayercakeApplication).meshRuntime
+    override fun onStart() { super.onStart(); runtime.visible(this, true) }
+    override fun onStop() { runtime.visible(this, false); super.onStop() }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val store = ViewModelProvider(this)[MeshStore::class.java]
         setContent { LayercakeTheme { MeshApp(store) } }
         lifecycleScope.launch {
-            repeatOnLifecycle(Lifecycle.State.RESUMED) {
-                try {
-                    store.enrollment.start()
-                    while (isActive) { store.enrollment.refresh(); store.refresh(); delay(3000) }
-                } finally { withContext(NonCancellable) { store.enrollment.stop() } }
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                while (isActive) { store.refresh(); delay(3000) }
             }
         }
     }
@@ -143,6 +141,7 @@ class MainActivity : ComponentActivity() {
             if (store.enrollment.state?.meshName == null && store.enrollment.state?.joiningName == null) OutlinedButton(onClick = { pair(true) }) { Text("Join / scan QR") }
         }
     }
+    BackgroundMeshCard(store.runtime)
     MembershipSummary(store.enrollment)
     InfoCard("One shared model", "Your trusted devices form the mesh. Model execution is still being connected.")
     if (store.snapshot?.devices?.isNotEmpty() == true) {
@@ -220,10 +219,11 @@ class MainActivity : ComponentActivity() {
     var endpoint by rememberSaveable { mutableStateOf(store.endpoint) }
     var notice by rememberSaveable { mutableStateOf("") }
     val scope = rememberCoroutineScope()
+    BackgroundMeshCard(store.runtime)
     Text("Dashboard connection", style = MaterialTheme.typography.titleLarge)
     OutlinedTextField(value = endpoint, onValueChange = { endpoint = it }, label = { Text("Dashboard address") }, placeholder = { Text("https://dashboard.example") }, singleLine = true, modifier = Modifier.fillMaxWidth())
     Button(onClick = { try { store.saveEndpoint(endpoint); notice = "Connection saved."; scope.launch { store.refresh() } } catch (e: Exception) { notice = e.message.orEmpty() } }) { Text("Save connection") }
     if (notice.isNotEmpty()) Text(notice)
     Text("Use the web dashboard address, not the raw core port. Reads /api/mesh. Leave empty to disconnect. Development uses http://127.0.0.1:3210 after an adb port forward.")
-    InfoCard("Private by default", "Polling pauses in the background. No prompt history is stored. Dashboard access does not join a mesh; membership is managed on the Mesh tab. Compute integration is still pending.")
+    InfoCard("Private by default", "Dashboard polling pauses in the background. Keep mesh active controls the separate peer connection. No prompt history is stored. Dashboard access does not join a mesh; membership is managed on the Mesh tab. Compute integration is still pending.")
 }
