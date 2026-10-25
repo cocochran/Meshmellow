@@ -121,6 +121,9 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Longest error body from the upstream quoted in a probe failure.
 const PROBE_ERROR_BODY_CHARS: usize = 512;
 
+/// Maximum bytes read while constructing a probe error message; UTF-8 needs at most four per char.
+const PROBE_ERROR_BODY_BYTES: usize = PROBE_ERROR_BODY_CHARS * 4;
+
 /// Delay before the shard backend's first probe retry; it doubles after every failed attempt.
 const PROBE_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 
@@ -891,8 +894,32 @@ async fn probe_generation(upstream: SocketAddr, server: &str) -> anyhow::Result<
         .with_context(|| format!("readiness probe: request to {server} failed"))?;
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        let body: String = body.chars().take(PROBE_ERROR_BODY_CHARS).collect();
+        let mut response = response;
+        let mut bytes = Vec::with_capacity(PROBE_ERROR_BODY_BYTES);
+        let mut truncated = response
+            .content_length()
+            .is_some_and(|length| length > PROBE_ERROR_BODY_BYTES as u64);
+        while bytes.len() < PROBE_ERROR_BODY_BYTES {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    let remaining = PROBE_ERROR_BODY_BYTES - bytes.len();
+                    let copied = remaining.min(chunk.len());
+                    bytes.extend_from_slice(&chunk[..copied]);
+                    if copied < chunk.len() || bytes.len() == PROBE_ERROR_BODY_BYTES {
+                        truncated = true;
+                        break;
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        let mut body: String = String::from_utf8_lossy(&bytes)
+            .chars()
+            .take(PROBE_ERROR_BODY_CHARS)
+            .collect();
+        if truncated {
+            body.push('…');
+        }
         bail!("readiness probe: {server} answered {status}: {body}");
     }
     let reply: Value = response

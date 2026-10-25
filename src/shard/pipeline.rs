@@ -18,6 +18,8 @@
 //! The same decoding loop, stop rules and UTF-8 assembly apply.
 
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::marker::PhantomData;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -25,8 +27,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail, ensure};
 use iroh::endpoint::{Connection, VarInt};
 use iroh::{Endpoint, EndpointId};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 use tokio::process::Command;
+use tokio::sync::oneshot;
 use tokio::time::{timeout, timeout_at};
 use tracing::{debug, info, warn};
 
@@ -55,6 +60,9 @@ const CHILD_EXIT_GRACE: Duration = Duration::from_secs(5);
 
 /// `tracing` target for lines a local runner writes to stderr.
 const RUNNER_LOG_TARGET: &str = "shard_runner";
+
+/// Maximum runner stderr buffered for one tracing event; longer lines are split into chunks.
+const MAX_RUNNER_LOG_LINE_BYTES: u64 = 8 * 1024;
 
 /// Application close code for a remote stage connection the generation is done with.
 const CONNECTION_DONE: VarInt = VarInt::from_u32(0);
@@ -88,7 +96,7 @@ pub struct LocalLaunch<'a> {
 /// What keeps a link's process or stream alive.
 enum LinkGuard {
     /// A local runner, killed when dropped.
-    Process(Child),
+    Process(Box<Child>),
     /// The Iroh connection carrying a remote stage's stream.
     Stream(Connection),
 }
@@ -136,7 +144,7 @@ impl StageLink {
             reader: Box::new(reader),
             writer: Box::new(stdin),
             metadata,
-            guard: LinkGuard::Process(child),
+            guard: LinkGuard::Process(Box::new(child)),
             label,
         })
     }
@@ -253,7 +261,7 @@ impl StageLink {
         let _ = writer.shutdown().await;
         drop(writer);
         match guard {
-            LinkGuard::Process(child) => stop_child(child, &label, kill).await,
+            LinkGuard::Process(child) => stop_child(*child, &label, kill).await,
             LinkGuard::Stream(connection) => {
                 connection.close(CONNECTION_DONE, CONNECTION_DONE_REASON);
             }
@@ -339,6 +347,11 @@ pub struct PromptTooLong {
     /// The context window.
     pub context: u32,
 }
+
+/// Cooperative request cancellation caused by a disconnected HTTP client.
+#[derive(Debug, thiserror::Error)]
+#[error("generation canceled because the HTTP client disconnected")]
+pub(crate) struct GenerationCancelled;
 
 /// Validated stage links, ready for one generation.
 pub struct Pipeline {
@@ -436,30 +449,78 @@ impl Pipeline {
         Ok(())
     }
 
-    /// Runs greedy decoding to completion, calling `on_text` with each new piece of complete
-    /// UTF-8 text as it is produced, then closes every link. On any error the links are killed
-    /// and the error is returned; nothing is retried.
-    pub async fn generate<F: FnMut(&str)>(
-        mut self,
-        limits: GenerationLimits,
-        on_text: F,
-    ) -> anyhow::Result<Generation> {
-        let result = self.run(limits, on_text).await;
-        let kill = result.is_err();
+    /// Closes every stage and ring link held by this pipeline.
+    pub async fn close(self, kill: bool) {
         if let Some(ring) = self.ring {
             ring.close(!kill).await;
         }
         for link in self.links {
             link.close(kill).await;
         }
+    }
+
+    /// Runs greedy decoding to completion, calling `on_text` with each new piece of complete
+    /// UTF-8 text as it is produced, then closes every link. On any error the links are killed
+    /// and the error is returned; nothing is retried.
+    pub async fn generate<F: FnMut(&str)>(
+        self,
+        limits: GenerationLimits,
+        mut on_text: F,
+    ) -> anyhow::Result<Generation> {
+        self.generate_inner(limits, None, move |text| {
+            on_text(&text);
+            std::future::ready(())
+        })
+        .await
+    }
+
+    /// Runs generation with async text delivery and cooperative cancellation. The pipeline
+    /// closes remote streams and local runners before returning after a client disconnect.
+    pub async fn generate_cancellable<F, Fut>(
+        self,
+        limits: GenerationLimits,
+        cancel: oneshot::Receiver<()>,
+        on_text: F,
+    ) -> anyhow::Result<Generation>
+    where
+        F: FnMut(String) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        self.generate_inner(limits, Some(cancel), on_text).await
+    }
+
+    async fn generate_inner<F, Fut>(
+        mut self,
+        limits: GenerationLimits,
+        cancel: Option<oneshot::Receiver<()>>,
+        on_text: F,
+    ) -> anyhow::Result<Generation>
+    where
+        F: FnMut(String) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let result = match cancel {
+            Some(mut cancel) => tokio::select! {
+                biased;
+                _ = &mut cancel => Err(GenerationCancelled.into()),
+                result = self.run_async(limits, on_text) => result,
+            },
+            None => self.run_async(limits, on_text).await,
+        };
+        let kill = result.is_err();
+        self.close(kill).await;
         result
     }
 
-    async fn run<F: FnMut(&str)>(
+    async fn run_async<F, Fut>(
         &mut self,
         limits: GenerationLimits,
         on_text: F,
-    ) -> anyhow::Result<Generation> {
+    ) -> anyhow::Result<Generation>
+    where
+        F: FnMut(String) -> Fut,
+        Fut: Future<Output = ()>,
+    {
         ensure!(limits.max_tokens >= 1, "max_tokens must be at least 1");
         self.ensure_prompt_fits(limits.context)?;
         let mut decoder = Decoder::default();
@@ -468,13 +529,14 @@ impl Pipeline {
             assembler: Utf8Assembler::default(),
             text: String::new(),
             on_text,
+            _future: PhantomData,
         };
         let finish = loop {
             if reply.eog {
                 break FinishReason::Stop;
             }
             let token = self.sampled_token(&reply)?;
-            text.push(&reply.piece_bytes()?);
+            text.push(&reply.piece_bytes()?).await;
             decoder.completion_tokens += 1;
             if decoder.completion_tokens >= limits.max_tokens || decoder.position >= limits.context
             {
@@ -483,7 +545,7 @@ impl Pipeline {
             reply = self.step(&mut decoder, &[token]).await?;
         };
         Ok(Generation {
-            text: text.finish(),
+            text: text.finish().await,
             finish,
             prompt_tokens: self.prompt_tokens(),
             completion_tokens: decoder.completion_tokens,
@@ -595,29 +657,34 @@ impl Decoder {
 }
 
 /// Collects the completion and hands each newly completed piece of text to the caller.
-struct TextSink<F> {
+struct TextSink<F, Fut> {
     assembler: Utf8Assembler,
     text: String,
     on_text: F,
+    _future: PhantomData<Fut>,
 }
 
-impl<F: FnMut(&str)> TextSink<F> {
-    fn push(&mut self, piece: &[u8]) {
+impl<F, Fut> TextSink<F, Fut>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    async fn push(&mut self, piece: &[u8]) {
         let fresh = self.assembler.push(piece);
-        self.deliver(&fresh);
+        self.deliver(fresh).await;
     }
 
     /// Flushes any incomplete trailing bytes and returns the whole completion.
-    fn finish(mut self) -> String {
+    async fn finish(mut self) -> String {
         let rest = std::mem::take(&mut self.assembler).finish();
-        self.deliver(&rest);
+        self.deliver(rest).await;
         self.text
     }
 
-    fn deliver(&mut self, fresh: &str) {
+    async fn deliver(&mut self, fresh: String) {
         if !fresh.is_empty() {
-            (self.on_text)(fresh);
-            self.text.push_str(fresh);
+            (self.on_text)(fresh.clone()).await;
+            self.text.push_str(&fresh);
         }
     }
 }
@@ -762,11 +829,17 @@ async fn forward_stderr(label: String, stderr: impl AsyncRead + Unpin) {
     let mut line = Vec::new();
     loop {
         line.clear();
-        match lines.read_until(b'\n', &mut line).await {
+        match (&mut lines)
+            .take(MAX_RUNNER_LOG_LINE_BYTES)
+            .read_until(b'\n', &mut line)
+            .await
+        {
             Ok(0) => return,
             Ok(_) => {
+                let truncated =
+                    line.last() != Some(&b'\n') && line.len() as u64 == MAX_RUNNER_LOG_LINE_BYTES;
                 let text = String::from_utf8_lossy(line.trim_ascii_end());
-                info!(target: RUNNER_LOG_TARGET, stage = %label, "{text}");
+                info!(target: RUNNER_LOG_TARGET, stage = %label, truncated, "{text}");
             }
             Err(error) => {
                 warn!(target: RUNNER_LOG_TARGET, stage = %label, %error, "failed to read runner stderr");

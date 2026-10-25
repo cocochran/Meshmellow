@@ -7,10 +7,10 @@
 use std::net::SocketAddr;
 use std::path::Path;
 
-use anyhow::{Context, anyhow, bail, ensure};
+use anyhow::{Context, anyhow, ensure};
 use iroh::EndpointId;
-use serde::de::DeserializeOwned;
 
+use crate::config::read_json_file;
 use crate::network;
 use crate::planning::{self, PlanningOutput, PlanningRequest};
 
@@ -46,8 +46,8 @@ impl LaunchPlan {
     /// Reads the plan and profile JSON files (errors name the file), then validates them with
     /// [`Self::from_parts`].
     pub fn load(plan_path: &Path, profile_path: &Path, min_peers: usize) -> anyhow::Result<Self> {
-        let plan = read_json(plan_path, "plan")?;
-        let profile = read_json(profile_path, "profile")?;
+        let plan = read_json_file(plan_path, "plan")?;
+        let profile = read_json_file(profile_path, "profile")?;
         Self::from_parts(plan, profile, min_peers)
     }
 
@@ -97,15 +97,6 @@ fn remote_workers(plan: &PlanningOutput) -> anyhow::Result<Vec<RemoteWorker>> {
             Ok(RemoteWorker { id, rpc_endpoint })
         })
         .collect()
-}
-
-fn read_json<T: DeserializeOwned>(path: &Path, what: &str) -> anyhow::Result<T> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read {what} {}", path.display()))?;
-    match serde_json::from_str(&text) {
-        Ok(value) => Ok(value),
-        Err(error) => bail!("invalid {what} JSON in {}: {error}", path.display()),
-    }
 }
 
 #[cfg(test)]
@@ -188,7 +179,7 @@ mod tests {
         std::fs::write(&garbage, "{not json").unwrap();
 
         let unread = LaunchPlan::load(&missing, &garbage, DEFAULT_MIN_PEERS).unwrap_err();
-        let invalid = read_json::<PlanningRequest>(&garbage, "profile").unwrap_err();
+        let invalid = read_json_file::<PlanningRequest>(&garbage, "profile").unwrap_err();
 
         assert!(unread.to_string().contains("missing.json"), "{unread}");
         assert!(invalid.to_string().contains("garbage.json"), "{invalid}");

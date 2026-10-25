@@ -154,12 +154,12 @@ fn fresh(time: u64, request: &MeasuredRequest) -> bool {
 }
 
 fn link<'a>(
-    links: &'a HashMap<(String, String, u64), &'a LinkObservation>,
+    links: &HashMap<(&'a str, &'a str, u64), &'a LinkObservation>,
     from: &str,
     to: &str,
     payload: u64,
 ) -> Option<&'a LinkObservation> {
-    links.get(&(from.into(), to.into(), payload)).copied()
+    links.get(&(from, to, payload)).copied()
 }
 
 /// Exact subset search over measured contiguous ranges and directed links.
@@ -244,7 +244,9 @@ fn plan_with_topology(
     }
     let mut ranges = Vec::new();
     for peer in &active {
-        let mut observed = HashMap::new();
+        let mut seen = HashSet::new();
+        let mut by_begin: HashMap<usize, Vec<(usize, &RangeObservation, MemoryBytes)>> =
+            HashMap::new();
         for range in &peer.ranges {
             if range.workload != request.workload || !fresh(range.measured_at_unix_ms, request) {
                 continue;
@@ -256,23 +258,27 @@ fn plan_with_topology(
             if !charged.fits(&peer.budget_bytes) || !charged.fits(&peer.available_bytes) {
                 continue;
             }
-            if observed
-                .insert((range.begin, range.end), (range, charged))
-                .is_some()
-            {
+            if !seen.insert((range.begin, range.end)) {
                 return Err(invalid("duplicate eligible range observation"));
             }
+            by_begin
+                .entry(range.begin)
+                .or_default()
+                .push((range.end, range, charged));
         }
-        ranges.push(observed);
+        for alternatives in by_begin.values_mut() {
+            alternatives.sort_by_key(|(end, _, _)| *end);
+        }
+        ranges.push(by_begin);
     }
-    let mut links = HashMap::new();
+    let mut links: HashMap<(&str, &str, u64), &LinkObservation> = HashMap::new();
     for edge in &request.links {
         if edge.workload != request.workload || !fresh(edge.measured_at_unix_ms, request) {
             continue;
         }
         if links
             .insert(
-                (edge.from.clone(), edge.to.clone(), edge.payload_bytes),
+                (edge.from.as_str(), edge.to.as_str(), edge.payload_bytes),
                 edge,
             )
             .is_some()
@@ -311,14 +317,14 @@ fn plan_with_topology(
                 cost,
                 assignments: vec![MeasuredAssignment {
                     peer_id: peer.id.clone(),
-                    layers: begin..end,
+                    layers: 0..*end,
                     range_profile_id: range.profile_id.clone(),
                     charged_bytes: charged.clone(),
                     decode_us: range.decode_us,
                 }],
                 links: ingress.map_or_else(Vec::new, |edge| vec![edge.profile_id.clone()]),
             };
-            insert_cheaper(&mut states, (1 << index, index, end), candidate);
+            insert_cheaper(&mut states, (1 << index, index, *end), candidate);
         }
     }
     let subset_limit = 1usize << active.len();
@@ -340,10 +346,10 @@ fn plan_with_topology(
                     ) else {
                         continue;
                     };
-                    for (&(begin, finish), (range, charged)) in &ranges[next] {
-                        if begin != end {
-                            continue;
-                        }
+                    let Some(extensions) = ranges[next].get(&end) else {
+                        continue;
+                    };
+                    for (finish, range, charged) in extensions {
                         let cost = previous
                             .cost
                             .checked_add(edge.transfer_us)
@@ -354,12 +360,12 @@ fn plan_with_topology(
                         candidate.links.push(edge.profile_id.clone());
                         candidate.assignments.push(MeasuredAssignment {
                             peer_id: peer.id.clone(),
-                            layers: begin..finish,
+                            layers: end..*finish,
                             range_profile_id: range.profile_id.clone(),
                             charged_bytes: charged.clone(),
                             decode_us: range.decode_us,
                         });
-                        insert_cheaper(&mut states, (mask | (1 << next), next, finish), candidate);
+                        insert_cheaper(&mut states, (mask | (1 << next), next, *finish), candidate);
                     }
                 }
             }

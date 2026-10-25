@@ -26,10 +26,10 @@ use iroh::endpoint::{Connection, Incoming, RecvStream, SendStream, VarInt};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStderr, ChildStdin, Command};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::task::{JoinError, JoinSet};
 use tokio::time::timeout;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::admission::AdmittedChild as Child;
 
@@ -65,6 +65,9 @@ const COPY_BUFFER_LEN: usize = 64 * 1024;
 
 /// Longest stderr chunk logged as one line; longer lines are split.
 const MAX_STDERR_LINE: u64 = 8 * 1024;
+
+/// Maximum incoming connections, including those queued behind the one-session runner lock.
+const MAX_SHARD_CONNECTIONS: usize = 128;
 
 /// Read size used while hashing files.
 const HASH_CHUNK_LEN: usize = 8 * 1024 * 1024;
@@ -123,6 +126,7 @@ pub async fn serve_shard(
         "shard worker serving"
     );
 
+    let connection_slots = Arc::new(Semaphore::new(MAX_SHARD_CONNECTIONS));
     let mut connections = JoinSet::new();
     loop {
         tokio::select! {
@@ -131,7 +135,17 @@ pub async fn serve_shard(
                     info!("endpoint closed; shard worker stopping");
                     return Ok(());
                 };
-                connections.spawn(serve_connection(incoming, Arc::clone(&shard), allowed.clone()));
+                let Ok(permit) = connection_slots.clone().try_acquire_owned() else {
+                    incoming.refuse();
+                    debug!(limit = MAX_SHARD_CONNECTIONS, "shard connection limit reached; refusing connection");
+                    continue;
+                };
+                let shard = Arc::clone(&shard);
+                let allowed = allowed.clone();
+                connections.spawn(async move {
+                    let _permit = permit;
+                    serve_connection(incoming, shard, allowed).await;
+                });
             }
             Some(joined) = connections.join_next(), if !connections.is_empty() => {
                 log_task_panic(joined);
@@ -499,8 +513,9 @@ pub(crate) async fn forward_stderr(stderr: ChildStderr, pid: Option<u32>) {
         {
             Ok(0) => return,
             Ok(_) => {
+                let truncated = line.last() != Some(&b'\n') && line.len() as u64 == MAX_STDERR_LINE;
                 let text = String::from_utf8_lossy(&line);
-                info!(pid, "shard runner: {}", text.trim_end());
+                info!(pid, truncated, "shard runner: {}", text.trim_end());
             }
             Err(error) => {
                 warn!(pid, %error, "failed to read shard runner stderr");

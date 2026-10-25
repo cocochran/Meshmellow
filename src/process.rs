@@ -40,6 +40,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 /// Longest HTTP status line read during a [`Readiness::HttpOk`] probe.
 const MAX_STATUS_LINE_LEN: u64 = 1024;
 
+/// Maximum child output buffered for one tracing event; longer lines are split into chunks.
+const MAX_CHILD_LOG_LINE_BYTES: u64 = 8 * 1024;
+
 const DEFAULT_MAX_RESTARTS: u32 = 3;
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(8);
@@ -321,11 +324,17 @@ async fn forward_lines(name: String, stream: &'static str, pipe: impl AsyncRead 
     let mut line = Vec::new();
     loop {
         line.clear();
-        match reader.read_until(b'\n', &mut line).await {
+        match (&mut reader)
+            .take(MAX_CHILD_LOG_LINE_BYTES)
+            .read_until(b'\n', &mut line)
+            .await
+        {
             Ok(0) => return,
             Ok(_) => {
+                let truncated =
+                    line.last() != Some(&b'\n') && line.len() as u64 == MAX_CHILD_LOG_LINE_BYTES;
                 let text = String::from_utf8_lossy(line.trim_ascii_end());
-                info!(target: CHILD_LOG_TARGET, name = %name, stream, "{text}");
+                info!(target: CHILD_LOG_TARGET, name = %name, stream, truncated, "{text}");
             }
             Err(error) => {
                 warn!(target: CHILD_LOG_TARGET, name = %name, stream, %error, "failed to read child output");
@@ -337,42 +346,62 @@ async fn forward_lines(name: String, stream: &'static str, pipe: impl AsyncRead 
 
 /// Waits until the child passes its readiness probe, failing if it exits or times out first.
 async fn wait_ready(spec: &ChildSpec, child: &mut Child) -> anyhow::Result<()> {
+    let mut last_probe = "no readiness probe completed".to_owned();
     let ready = async {
         tokio::select! {
             status = child.wait() => {
                 bail!("{} {} before becoming ready", spec.name, describe_exit(status))
             }
-            () = poll_until_ready(&spec.readiness) => Ok(()),
+            () = poll_until_ready(&spec.readiness, &mut last_probe) => Ok(()),
         }
     };
-    tokio::time::timeout(spec.ready_timeout, ready)
-        .await
-        .map_err(|_| {
-            anyhow!(
-                "{} was not ready within {:?}",
-                spec.name,
-                spec.ready_timeout
-            )
-        })?
+    match tokio::time::timeout(spec.ready_timeout, ready).await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow!(
+            "{} was not ready within {:?}; last readiness probe: {last_probe}",
+            spec.name,
+            spec.ready_timeout
+        )),
+    }
 }
 
-async fn poll_until_ready(readiness: &Readiness) {
-    while !probe(readiness).await {
+async fn poll_until_ready(readiness: &Readiness, last_probe: &mut String) {
+    loop {
+        match probe(readiness).await {
+            Ok(true) => return,
+            Ok(false) => *last_probe = describe_not_ready(readiness),
+            Err(error) => *last_probe = error,
+        }
         tokio::time::sleep(READY_POLL_INTERVAL).await;
     }
 }
 
-/// Runs one readiness check; any error or stall counts as "not ready yet".
-async fn probe(readiness: &Readiness) -> bool {
+/// Runs one readiness check, retaining the reason when it fails or stalls.
+async fn probe(readiness: &Readiness) -> Result<bool, String> {
     let attempt = async {
         match readiness {
-            Readiness::TcpPort(addr) => connect(*addr).await.is_ok(),
-            Readiness::HttpOk { addr, path } => http_ok(*addr, path).await.unwrap_or(false),
+            Readiness::TcpPort(addr) => connect(*addr)
+                .await
+                .map(|_| true)
+                .map_err(|error| format!("TCP connect to {addr} failed: {error}")),
+            Readiness::HttpOk { addr, path } => http_ok(*addr, path)
+                .await
+                .map_err(|error| format!("HTTP GET http://{addr}{path} failed: {error}")),
         }
     };
-    tokio::time::timeout(PROBE_TIMEOUT, attempt)
-        .await
-        .unwrap_or(false)
+    match tokio::time::timeout(PROBE_TIMEOUT, attempt).await {
+        Ok(result) => result,
+        Err(_) => Err(format!("readiness probe timed out after {PROBE_TIMEOUT:?}")),
+    }
+}
+
+fn describe_not_ready(readiness: &Readiness) -> String {
+    match readiness {
+        Readiness::TcpPort(addr) => format!("TCP listener {addr} did not accept a connection"),
+        Readiness::HttpOk { addr, path } => {
+            format!("GET http://{addr}{path} did not return HTTP 200")
+        }
+    }
 }
 
 async fn connect(addr: SocketAddr) -> std::io::Result<TcpStream> {
@@ -496,6 +525,7 @@ mod tests {
                 path: path.clone()
             })
             .await
+            .unwrap()
         );
         assert!(
             !probe(&Readiness::HttpOk {
@@ -503,6 +533,30 @@ mod tests {
                 path
             })
             .await
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_poll_remembers_the_last_http_failure() {
+        let failing = http_server("HTTP/1.1 503 Service Unavailable\r\n\r\n").await;
+        let readiness = Readiness::HttpOk {
+            addr: failing,
+            path: "/health".to_owned(),
+        };
+        let mut last_probe = "no readiness probe completed".to_owned();
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(150),
+                poll_until_ready(&readiness, &mut last_probe)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            last_probe,
+            format!("GET http://{failing}/health did not return HTTP 200")
         );
     }
 
@@ -510,8 +564,20 @@ mod tests {
     async fn tcp_probe_needs_a_listener() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        assert!(probe(&Readiness::TcpPort(addr)).await);
+        assert!(probe(&Readiness::TcpPort(addr)).await.unwrap());
         drop(listener);
-        assert!(!probe(&Readiness::TcpPort(addr)).await);
+        let failure = probe(&Readiness::TcpPort(addr)).await.unwrap_err();
+        assert!(failure.contains("TCP connect to"), "{failure}");
+    }
+
+    #[test]
+    fn non_200_readiness_error_names_the_endpoint() {
+        assert_eq!(
+            describe_not_ready(&Readiness::HttpOk {
+                addr: "127.0.0.1:8081".parse().unwrap(),
+                path: "/health".to_owned(),
+            }),
+            "GET http://127.0.0.1:8081/health did not return HTTP 200"
+        );
     }
 }
