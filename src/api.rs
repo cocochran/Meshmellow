@@ -6,7 +6,7 @@
 //! are relayed chunk by chunk as they arrive; the assistant text is assembled on the side for
 //! the [`HistorySink`]. A streamed reply completes only after a valid `[DONE]` terminator;
 //! truncated, malformed or error-bearing SSE fails the job without committing history.
-//! `GET /jobs` lists job states.
+//! `GET /jobs` lists job states and `GET /peers` lists peers with authenticated control links.
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -23,18 +23,23 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::{Stream, StreamExt, stream};
+use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 use crate::history::{CompletedTurn, HistorySink};
 use crate::jobs::{JobInfo, JobPermit, JobQueue};
+use crate::network::SharedPeerTable;
 
 /// OpenAI-compatible chat endpoint, served here and by llama-server.
 pub const CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
 
 /// Lists every tracked job as JSON.
 pub const JOBS_PATH: &str = "/jobs";
+
+/// Lists peers with an authenticated control connection to this leader.
+pub const PEERS_PATH: &str = "/peers";
 
 /// Browser client served by the leader at the root path.
 pub const WEB_CLIENT_PATH: &str = "/";
@@ -65,24 +70,27 @@ const MESSAGE_CONTENT_POINTER: &str = "/choices/0/message/content";
 const DELTA_CONTENT_POINTER: &str = "/choices/0/delta/content";
 
 /// Where the API listens and where llama-server is.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ApiConfig {
     /// Address to serve on; must be loopback, anything else is refused.
     pub listen: SocketAddr,
     /// llama-server's HTTP address.
     pub upstream: SocketAddr,
+    /// Authenticated peers currently connected to the leader.
+    pub peers: SharedPeerTable,
 }
 
 /// State shared by every request handler.
 struct ApiState {
     queue: Arc<JobQueue>,
+    peers: SharedPeerTable,
     sink: Arc<dyn HistorySink>,
     client: reqwest::Client,
     upstream_url: String,
 }
 
-/// Serves `POST /v1/chat/completions` and `GET /jobs` on `config.listen` until `shutdown`
-/// resolves, then finishes in-flight requests and returns.
+/// Serves chat completions, job status, and connected-peer status on `config.listen` until
+/// `shutdown` resolves, then finishes in-flight requests and returns.
 ///
 /// Each chat request acquires a permit from `queue`, has its optional `conversation_id`
 /// stripped, and is forwarded to llama-server (streaming or not). The permit is completed on
@@ -101,6 +109,7 @@ pub async fn serve_api(
         .context("failed to build upstream http client")?;
     let state = Arc::new(ApiState {
         queue,
+        peers: config.peers,
         sink,
         client,
         upstream_url: format!("http://{}{CHAT_COMPLETIONS_PATH}", config.upstream),
@@ -109,6 +118,7 @@ pub async fn serve_api(
         .route(WEB_CLIENT_PATH, get(web_client))
         .route(CHAT_COMPLETIONS_PATH, post(chat_completions))
         .route(JOBS_PATH, get(list_jobs))
+        .route(PEERS_PATH, get(list_peers))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state);
     let listener = TcpListener::bind(config.listen)
@@ -164,6 +174,35 @@ fn ensure_loopback(listen: SocketAddr) -> anyhow::Result<()> {
 
 async fn list_jobs(State(state): State<Arc<ApiState>>) -> Json<Vec<JobInfo>> {
     Json(state.queue.jobs())
+}
+
+#[derive(Serialize)]
+struct PeerSummary {
+    /// Authenticated Iroh endpoint ID in its canonical display form.
+    node_id: String,
+    /// Unix milliseconds when this peer's current control connection was recorded.
+    connected_at_unix_ms: u64,
+    /// Unix milliseconds of the last accepted heartbeat, if one has arrived.
+    last_heartbeat_unix_ms: Option<u64>,
+}
+
+async fn list_peers(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<Vec<PeerSummary>>, StatusCode> {
+    let peers = state.peers.lock().map_err(|error| {
+        warn!(%error, "peer table lock poisoned; refusing to report peer status");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let mut summaries = peers
+        .peers()
+        .map(|peer| PeerSummary {
+            node_id: peer.node_id.to_string(),
+            connected_at_unix_ms: peer.connected_at_unix_ms,
+            last_heartbeat_unix_ms: peer.last_heartbeat_unix_ms,
+        })
+        .collect::<Vec<_>>();
+    summaries.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    Ok(Json(summaries))
 }
 
 async fn chat_completions(State(state): State<Arc<ApiState>>, body: Bytes) -> Response {

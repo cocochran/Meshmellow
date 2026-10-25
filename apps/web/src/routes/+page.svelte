@@ -29,6 +29,8 @@
   let pollController: AbortController | null = null;
   let mounted = false;
   const devices = $derived(snapshot?.devices ?? []);
+  const peers = $derived(snapshot?.peers ?? []);
+  const deviceCount = $derived(snapshot?.source === 'core' ? peers.length : devices.length);
   const connected = $derived(snapshot?.connected === true && !error);
   const runHeading = $derived(!connected ? 'Runtime unavailable' : snapshot?.active ? 'A generation is running' : snapshot?.event === 'done' ? 'Latest run finished' : snapshot?.event === 'error' ? 'Latest run failed' : snapshot?.event === 'paused' ? 'Runtime is paused' : 'Runtime is idle');
   const measuredDevices = $derived(devices.filter((d) => d.computeMs !== null));
@@ -43,8 +45,9 @@
   const allBuffersKnown = $derived(devices.length > 0 && devices.every((d) => d.bufferBytes !== null));
   const rangeLabel = (d: Device) => d.begin !== null && d.end !== null ? `${d.begin}–${d.end - 1}` : 'Unreported';
   const sizeLabel = (bytes: number | null) => bytes === null ? '—' : `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
+  const timeLabel = (timestamp: number | null) => timestamp === null ? 'Not reported' : new Date(timestamp).toLocaleTimeString();
   const iconFor = (d: Device) => /ipad|tablet/i.test(d.name) ? 'tablet' : /galaxy|pixel|phone/i.test(d.name) ? 'phone' : /cuda|rtx/i.test(d.hardware) ? 'server' : 'laptop';
-  const statusLabel = (d: Device) => !connected ? 'Unavailable' : !snapshot?.active ? 'Last observed' : d.status === 'inflight' ? 'Computing' : d.status === 'loading' ? 'Loading' : 'In current run';
+  const statusLabel = (d: Device) => !connected ? 'Unavailable' : snapshot?.source === 'core' ? 'Connected' : !snapshot?.active ? 'Last observed' : d.status === 'inflight' ? 'Computing' : d.status === 'loading' ? 'Loading' : 'In current run';
 
   async function refresh() {
     if (refreshing) return;
@@ -109,7 +112,7 @@
     <span class="eyebrow sidebar-label">WORKSPACE</span>
     <nav aria-label="Main navigation">
       {#each sections as item}
-        <button class:current={section === item.id} aria-current={section === item.id ? 'page' : undefined} onclick={() => { section = item.id; notice = ''; }}><Icon name={item.icon} /><span>{item.label}</span>{#if item.id === 'devices' && devices.length}<span class="nav-count">{devices.length}</span>{/if}</button>
+        <button class:current={section === item.id} aria-current={section === item.id ? 'page' : undefined} onclick={() => { section = item.id; notice = ''; }}><Icon name={item.icon} /><span>{item.label}</span>{#if item.id === 'devices' && deviceCount}<span class="nav-count">{deviceCount}</span>{/if}</button>
       {/each}
     </nav>
     <div class="sidebar-bottom">
@@ -128,9 +131,15 @@
 
       {#if section === 'overview'}
         <div class="metrics-grid">
-          <div class="metric"><span>Devices in route</span><strong>{loading ? '—' : devices.length}<small>devices</small></strong><p>Configured stages · availability not reported</p></div>
-          <div class="metric"><span>Decode rate</span><strong>{snapshot?.decodeRate?.toFixed(2) ?? '—'}<small>steps / sec</small></strong><p>{snapshot?.active ? 'Reported by the current run' : 'Last run · not a live speed estimate'}</p></div>
-          <div class="metric"><span>Stage buffers</span><strong>{allBuffersKnown ? (observedBuffers / 1024 ** 3).toFixed(1) : '—'}<small>GiB</small></strong><p>Reported stage buffers · not total memory</p></div>
+          {#if snapshot?.source === 'core'}
+            <div class="metric"><span>Connected peers</span><strong>{loading || !snapshot.peerStatusAvailable ? '—' : peers.length}<small>peers</small></strong><p>Authenticated control links to this leader</p></div>
+            <div class="metric"><span>Requests observed</span><strong>{loading ? '—' : snapshot.jobs.length}<small>jobs</small></strong><p>Recent entries reported by the core</p></div>
+            <div class="metric"><span>Requests running</span><strong>{loading ? '—' : snapshot.jobs.filter((job) => job.status === 'running').length}<small>jobs</small></strong><p>Currently marked running by the core</p></div>
+          {:else}
+            <div class="metric"><span>Devices in route</span><strong>{loading ? '—' : devices.length}<small>devices</small></strong><p>Configured stages · availability not reported</p></div>
+            <div class="metric"><span>Decode rate</span><strong>{snapshot?.decodeRate?.toFixed(2) ?? '—'}<small>steps / sec</small></strong><p>{snapshot?.active ? 'Reported by the current run' : 'Last run · not a live speed estimate'}</p></div>
+            <div class="metric"><span>Stage buffers</span><strong>{allBuffersKnown ? (observedBuffers / 1024 ** 3).toFixed(1) : '—'}<small>GiB</small></strong><p>Reported stage buffers · not total memory</p></div>
+          {/if}
         </div>
       {/if}
 
@@ -143,16 +152,19 @@
       {/if}
 
       {#if section === 'overview' || section === 'devices'}
-        <section class="panel device-panel"><div class="panel-heading"><div><h2>Devices <span class="count-pill">{devices.length}</span></h2><p>{snapshot?.active ? 'Current run · latest reported measurement per stage' : 'Last reported measurements · not a live availability check'}</p></div><button class="text-button" disabled={refreshing} onclick={refresh}><Icon name="refresh" size={15}/>{refreshing ? 'Refreshing…' : 'Refresh'}</button></div>
-          {#if devices.length}<div class="table-toolbar"><label class="device-search"><Icon name="devices" size={16}/><input aria-label="Filter devices" type="search" bind:value={deviceQuery} placeholder="Filter devices…" /></label><select aria-label="Device order" bind:value={deviceOrder}><option value="route">Route order</option><option value="compute">Slowest compute first</option></select></div>{/if}
+        <section class="panel device-panel"><div class="panel-heading"><div><h2>{snapshot?.source === 'core' ? 'Connected peers' : 'Devices'} <span class="count-pill">{snapshot?.source === 'core' && !snapshot.peerStatusAvailable ? '—' : deviceCount}</span></h2><p>{snapshot?.source === 'core' ? 'Authenticated control links currently known to this leader.' : snapshot?.active ? 'Current run · latest reported measurement per stage' : 'Last reported measurements · not a live availability check'}</p></div><button class="text-button" disabled={refreshing} onclick={refresh}><Icon name="refresh" size={15}/>{refreshing ? 'Refreshing…' : 'Refresh'}</button></div>
+          {#if snapshot?.source !== 'core' && devices.length}<div class="table-toolbar"><label class="device-search"><Icon name="devices" size={16}/><input aria-label="Filter devices" type="search" bind:value={deviceQuery} placeholder="Filter devices…" /></label><select aria-label="Device order" bind:value={deviceOrder}><option value="route">Route order</option><option value="compute">Slowest compute first</option></select></div>{/if}
           {#if loading}<div class="empty-state"><span class="loading-orbit"></span><h3>Reading runtime</h3><p>Waiting for the first observation.</p></div>
-          {:else if !devices.length}<div class="empty-state"><Icon name="devices" size={30}/><h3>{snapshot?.source === 'core' && connected ? 'Device telemetry isn’t available yet' : 'No devices reported'}</h3><p>{snapshot?.source === 'core' && connected ? 'This core exposes its job queue. Device and layer telemetry will follow.' : 'Connect the runtime to see its configured devices and layer assignments.'}</p></div>
+          {:else if snapshot?.source === 'core' && !snapshot.peerStatusAvailable}<div class="empty-state"><Icon name="info" size={35}/><h3>Peer status isn’t available</h3><p>This core version exposes its job queue, but not connected-peer status.</p></div>
+          {:else if snapshot?.source === 'core' && !peers.length}<div class="empty-state"><Icon name="devices" size={35}/><h3>No peers connected</h3><p>Peers appear here when they establish an authenticated control link.</p></div>
+          {:else if snapshot?.source === 'core'}<div class="job-list">{#each peers as peer}<div class="job-row"><code>{peer.id}</code><span class="status-pill">Connected</span><span>Connected: {timeLabel(peer.connectedAt)}</span><span>Heartbeat: {timeLabel(peer.lastHeartbeat)}</span></div>{/each}</div>
+          {:else if !devices.length}<div class="empty-state"><Icon name="devices" size={30}/><h3>No devices reported</h3><p>Connect the runtime to see its configured devices and layer assignments.</p></div>
           {:else if !visibleDevices.length}<div class="empty-state compact"><h3>No matching devices</h3><p>Try a different device name or hardware type.</p><button class="text-button" onclick={() => deviceQuery = ''}>Clear filter</button></div>
           {:else}
           <!-- The table scrolls horizontally on narrow screens; keyboard users need to focus its scroll region. -->
           <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
           <div class="device-table" tabindex="0" role="region" aria-label="Device measurements"><div class="table-head"><span>Device</span><span>State</span><span>Layers</span><span>Native compute <span class="column-hint">latest</span></span><span>Buffers</span><span></span></div>{#each visibleDevices as device}<button class="device-row" onclick={() => showDevice(device)} aria-label={`View ${device.name}`}><span class="device-name"><span class="device-icon" style={`--device-color: ${colors[devices.indexOf(device) % colors.length]}`}><Icon name={iconFor(device)} size={20}/></span><span><strong>{device.name}</strong><small>{device.hardware}</small></span></span><span class="status-pill" class:computing={snapshot?.active && device.status === 'inflight'}><span class="dot"></span>{statusLabel(device)}</span><span class="mono range-cell">{rangeLabel(device)}</span><span class="compute-cell"><span class="mono">{device.computeMs?.toFixed(1) ?? '—'}<small>{device.computeMs !== null ? ' ms' : ''}</small></span><span class="compute-track" aria-hidden="true"><i style={`width: ${device.computeMs === null ? 0 : device.computeMs / maxCompute * 100}%`}></i></span></span><span class="mono buffer-cell">{sizeLabel(device.bufferBytes)}</span><Icon name="chevron" size={15}/></button>{/each}</div>{/if}
-          <div class="panel-footer"><Icon name="info" size={14}/><span>Compute time excludes network transfer and waiting. Buffers are reported allocations, not total device memory.</span></div>
+          {#if snapshot?.source !== 'core'}<div class="panel-footer"><Icon name="info" size={14}/><span>Compute time excludes network transfer and waiting. Buffers are reported allocations, not total device memory.</span></div>{/if}
         </section>
       {/if}
 
@@ -172,7 +184,7 @@
 
       {#if section === 'settings'}
         <div class="settings-grid"><section class="panel"><div class="panel-heading"><div><h2>Workspace preferences</h2><p>Saved locally. These do not change mesh membership.</p></div></div><form class="settings-form" onsubmit={saveSettings}><label for="display-name">Workspace display name</label><input id="display-name" bind:value={displayName} maxlength="48" required /><p>A friendly name for this web interface.</p><label for="refresh-interval">Refresh interval</label><select id="refresh-interval" bind:value={refreshSeconds}><option value={2}>Every 2 seconds</option><option value={5}>Every 5 seconds</option><option value={10}>Every 10 seconds</option><option value={30}>Every 30 seconds</option></select><p>Polling pauses while this browser tab is hidden.</p><button class="button primary" disabled={saving}>{saving ? 'Saving…' : 'Save preferences'}<Icon name="check" size={16}/></button></form></section>
-        <section class="panel"><div class="panel-heading"><div><h2>Runtime connection</h2><p>Configured when you launch the web server.</p></div></div><div class="connection-details"><span class="eyebrow">LOCAL ENDPOINT</span><div class="endpoint"><code>{snapshot?.endpoint || 'Not configured'}</code>{#if snapshot?.endpoint}<button aria-label="Copy runtime address" onclick={copyEndpoint}><Icon name="copy" size={17}/></button>{/if}</div><dl><div><dt>Source</dt><dd>{snapshot?.source === 'core' ? 'Core API · job queue' : 'Live runtime · stage telemetry'}</dd></div><div><dt>Access</dt><dd>Read-only</dd></div><div><dt>Pairing</dt><dd>Awaiting core support</dd></div></dl><p class="fine-print">Start with <code>--runtime</code> and <code>--source</code> to choose the local connection. Worker configuration stays with the core.</p></div></section></div>
+        <section class="panel"><div class="panel-heading"><div><h2>Runtime connection</h2><p>Configured when you launch the web server.</p></div></div><div class="connection-details"><span class="eyebrow">LOCAL ENDPOINT</span><div class="endpoint"><code>{snapshot?.endpoint || 'Not configured'}</code>{#if snapshot?.endpoint}<button aria-label="Copy runtime address" onclick={copyEndpoint}><Icon name="copy" size={17}/></button>{/if}</div><dl><div><dt>Source</dt><dd>{snapshot?.source === 'core' ? 'Core API · jobs and peers' : 'Live runtime · stage telemetry'}</dd></div><div><dt>Access</dt><dd>Read-only</dd></div><div><dt>Pairing</dt><dd>Awaiting core support</dd></div></dl><p class="fine-print">Start with <code>--runtime</code> and <code>--source</code> to choose the local connection. Worker configuration stays with the core.</p></div></section></div>
       {/if}
 
       <footer class="page-footer"><span>Local dashboard · Read-only</span><span>{snapshot ? `Last checked ${new Date(snapshot.checkedAt).toLocaleTimeString()}` : 'Waiting for first observation'}</span></footer>

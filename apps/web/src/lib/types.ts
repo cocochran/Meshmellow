@@ -11,6 +11,11 @@ export interface Device {
   bufferBytes: number | null;
 }
 export interface Job { id: string; status: string; createdAt: number | null }
+export interface Peer {
+  id: string;
+  connectedAt: number | null;
+  lastHeartbeat: number | null;
+}
 export interface MeshSnapshot {
   connected: boolean;
   source: Source;
@@ -21,6 +26,8 @@ export interface MeshSnapshot {
   event: string;
   model: string;
   devices: Device[];
+  peers: Peer[];
+  peerStatusAvailable: boolean;
   layers: number | null;
   decodeRate: number | null;
   outputSteps: number | null;
