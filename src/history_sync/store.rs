@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::history_sync::history::{Entry, Epoch, History, Seq};
 
@@ -366,8 +367,12 @@ impl HistoryStore {
         self.log.sync_data().map_err(io_at(&log_path))?;
         self.epoch = self.epoch.max(epoch);
         self.history.extend(entries.iter().cloned());
-        if self.history.len() - self.snapshot_len >= SNAPSHOT_EVERY {
-            self.compact()?;
+        if self.history.len() - self.snapshot_len >= SNAPSHOT_EVERY
+            && let Err(error) = self.compact()
+        {
+            // The log append was already synced above. Returning an error here would tell the
+            // caller the append failed even though replay after restart includes these entries.
+            warn!(%error, "history append is durable, but snapshot compaction failed");
         }
         Ok(())
     }

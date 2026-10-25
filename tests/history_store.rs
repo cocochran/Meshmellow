@@ -151,6 +151,27 @@ fn log_is_folded_into_the_snapshot() {
 }
 
 #[test]
+fn durable_append_succeeds_when_snapshot_compaction_fails() {
+    let dir = DataDir::new("compact-failure");
+    let mut store = HistoryStore::open(&dir.0, meta()).unwrap();
+    let snapshot_temp = dir
+        .0
+        .join("history")
+        .join(CONVERSATION)
+        .join("snapshot.tmp");
+    fs::create_dir(&snapshot_temp).unwrap();
+    let entries: Vec<_> = (0..SNAPSHOT_EVERY as usize).flat_map(job).collect();
+
+    // The log has been synced even though compaction cannot create its temporary snapshot file.
+    store.append(&entries).unwrap();
+    assert_eq!(store.history().entries(), entries);
+    drop(store);
+
+    let recovered = HistoryStore::load(&dir.0, CONVERSATION).unwrap();
+    assert_eq!(recovered.history().entries(), entries);
+}
+
+#[test]
 fn replace_discards_the_old_history() {
     let dir = DataDir::new("replace");
     let mut store = HistoryStore::open(&dir.0, meta()).unwrap();

@@ -26,6 +26,7 @@ use std::{
 use tokio::io::AsyncReadExt;
 use tokio::{net::TcpListener, sync::Mutex};
 use tower_http::services::ServeDir;
+use tracing::debug;
 
 /// Preferences contain only a display name and refresh interval; reject unexpectedly large files.
 const MAX_PREFERENCES_BYTES: usize = 8 * 1024;
@@ -60,13 +61,16 @@ struct App {
 }
 impl App {
     async fn api_status(&self) -> ApiEndpoint {
-        let member = self
-            .node
-            .snapshot()
-            .await
-            .ok()
-            .is_some_and(|s| !s["mesh"].is_null());
-        let ready = if member && let Some(upstream) = self.upstream {
+        let member = match mesh_membership(self.node.snapshot().await) {
+            Ok(member) => Some(member),
+            Err(error) => {
+                debug!(%error, "mesh state unavailable while checking inference readiness");
+                None
+            }
+        };
+        let ready = if member == Some(true)
+            && let Some(upstream) = self.upstream
+        {
             self.client
                 .get(format!("http://{upstream}/health"))
                 .send()
@@ -79,7 +83,9 @@ impl App {
             base_url: format!("{}/v1", self.origin),
             inference_ready: ready,
             scope: "device_local".into(),
-            message: if !member {
+            message: if member.is_none() {
+                "Mesh status is unavailable; inference readiness cannot be confirmed."
+            } else if member == Some(false) {
                 "Create or join a mesh to enable inference."
             } else if self.upstream.is_none() {
                 "API listening. No inference backend is attached."
@@ -96,6 +102,11 @@ impl App {
             .set_api_endpoint(Some(self.api_status().await))
             .await;
     }
+}
+
+/// Preserve snapshot failures separately from a valid snapshot with no mesh membership.
+fn mesh_membership(snapshot: Result<Value>) -> Result<bool> {
+    snapshot.map(|snapshot| !snapshot["mesh"].is_null())
 }
 pub async fn run(options: Options) -> Result<()> {
     if let Some(upstream) = options.upstream {
@@ -466,6 +477,13 @@ async fn save_preferences(State(app): State<Arc<App>>, Json(value): Json<Value>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mesh_snapshot_errors_are_not_mistaken_for_non_membership() {
+        assert!(mesh_membership(Ok(json!({"mesh": {}}))).unwrap());
+        assert!(!mesh_membership(Ok(json!({"mesh": null}))).unwrap());
+        assert!(mesh_membership(Err(anyhow::anyhow!("unavailable"))).is_err());
+    }
 
     #[tokio::test]
     async fn preferences_reader_enforces_size_limit() {
