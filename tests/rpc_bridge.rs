@@ -12,7 +12,8 @@ use iroh::endpoint::{ConnectionError, presets};
 use iroh::{Endpoint, EndpointAddr, RelayMode};
 use llm_cluster::protocol::RPC_BRIDGE_ALPN;
 use llm_cluster::rpc_bridge::{
-    PEER_NOT_APPROVED, PEER_NOT_APPROVED_REASON, PeerAllowlist, run_leader, serve_worker,
+    BridgeMapping, LeaderBridges, PEER_NOT_APPROVED, PEER_NOT_APPROVED_REASON, PeerAllowlist,
+    run_leader, serve_worker,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -30,6 +31,8 @@ const LISTENER_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const LOOPBACK_ANY_PORT: &str = "127.0.0.1:0";
 /// Grace period for a wrongly forwarded stream to reach the RPC server before asserting it never did.
 const STRAY_FORWARD_GRACE: Duration = Duration::from_millis(200);
+/// Tags the two fake RPC servers behind one multi-worker leader prefix their echoes with.
+const WORKER_TAGS: [&[u8]; 2] = [b"worker-a:", b"worker-b:"];
 
 /// The three running pieces of a bridge plus the leader's client-facing address.
 struct Bridge {
@@ -129,6 +132,28 @@ async fn spawn_echo_server() -> SocketAddr {
         while let Ok((mut socket, _)) = listener.accept().await {
             tokio::spawn(async move {
                 let (mut reader, mut writer) = socket.split();
+                tokio::io::copy(&mut reader, &mut writer)
+                    .await
+                    .expect("echo copy");
+                writer.shutdown().await.expect("echo shutdown");
+            });
+        }
+    });
+    addr
+}
+
+/// Fake `ggml-rpc-server` that identifies itself: writes `tag`, then echoes like
+/// [`spawn_echo_server`].
+async fn spawn_tagged_echo_server(tag: &'static [u8]) -> SocketAddr {
+    let listener = TcpListener::bind(LOOPBACK_ANY_PORT)
+        .await
+        .expect("bind tagged echo");
+    let addr = listener.local_addr().expect("tagged echo address");
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let (mut reader, mut writer) = socket.split();
+                writer.write_all(tag).await.expect("send tag");
                 tokio::io::copy(&mut reader, &mut writer)
                     .await
                     .expect("echo copy");
@@ -301,4 +326,156 @@ async fn unapproved_peer_is_closed_before_reaching_the_rpc_server() {
         .await
         .expect("worker stops after endpoint close")
         .expect("worker did not panic");
+}
+
+/// A `bridge-serve` worker endpoint that only lets `leader` reach its tagged echo server.
+async fn spawn_tagged_worker(
+    lookup: &MemoryLookup,
+    leader: iroh::EndpointId,
+    tag: &'static [u8],
+) -> (Endpoint, JoinHandle<()>) {
+    let echo_addr = spawn_tagged_echo_server(tag).await;
+    let endpoint = bind_endpoint(vec![RPC_BRIDGE_ALPN.to_vec()], None).await;
+    lookup.add_endpoint_info(direct_addr(&endpoint));
+    let allowed = PeerAllowlist::new([leader]).expect("allowlist");
+    let task = tokio::spawn({
+        let endpoint = endpoint.clone();
+        async move {
+            serve_worker(endpoint, echo_addr, allowed)
+                .await
+                .expect("worker bridge")
+        }
+    });
+    (endpoint, task)
+}
+
+fn any_port_mapping(worker: iroh::EndpointId) -> BridgeMapping {
+    BridgeMapping {
+        worker,
+        listen: LOOPBACK_ANY_PORT.parse().expect("loopback address"),
+    }
+}
+
+/// Binds `mappings` on a fresh leader endpoint, expecting a refusal, and returns its message.
+async fn bind_error(mappings: &[BridgeMapping]) -> String {
+    let endpoint = bind_endpoint(Vec::new(), None).await;
+    let error = LeaderBridges::bind(endpoint.clone(), mappings)
+        .await
+        .expect_err("bind must refuse these mappings");
+    endpoint.close().await;
+    error.to_string()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_leader_bridges_each_port_to_its_own_worker() {
+    init_tracing();
+    let lookup = MemoryLookup::new();
+    let leader_endpoint = bind_endpoint(Vec::new(), Some(lookup.clone())).await;
+    let mut workers = Vec::new();
+    for tag in WORKER_TAGS {
+        workers.push(spawn_tagged_worker(&lookup, leader_endpoint.id(), tag).await);
+    }
+    let mappings: Vec<BridgeMapping> = workers
+        .iter()
+        .map(|(endpoint, _)| any_port_mapping(endpoint.id()))
+        .collect();
+
+    let bridges = LeaderBridges::bind(leader_endpoint.clone(), &mappings)
+        .await
+        .expect("bind every bridge");
+    let bound = bridges.addrs();
+    let leader = tokio::spawn(bridges.serve());
+
+    let bound_workers: Vec<_> = bound.iter().map(|mapping| mapping.worker).collect();
+    let planned_workers: Vec<_> = mappings.iter().map(|mapping| mapping.worker).collect();
+    assert_eq!(bound_workers, planned_workers, "addrs keep input order");
+    assert!(bound.iter().all(|mapping| mapping.listen.port() != 0));
+    assert_ne!(
+        bound[0].listen, bound[1].listen,
+        "each worker gets its own port"
+    );
+
+    for (mapping, tag) in bound.iter().zip(WORKER_TAGS) {
+        let echoed = timeout(
+            TEST_TIMEOUT,
+            round_trip(mapping.listen, SMALL_PAYLOAD.to_vec()),
+        )
+        .await
+        .expect("round trip finishes");
+        assert_eq!(
+            echoed,
+            [tag, SMALL_PAYLOAD].concat(),
+            "wrong worker behind {mapping:?}"
+        );
+    }
+
+    leader_endpoint.close().await;
+    let served = timeout(TEST_TIMEOUT, leader)
+        .await
+        .expect("leader bridges stop after endpoint close")
+        .expect("leader bridges did not panic");
+    assert!(served.is_ok(), "endpoint close is a clean stop: {served:?}");
+    for (endpoint, task) in workers {
+        endpoint.close().await;
+        timeout(TEST_TIMEOUT, task)
+            .await
+            .expect("worker stops after endpoint close")
+            .expect("worker did not panic");
+    }
+}
+
+#[tokio::test]
+async fn bind_refuses_an_empty_mapping_list() {
+    let message = bind_error(&[]).await;
+    assert!(message.contains("at least one worker"), "{message}");
+}
+
+#[tokio::test]
+async fn bind_refuses_a_worker_mapped_twice() {
+    let worker = iroh::SecretKey::generate().public();
+    let message = bind_error(&[any_port_mapping(worker), any_port_mapping(worker)]).await;
+    assert!(message.contains(&worker.to_string()), "{message}");
+    assert!(message.contains("more than one"), "{message}");
+}
+
+#[tokio::test]
+async fn bind_refuses_a_listen_address_mapped_twice() {
+    let listen = free_loopback_port().await;
+    let mapping = |worker| BridgeMapping { worker, listen };
+    let message = bind_error(&[
+        mapping(iroh::SecretKey::generate().public()),
+        mapping(iroh::SecretKey::generate().public()),
+    ])
+    .await;
+    assert!(message.contains(&listen.to_string()), "{message}");
+    assert!(message.contains("more than one worker"), "{message}");
+}
+
+#[tokio::test]
+async fn bind_refuses_a_non_loopback_address() {
+    let first = any_port_mapping(iroh::SecretKey::generate().public());
+    let exposed = BridgeMapping {
+        worker: iroh::SecretKey::generate().public(),
+        listen: SocketAddr::from(([0, 0, 0, 0], 0)),
+    };
+    let message = bind_error(&[first, exposed]).await;
+    assert!(message.contains("non-loopback"), "{message}");
+}
+
+#[tokio::test]
+async fn serve_returns_ok_once_the_endpoint_closes() {
+    let endpoint = bind_endpoint(Vec::new(), None).await;
+    let worker = iroh::SecretKey::generate().public();
+    let bridges = LeaderBridges::bind(endpoint.clone(), &[any_port_mapping(worker)])
+        .await
+        .expect("bind bridge");
+    let serve = tokio::spawn(bridges.serve());
+
+    endpoint.close().await;
+
+    let served = timeout(TEST_TIMEOUT, serve)
+        .await
+        .expect("serve stops after endpoint close")
+        .expect("serve did not panic");
+    assert!(served.is_ok(), "{served:?}");
 }
