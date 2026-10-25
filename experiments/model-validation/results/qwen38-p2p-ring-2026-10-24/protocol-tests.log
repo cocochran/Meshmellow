@@ -1,0 +1,42 @@
+warning: use of deprecated method `noq_udp::UdpSocketState::send`: silences I/O errors; use `UdpSocketState::try_send()` instead
+   --> vendor/netwatch/src/udp.rs:347:66
+    |
+347 |             let res = socket.try_io(Interest::WRITABLE, || state.send(socket.into(), transmit));
+    |                                                                  ^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated method `noq_udp::UdpSocketState::send`: silences I/O errors; use `UdpSocketState::try_send()` instead
+   --> vendor/netwatch/src/udp.rs:378:68
+    |
+378 |                         socket.try_io(Interest::WRITABLE, || state.send(socket.into(), transmit));
+    |                                                                    ^^^^
+
+warning: use of deprecated method `noq_udp::UdpSocketState::send`: silences I/O errors; use `UdpSocketState::try_send()` instead
+   --> vendor/netwatch/src/udp.rs:986:69
+    |
+986 |             let result = socket.try_io(Interest::WRITABLE, || state.send(socket.into(), transmit));
+    |                                                                     ^^^^
+
+warning: use of deprecated method `noq_udp::UdpSocketState::send`: silences I/O errors; use `UdpSocketState::try_send()` instead
+    --> vendor/netwatch/src/udp.rs:1007:60
+     |
+1007 |                 socket.try_io(Interest::WRITABLE, || state.send(socket.into(), transmit))
+     |                                                            ^^^^
+
+warning: use of deprecated method `noq_udp::UdpSocketState::send`: silences I/O errors; use `UdpSocketState::try_send()` instead
+    --> vendor/netwatch/src/udp.rs:1044:31
+     |
+1044 |                         state.send(socket.into(), self.transmit)
+     |                               ^^^^
+
+warning: `netwatch` (lib) generated 5 warnings
+   Compiling meshthing-ios-iroh-probe v0.1.0 (/Users/stephenson.439/Projects/HackOHIO26/experiments/mobile-probe/iroh-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.84s
+     Running unittests src/lib.rs (experiments/mobile-probe/iroh-core/target/debug/deps/meshthing_ios_iroh_probe-fb662f1964509ecb)
+
+running 2 tests
+test ring::tests::rejects_replay_and_wrong_payload ... ok
+test ring::tests::rejects_oversized_metadata ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

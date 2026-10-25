@@ -1,5 +1,9 @@
 # Model validation (M-12, M-13)
 
+See [Qwen3.8 direct peer forwarding](QWEN38_RING.md) for the native hybrid-model
+runner, physical iPad/Metal and PC/CUDA evidence, protocol, research inputs,
+and the distinction between verified capabilities and unimplemented requirements.
+
 See [throughput tuning](TUNING.md) for placement, prediction, Iroh and RPC trace
 comparisons, including optimizations that did not reproduce a speedup.
 See [RPC software experiments](RPC_EXPERIMENTS.md) for frame packing and input
