@@ -13,7 +13,16 @@
 //! monotonic clock from the hello onward), the acceptor closes the connection with
 //! [`HEARTBEAT_TIMEOUT_CODE`] and the session's usual cleanup forgets the peer. [`serve_control`]
 //! never times peers out.
+//!
+//! Heartbeats can also flow the other way. With [`ControlOptions::heartbeat_interval`] set, the
+//! acceptor opens one unidirectional stream to each dialer after the hello and writes its own
+//! [`Heartbeat`] on it every interval. A dialer that calls [`watch_heartbeats`] records those in
+//! its [`PeerTable`] and closes the connection with [`HEARTBEAT_TIMEOUT_CODE`] once they stop.
+//! Unlike the acceptor's watchdog, which is armed from the hello, the dialer's arms only at the
+//! first heartbeat it accepts, so a dialer connected to an acceptor that never heartbeats (an
+//! older build, or one without an interval) is never timed out.
 
+use std::convert::Infallible;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -24,7 +33,7 @@ use iroh::endpoint::{Connection, ConnectionError, Incoming, RecvStream, SendStre
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
-use tokio::time::Instant;
+use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
 use crate::node::{NodeId, PeerTable};
@@ -48,6 +57,9 @@ pub const HEARTBEAT_TIMEOUT_CODE: u32 = 4;
 /// QUIC close reason sent with [`HEARTBEAT_TIMEOUT_CODE`].
 const HEARTBEAT_TIMEOUT_REASON: &[u8] = b"heartbeat timeout";
 
+/// Leadership epoch carried in heartbeats; elections (and real epochs) do not exist yet.
+pub const HEARTBEAT_EPOCH: u64 = 0;
+
 /// Options for [`serve_control_with`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ControlOptions {
@@ -58,6 +70,13 @@ pub struct ControlOptions {
     /// for another node do not reset it. `Some(Duration::ZERO)` is not meaningful and is treated
     /// as `None`; callers should map a configured `0` to `None` themselves.
     pub heartbeat_timeout: Option<Duration>,
+    /// How often the acceptor sends its own [`Heartbeat`] to each accepted peer, on one
+    /// unidirectional stream opened after the hello; `None` (the default) sends none.
+    ///
+    /// Sequences start at 1 on every connection. A failed write or a closed connection stops only
+    /// that connection's sender; receiving the peer's streams and the timeout are unaffected.
+    /// `Some(Duration::ZERO)` is treated as `None`.
+    pub heartbeat_interval: Option<Duration>,
 }
 
 /// Length of an Ed25519 secret key in bytes.
@@ -233,15 +252,16 @@ pub async fn serve_control_with(
     options: ControlOptions,
 ) -> anyhow::Result<()> {
     let local = Arc::new(local);
-    let heartbeat_timeout = options
-        .heartbeat_timeout
-        .filter(|timeout| !timeout.is_zero());
+    let options = ControlOptions {
+        heartbeat_timeout: nonzero(options.heartbeat_timeout),
+        heartbeat_interval: nonzero(options.heartbeat_interval),
+    };
     let mut sessions = JoinSet::new();
     while let Some(incoming) = endpoint.accept().await {
         let local = Arc::clone(&local);
         let peers = Arc::clone(&peers);
         sessions.spawn(async move {
-            run_control_session(incoming, &local, &peers, heartbeat_timeout).await;
+            run_control_session(incoming, &local, &peers, options).await;
         });
         // Reap finished sessions so a long-running listener does not accumulate them.
         while sessions.try_join_next().is_some() {}
@@ -250,26 +270,114 @@ pub async fn serve_control_with(
     Ok(())
 }
 
+/// Maps `Some(Duration::ZERO)` to `None`, which is what a zero timeout or interval means.
+fn nonzero(duration: Option<Duration>) -> Option<Duration> {
+    duration.filter(|duration| !duration.is_zero())
+}
+
 /// Handles one incoming control connection from hello to disconnect, recording the peer's
 /// heartbeats while it is open and logging the outcome.
 ///
 /// When the connection closes the session removes the peer from `peers`, unless it has already
 /// reconnected on a newer connection. With a `heartbeat_timeout`, the session closes the
-/// connection itself once the peer stops heartbeating.
+/// connection itself once the peer stops heartbeating. With a `heartbeat_interval`, it also
+/// heartbeats to the peer for as long as the session lasts.
 async fn run_control_session(
     incoming: Incoming,
     local: &Hello,
     peers: &SharedPeerTable,
-    heartbeat_timeout: Option<Duration>,
+    options: ControlOptions,
 ) {
     match accept_peer(incoming, local, peers).await {
         Ok(session) => {
-            let watchdog = HeartbeatWatchdog::start(heartbeat_timeout);
-            let reason = receive_control_streams(&session, peers, watchdog).await;
+            let watchdog = HeartbeatWatchdog::new(options.heartbeat_timeout, Arming::AtStart);
+            let sender = send_heartbeats(
+                session.connection(),
+                &local.node_id,
+                options.heartbeat_interval,
+            );
+            // The sender never completes, so the session ends exactly when receiving does, and
+            // the sender is dropped with it.
+            let reason = tokio::select! {
+                reason = receive_control_streams(&session, peers, watchdog) => reason,
+                never = sender => match never {},
+            };
             info!(peer = %session.hello().node_id, %reason, "peer disconnected");
         }
         Err(error) => warn!("rejected incoming connection: {error:#}"),
     }
+}
+
+/// Writes a [`Heartbeat`] from `node_id` every `interval` on one new unidirectional stream of
+/// `connection`, with sequences counting up from 1.
+///
+/// Never completes: without an interval, or once a write fails (the connection closed, or the
+/// peer stopped the stream), it waits forever, so only the caller decides when the session ends.
+async fn send_heartbeats(
+    connection: &Connection,
+    node_id: &str,
+    interval: Option<Duration>,
+) -> Infallible {
+    if let Some(interval) = interval {
+        let mut sequence: u64 = 0;
+        let next_heartbeat = || {
+            sequence = sequence.saturating_add(1);
+            Heartbeat {
+                node_id: node_id.to_owned(),
+                epoch: HEARTBEAT_EPOCH,
+                sequence,
+            }
+        };
+        let Err(error) = write_heartbeats(connection, interval, next_heartbeat).await;
+        debug!(
+            peer = %connection.remote_id(),
+            error = %format!("{error:#}"),
+            "stopped heartbeating to peer"
+        );
+    }
+    std::future::pending().await
+}
+
+/// Opens one unidirectional stream on `connection` and writes `next_heartbeat()` on it every
+/// `interval`, the first one immediately; a late tick delays the ones after it rather than
+/// bursting. Returns only when opening the stream or a write fails.
+pub async fn write_heartbeats(
+    connection: &Connection,
+    interval: Duration,
+    mut next_heartbeat: impl FnMut() -> Heartbeat,
+) -> anyhow::Result<Infallible> {
+    let mut stream = connection
+        .open_uni()
+        .await
+        .context("failed to open heartbeat stream")?;
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        protocol::write_frame(&mut stream, &Message::Heartbeat(next_heartbeat()))
+            .await
+            .context("failed to send heartbeat")?;
+    }
+}
+
+/// Dialer side of acceptor heartbeats: reads every unidirectional stream `session`'s peer opens,
+/// records its heartbeats in `peers`, and closes the connection with [`HEARTBEAT_TIMEOUT_CODE`]
+/// once the peer goes `timeout` without a heartbeat the table accepts. Returns why the
+/// connection closed.
+///
+/// The timeout arms only at the first accepted heartbeat, so a peer that never heartbeats (an
+/// acceptor without [`ControlOptions::heartbeat_interval`], or an older build) is never timed
+/// out. When this function closes the connection itself the result is
+/// [`ConnectionError::LocallyClosed`]; any other result means the connection closed for another
+/// reason. `None` or a zero `timeout` only records heartbeats. Other messages are logged and
+/// ignored. `peers` must already list the peer, as [`dial_peer`] leaves it.
+pub async fn watch_heartbeats(
+    session: &PeerSession,
+    peers: &SharedPeerTable,
+    timeout: Option<Duration>,
+) -> ConnectionError {
+    let watchdog = HeartbeatWatchdog::new(nonzero(timeout), Arming::AtFirstHeartbeat);
+    receive_control_streams(session, peers, watchdog).await
 }
 
 /// Removes `node_id` from `peers` if its entry still belongs to the connection with
@@ -285,6 +393,15 @@ fn forget_peer(peers: &SharedPeerTable, node_id: &NodeId, connection_token: u64)
     }
 }
 
+/// When a [`HeartbeatWatchdog`] starts counting down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Arming {
+    /// From creation, i.e. the hello: an acceptor requires its dialers to heartbeat.
+    AtStart,
+    /// From the first accepted heartbeat: a dialer tolerates acceptors that never heartbeat.
+    AtFirstHeartbeat,
+}
+
 /// Tracks when a session's peer must next heartbeat, on the monotonic clock.
 struct HeartbeatWatchdog {
     timeout: Option<Duration>,
@@ -292,22 +409,25 @@ struct HeartbeatWatchdog {
 }
 
 impl HeartbeatWatchdog {
-    /// Arms the watchdog from now; with no `timeout` it never expires.
-    fn start(timeout: Option<Duration>) -> Self {
+    /// Creates a watchdog that arms as `arming` says; with no `timeout` it never expires.
+    fn new(timeout: Option<Duration>, arming: Arming) -> Self {
         let mut watchdog = Self {
             timeout,
             deadline: None,
         };
-        watchdog.reset();
+        if arming == Arming::AtStart {
+            watchdog.reset();
+        }
         watchdog
     }
 
-    /// Moves the deadline a full timeout past now, as after an accepted heartbeat.
+    /// Moves the deadline a full timeout past now, as after an accepted heartbeat; this also
+    /// arms a watchdog that was waiting for its first heartbeat.
     fn reset(&mut self) {
         self.deadline = self.timeout.map(|timeout| Instant::now() + timeout);
     }
 
-    /// Completes when the deadline passes; never completes without a timeout.
+    /// Completes when the deadline passes; never completes without a timeout or while unarmed.
     async fn expired(&self) {
         match self.deadline {
             Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -645,6 +765,36 @@ mod tests {
 
         assert_eq!(parse_node_id(&format!(" {id}\n")).expect("parse"), id);
         assert!(parse_node_id("nonsense").is_err());
+    }
+
+    #[test]
+    fn acceptor_watchdog_arms_at_start_and_dialer_watchdog_at_first_heartbeat() {
+        let timeout = Some(Duration::from_secs(1));
+
+        assert!(
+            HeartbeatWatchdog::new(timeout, Arming::AtStart)
+                .deadline
+                .is_some()
+        );
+        let mut dialer = HeartbeatWatchdog::new(timeout, Arming::AtFirstHeartbeat);
+        assert!(dialer.deadline.is_none());
+        dialer.reset();
+        assert!(dialer.deadline.is_some());
+        assert!(
+            HeartbeatWatchdog::new(None, Arming::AtStart)
+                .deadline
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn zero_durations_mean_disabled() {
+        assert_eq!(nonzero(Some(Duration::ZERO)), None);
+        assert_eq!(nonzero(None), None);
+        assert_eq!(
+            nonzero(Some(Duration::from_millis(5))),
+            Some(Duration::from_millis(5))
+        );
     }
 
     #[test]

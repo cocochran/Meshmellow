@@ -12,7 +12,8 @@
 //!    legacy plan fails here. The plan's `runtime_devices` say which planned peers are remote
 //!    workers and which leader-local port bridges to each. shard: the manifest
 //!    ([`ShardManifest::load`]), including the v1 topology rules.
-//! 2. Accept control connections. llama: wait until every remote worker has said hello. shard:
+//! 2. Accept control connections, heartbeating to each connected worker every
+//!    `heartbeat_interval` so it can tell when the leader is gone. llama: wait until every remote worker has said hello. shard:
 //!    `shard-serve` workers open no control link, so there is nothing to wait for.
 //! 3. Start the upstream. llama: one RPC bridge per remote worker, all sharing the leader's
 //!    endpoint, then `llama-server` with the plan's `server_args`, waiting for `/health`. shard:
@@ -73,6 +74,11 @@ pub const DEFAULT_WORKER_WAIT: Duration = Duration::from_secs(60);
 /// unless configured otherwise: three missed beats at [`crate::worker::DEFAULT_HEARTBEAT_INTERVAL`]
 /// plus a second of slack.
 pub const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(7);
+
+/// How often the leader heartbeats to each connected worker unless configured otherwise; the
+/// same as the workers' own [`crate::worker::DEFAULT_HEARTBEAT_INTERVAL`], so their default
+/// [`crate::worker::DEFAULT_LEADER_HEARTBEAT_TIMEOUT`] allows three missed beats plus slack.
+pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = crate::worker::DEFAULT_HEARTBEAT_INTERVAL;
 
 /// How long `llama-server` may take to load the model and answer `/health` unless configured otherwise.
 pub const DEFAULT_LLAMA_READY_TIMEOUT: Duration = Duration::from_secs(300);
@@ -155,6 +161,11 @@ pub struct LeaderConfig {
     /// zero. `None` disables the timeout: a silent worker is then only dropped when QUIC notices
     /// the connection died.
     pub heartbeat_timeout: Option<Duration>,
+    /// How often the leader sends its own heartbeat to each connected worker, usually
+    /// [`DEFAULT_HEARTBEAT_INTERVAL`], so workers notice a lost leader within their
+    /// `leader_heartbeat_timeout` instead of QUIC's idle timeout. Must be shorter than that
+    /// timeout and must not be zero; `None` sends no heartbeats.
+    pub heartbeat_interval: Option<Duration>,
 }
 
 /// Which execution backend the leader runs, with its backend-specific settings.
@@ -277,6 +288,7 @@ async fn lead(
     let mut control = JoinSet::new();
     let options = ControlOptions {
         heartbeat_timeout: config.heartbeat_timeout,
+        heartbeat_interval: config.heartbeat_interval,
     };
     control.spawn(network::serve_control_with(
         endpoint.clone(),

@@ -211,6 +211,7 @@ impl Leader {
             api_addr: free_loopback_addr().await,
             worker_wait: WORKER_WAIT,
             heartbeat_timeout: None,
+            heartbeat_interval: None,
         };
         Self {
             runner_log: dir.join("final-stage.log"),

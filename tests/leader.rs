@@ -50,9 +50,10 @@ const WORKER_WAIT: Duration = Duration::from_secs(30);
 const SHORT_WORKER_WAIT: Duration = Duration::from_millis(500);
 const LLAMA_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const SHORT_LLAMA_READY_TIMEOUT: Duration = Duration::from_secs(2);
+/// Heartbeat interval of both the worker and the leader.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(200);
-/// Ten missed beats: the leader runs with its heartbeat timeout on, as in production, without a
-/// slow test machine dropping the worker.
+/// Ten missed beats: the leader and the worker run with their heartbeat timeouts on, as in
+/// production, without a slow test machine dropping the link.
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long the leader is left without its worker, to show it waits instead of launching.
 const WORKER_JOIN_DELAY: Duration = Duration::from_millis(500);
@@ -126,6 +127,7 @@ impl Cluster {
             api_addr,
             worker_wait: WORKER_WAIT,
             heartbeat_timeout: Some(HEARTBEAT_TIMEOUT),
+            heartbeat_interval: Some(HEARTBEAT_INTERVAL),
         };
         Self {
             dir,
@@ -206,6 +208,7 @@ impl Cluster {
             leader: None,
             allowed_peers: Vec::new(),
             heartbeat_interval: HEARTBEAT_INTERVAL,
+            leader_heartbeat_timeout: Some(HEARTBEAT_TIMEOUT),
         };
         tokio::spawn(async move { run_worker_on(endpoint, Some(leader), &config).await })
     }

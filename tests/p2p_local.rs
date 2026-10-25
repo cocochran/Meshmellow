@@ -1,4 +1,5 @@
-//! Three nodes on localhost connect pairwise, exchange hellos, and see each other in their peer tables.
+//! Three nodes on localhost connect pairwise, exchange hellos, and see each other in their peer tables;
+//! heartbeats in both directions keep control links open, and their absence closes them.
 //!
 //! Endpoints are bound without relays or address lookup and dialed by their direct addresses, so
 //! the test needs no internet access.
@@ -8,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use iroh::Endpoint;
-use iroh::endpoint::{Connection, ConnectionError};
+use iroh::endpoint::{Connection, ConnectionError, SendStream};
 use llm_cluster::network::{
     self, ControlOptions, HEARTBEAT_TIMEOUT_CODE, PeerSession, SharedPeerTable,
 };
@@ -68,7 +69,7 @@ fn spawn_heartbeats(connection: &Connection, node: &TestNode) -> JoinHandle<()> 
     })
 }
 
-/// Waits for `connection` to close and asserts the acceptor closed it for a missed heartbeat.
+/// Waits for `connection` to close and asserts the other side closed it for a missed heartbeat.
 async fn assert_closed_for_heartbeat_timeout(connection: &Connection) {
     let closed = timeout(CLEANUP_TIMEOUT, connection.closed())
         .await
@@ -106,8 +107,41 @@ impl TestNode {
     async fn start_with_heartbeat_timeout(name: &str, timeout: Duration) -> Self {
         let options = ControlOptions {
             heartbeat_timeout: Some(timeout),
+            ..ControlOptions::default()
         };
         Self::start_with(name, CLUSTER_ID, options).await
+    }
+
+    /// Starts a node whose accept loop heartbeats to every peer each `interval`.
+    async fn start_with_heartbeat_interval(name: &str, interval: Duration) -> Self {
+        let options = ControlOptions {
+            heartbeat_interval: Some(interval),
+            ..ControlOptions::default()
+        };
+        Self::start_with(name, CLUSTER_ID, options).await
+    }
+
+    /// The last heartbeat sequence this node accepted from `other`, if any.
+    fn heartbeat_sequence_from(&self, other: &TestNode) -> Option<u64> {
+        let table = self.peers.lock().expect("peer table lock");
+        table
+            .get(&other.endpoint.id())
+            .and_then(|info| info.last_heartbeat_sequence)
+    }
+
+    /// Waits until this node has accepted a heartbeat from `other` with a sequence above `after`.
+    async fn wait_for_heartbeat_after(&self, other: &TestNode, after: u64) -> u64 {
+        let newer = async {
+            loop {
+                match self.heartbeat_sequence_from(other) {
+                    Some(sequence) if sequence > after => return sequence,
+                    _ => tokio::time::sleep(POLL_INTERVAL).await,
+                }
+            }
+        };
+        timeout(CLEANUP_TIMEOUT, newer)
+            .await
+            .expect("acceptor heartbeats reach the dialer")
     }
 
     async fn start_with(name: &str, cluster_id: &str, options: ControlOptions) -> Self {
@@ -391,4 +425,125 @@ async fn old_connection_timing_out_keeps_the_reconnected_peer() {
     drop((old, new));
     dialer.stop().await;
     acceptor.stop().await;
+}
+
+#[tokio::test]
+async fn acceptor_heartbeats_reach_the_dialer_with_increasing_sequences() {
+    let dialer = TestNode::start("leader-beats-dialer").await;
+    let acceptor =
+        TestNode::start_with_heartbeat_interval("leader-beats-acceptor", HEARTBEAT_INTERVAL).await;
+    let session = Arc::new(dialer.dial(&acceptor).await);
+    let watch = {
+        let (session, peers) = (Arc::clone(&session), Arc::clone(&dialer.peers));
+        tokio::spawn(async move {
+            network::watch_heartbeats(&session, &peers, Some(HEARTBEAT_TIMEOUT)).await
+        })
+    };
+
+    let first = dialer.wait_for_heartbeat_after(&acceptor, 0).await;
+    let later = dialer.wait_for_heartbeat_after(&acceptor, first).await;
+
+    assert!(
+        first >= 1 && later > first,
+        "sequences {first} then {later}"
+    );
+    assert_stays_open(session.connection(), SURVIVAL_PERIOD).await;
+    watch.abort();
+    drop(session);
+    dialer.stop().await;
+    acceptor.stop().await;
+}
+
+#[tokio::test]
+async fn dialer_never_times_out_an_acceptor_that_never_heartbeats() {
+    let dialer = TestNode::start("quiet-leader-dialer").await;
+    let acceptor = TestNode::start("quiet-leader-acceptor").await;
+    let session = dialer.dial(&acceptor).await;
+
+    let watched = timeout(
+        SURVIVAL_PERIOD,
+        network::watch_heartbeats(&session, &dialer.peers, Some(HEARTBEAT_TIMEOUT)),
+    )
+    .await;
+
+    assert!(watched.is_err(), "watch ended early: {watched:?}");
+    assert!(session.connection().close_reason().is_none());
+    assert_eq!(
+        dialer.token_for(&acceptor),
+        Some(session.connection_token())
+    );
+    drop(session);
+    dialer.stop().await;
+    acceptor.stop().await;
+}
+
+/// Number of heartbeats [`heartbeat_then_go_silent`] sends before going quiet.
+const BEATS_BEFORE_SILENCE: u64 = 3;
+
+/// A hand-written acceptor that heartbeats [`BEATS_BEFORE_SILENCE`] times and then goes silent
+/// while keeping the connection (and its stream) open; returns both so the caller holds them.
+async fn heartbeat_then_go_silent(endpoint: Endpoint, hello: Hello) -> (PeerSession, SendStream) {
+    let peers: SharedPeerTable = Arc::new(Mutex::new(PeerTable::new()));
+    let incoming = timeout(CLEANUP_TIMEOUT, endpoint.accept())
+        .await
+        .expect("dialer connects in time")
+        .expect("acceptor endpoint open");
+    let session = network::accept_peer(incoming, &hello, &peers)
+        .await
+        .expect("hello");
+    let mut stream = session.connection().open_uni().await.expect("open stream");
+    for sequence in 1..=BEATS_BEFORE_SILENCE {
+        let heartbeat = Message::Heartbeat(Heartbeat {
+            node_id: hello.node_id.clone(),
+            epoch: network::HEARTBEAT_EPOCH,
+            sequence,
+        });
+        protocol::write_frame(&mut stream, &heartbeat)
+            .await
+            .expect("write heartbeat");
+        tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+    }
+    (session, stream)
+}
+
+#[tokio::test]
+async fn dialer_closes_the_link_when_acceptor_heartbeats_stop() {
+    let dialer = TestNode::start("stalled-leader-dialer").await;
+    let key_path = std::env::temp_dir().join(format!(
+        "meshthing-p2p-local-{}-stalled-leader.key",
+        std::process::id()
+    ));
+    // A leftover file from an aborted run may or may not exist; either way we start fresh.
+    let _ = std::fs::remove_file(&key_path);
+    let endpoint = network::bind_local_endpoint(&key_path, vec![CONTROL_ALPN.to_vec()])
+        .await
+        .expect("bind endpoint");
+    let hello = network::local_hello(&endpoint, CLUSTER_ID, 0);
+    let acceptor = tokio::spawn(heartbeat_then_go_silent(endpoint.clone(), hello));
+    let session = network::dial_peer(
+        &dialer.endpoint,
+        endpoint.addr(),
+        &dialer.hello,
+        &dialer.peers,
+    )
+    .await
+    .expect("dial the stalling acceptor");
+
+    let reason = timeout(
+        CLEANUP_TIMEOUT,
+        network::watch_heartbeats(&session, &dialer.peers, Some(HEARTBEAT_TIMEOUT)),
+    )
+    .await
+    .expect("dialer gives up on the silent acceptor");
+
+    assert!(
+        matches!(reason, ConnectionError::LocallyClosed),
+        "expected a local close, got {reason:?}"
+    );
+    let (accepted, _stream) = acceptor.await.expect("acceptor task");
+    assert_closed_for_heartbeat_timeout(accepted.connection()).await;
+    drop((session, accepted));
+    endpoint.close().await;
+    dialer.stop().await;
+    std::fs::remove_file(&key_path).expect("remove key file");
 }
