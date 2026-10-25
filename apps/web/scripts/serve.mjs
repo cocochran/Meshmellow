@@ -15,7 +15,7 @@ const { values } = parseArgs({ options: {
   help: { type: 'boolean', default: false }
 } });
 if (values.help) {
-  console.log('MeshThing UI\n\n./mesh-ui [--port 3210] [--runtime http://127.0.0.1:8095] [--source live-demo|core] [--model "Model label"] [--open]\n\nReads runtime state only. Ctrl+C stops the UI, leaving workers running.');
+  console.log('Layercake UI\n\n./mesh-ui [--port 3210] [--runtime http://127.0.0.1:8095] [--source live-demo|core] [--model "Model label"] [--open]\n\nReads runtime state only. Ctrl+C stops the UI, leaving workers running.');
   process.exit(0);
 }
 const port = Number(values.port);
@@ -50,9 +50,9 @@ const server = createServer((req, res) => {
   res.setHeader('X-Frame-Options', 'DENY');
   handler(req, res);
 });
-server.on('error', (error) => { console.error(`Cannot start MeshThing UI: ${error.message}`); process.exitCode = 1; });
+server.on('error', (error) => { console.error(`Cannot start Layercake UI: ${error.message}`); process.exitCode = 1; });
 server.listen(port, '127.0.0.1', () => {
-  console.log(`\n  MeshThing · your devices, one model\n  ${origin}\n\n  ${runtime ? `Reading ${values.source} at ${runtime}` : 'No runtime connected. See ./mesh-ui --help.'}\n  Ctrl+C stops this UI only.\n`);
+  console.log(`\n  Layercake · your devices, one model\n  ${origin}\n\n  ${runtime ? `Reading ${values.source} at ${runtime}` : 'No runtime connected. See ./mesh-ui --help.'}\n  Ctrl+C stops this UI only.\n`);
   if (values.open) {
     const command = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'explorer.exe' : 'xdg-open';
     const child = spawn(command, [origin], { stdio: 'ignore' });
