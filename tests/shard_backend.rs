@@ -210,6 +210,7 @@ impl Leader {
             upstream_port: free_loopback_addr().await.port(),
             api_addr: free_loopback_addr().await,
             worker_wait: WORKER_WAIT,
+            heartbeat_timeout: None,
         };
         Self {
             runner_log: dir.join("final-stage.log"),

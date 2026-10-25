@@ -26,6 +26,8 @@
 //! 5. Serve the job API. llama only: with an evidence file configured, verify the externally
 //!    collected run evidence against the plan while serving; a failed verification stops the
 //!    leader. Verification is tied to the planning profile, so the shard backend has none.
+//!    llama only: a planned worker that leaves the peer table while serving (heartbeat timeout
+//!    or closed connection) is logged, as is its rejoin; jobs and the queue are unaffected.
 //! 6. On shutdown or failure, stop the API, then the backend (`llama-server` and the bridges, or
 //!    the shard front end), then the endpoint, in that order.
 
@@ -48,7 +50,7 @@ use crate::evidence::{self, EvidenceConfig};
 use crate::history::LoggingHistorySink;
 use crate::jobs::JobQueue;
 use crate::launch::{LaunchPlan, RemoteWorker};
-use crate::network::{self, SharedPeerTable};
+use crate::network::{self, ControlOptions, SharedPeerTable};
 use crate::node::PeerTable;
 use crate::process::{self, ChildSpec, Readiness, RestartPolicy, Supervised};
 use crate::protocol::CONTROL_ALPN;
@@ -66,6 +68,11 @@ pub const DEFAULT_API_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LO
 /// How long to wait for every planned worker to connect (llama), or for the shard pipeline's
 /// readiness probe to pass (shard), unless configured otherwise.
 pub const DEFAULT_WORKER_WAIT: Duration = Duration::from_secs(60);
+
+/// How long a worker may go without a heartbeat before the leader closes its control connection,
+/// unless configured otherwise: three missed beats at [`crate::worker::DEFAULT_HEARTBEAT_INTERVAL`]
+/// plus a second of slack.
+pub const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(7);
 
 /// How long `llama-server` may take to load the model and answer `/health` unless configured otherwise.
 pub const DEFAULT_LLAMA_READY_TIMEOUT: Duration = Duration::from_secs(300);
@@ -113,6 +120,9 @@ const SHARD_FRONTEND_READY_TIMEOUT: Duration = Duration::from_secs(300);
 /// How often the worker wait re-checks the peer table.
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// How often the leader re-checks, while serving, that every planned worker is still connected.
+const PRESENCE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
 /// How often to check whether the shard front end listens yet.
 const LISTEN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -139,6 +149,12 @@ pub struct LeaderConfig {
     /// llama: how long to wait for every planned worker to connect. shard: how long the
     /// readiness probe is retried before startup fails.
     pub worker_wait: Duration,
+    /// How long a connected worker may go without a heartbeat before the leader closes its
+    /// control connection with [`network::HEARTBEAT_TIMEOUT_CODE`], dropping it from the peer
+    /// table until it reconnects. Must exceed the workers' heartbeat interval and must not be
+    /// zero. `None` disables the timeout: a silent worker is then only dropped when QUIC notices
+    /// the connection died.
+    pub heartbeat_timeout: Option<Duration>,
 }
 
 /// Which execution backend the leader runs, with its backend-specific settings.
@@ -256,12 +272,17 @@ async fn lead(
 ) -> anyhow::Result<()> {
     let peers: SharedPeerTable = Arc::new(Mutex::new(PeerTable::new()));
     let local = network::local_hello(endpoint, &config.cluster_id, EMPTY_LOG_INDEX);
-    // Dropping the set aborts the accept loop, so it never outlives this function.
+    // Dropping the set aborts the accept loop and the worker watch, so neither outlives this
+    // function.
     let mut control = JoinSet::new();
-    control.spawn(network::serve_control(
+    let options = ControlOptions {
+        heartbeat_timeout: config.heartbeat_timeout,
+    };
+    control.spawn(network::serve_control_with(
         endpoint.clone(),
         local,
         Arc::clone(&peers),
+        options,
     ));
 
     tokio::pin!(shutdown);
@@ -272,6 +293,12 @@ async fn lead(
             return Ok(());
         }
     };
+    if let Prepared::Llama(llama) = prepared {
+        control.spawn(watch_workers(
+            Arc::clone(&peers),
+            llama.launch.workers.clone(),
+        ));
+    }
     let failed_verification = verify_backend_while_serving(prepared);
     running.serve_until(shutdown, failed_verification).await
 }
@@ -602,6 +629,41 @@ fn missing_workers(
         .collect())
 }
 
+/// Logs, until aborted, every planned worker that leaves the peer table (its heartbeats stopped
+/// or its connection closed) and every one that rejoins. Only logs; serving is unaffected. Every
+/// worker is assumed connected at the start, as [`wait_for_workers`] has returned. Fails only if
+/// the peer table lock is poisoned.
+async fn watch_workers(peers: SharedPeerTable, workers: Vec<RemoteWorker>) -> anyhow::Result<()> {
+    let mut missing = Vec::new();
+    let mut ticks = tokio::time::interval(PRESENCE_POLL_INTERVAL);
+    loop {
+        ticks.tick().await;
+        let now_missing = missing_workers(&peers, &workers)?;
+        let (left, rejoined) = presence_changes(&missing, &now_missing);
+        for id in left {
+            warn!(worker = %id, "planned worker left the peer table; waiting for it to reconnect");
+        }
+        for id in rejoined {
+            info!(worker = %id, "planned worker reconnected");
+        }
+        missing = now_missing;
+    }
+}
+
+/// Workers that are missing now but were not `before` (left), and the reverse (rejoined).
+fn presence_changes(
+    before: &[EndpointId],
+    now: &[EndpointId],
+) -> (Vec<EndpointId>, Vec<EndpointId>) {
+    let newly = |from: &[EndpointId], absent_in: &[EndpointId]| {
+        from.iter()
+            .filter(|id| !absent_in.contains(id))
+            .copied()
+            .collect::<Vec<_>>()
+    };
+    (newly(now, before), newly(before, now))
+}
+
 fn join_ids(ids: &[EndpointId]) -> String {
     ids.iter()
         .map(EndpointId::to_string)
@@ -850,6 +912,19 @@ mod tests {
         wait_for_workers(&table_with(&[id]), &[worker(id)], Duration::ZERO)
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn presence_changes_report_departures_and_rejoins() {
+        let stays = SecretKey::generate().public();
+        let leaves = SecretKey::generate().public();
+        let rejoins = SecretKey::generate().public();
+
+        let (left, rejoined) = presence_changes(&[stays, rejoins], &[stays, leaves]);
+
+        assert_eq!(left, [leaves]);
+        assert_eq!(rejoined, [rejoins]);
+        assert_eq!(presence_changes(&[stays], &[stays]), (vec![], vec![]));
     }
 
     #[tokio::test]

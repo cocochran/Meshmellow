@@ -165,7 +165,7 @@ Holds the authoritative history and how far each peer has confirmed (`NeedsSnaps
 
 **As the project evolves**
 - Track which acks came from voters to support majority commit.
-- Drive `set_peers` from heartbeats.
+- Drive `set_peers` from the peer table on a live node. The peer table already drops a worker that misses heartbeats (M-11, section 9); calling `set_peers` when it changes waits on the M-9 live wiring.
 - Own the job queue's state changes in this same log.
 
 ### `replica.rs`: `Replica`
@@ -333,6 +333,7 @@ On peer-table changes, the main process calls `node.set_peers(&peer_table)` and 
 - **No control loop:** nothing yet reads `History` frames from control connections and calls the code above.
 - **HistorySink:** Yash's M-7/M-8 work proposes a `HistorySink { record(CompletedTurn) }` hook. It would sit on `start_job` / `complete_job` + `persist`.
 - **PR #10 conflicts:** it adds heartbeats to `PeerTable` and conflicts with the `NodeId`-keyed table here. Reconciling them is task M-21.
+- **Heartbeat timeout (M-11):** the leader now drops a worker whose heartbeats stop, not only one whose connection closes (section 9), but nothing calls `set_peers` on a live node yet.
 
 ## 7. CLI and demo
 
@@ -372,7 +373,9 @@ In priority order:
 1. **Control loop:** read `History` frames, `handle_durable` on workers, `persist` before sending on the main process, `set_peers` when the peer table changes.
 2. **Restore from export:** start a main process from a `ConversationExport` for manual takeover (david-codex's M-16 test needs this).
 3. **Reconcile with PR #10 (M-21):** heartbeat fields on the `NodeId`-keyed `PeerTable`; then hook up `HistorySink`.
-4. **Failure detection (M-11):** drop peers that miss heartbeats, not only those that disconnect.
+4. **Failure detection (M-11):** partly done.
+   - **Done:** the leader's control acceptor (`network::serve_control_with`) closes a worker's connection with close code `HEARTBEAT_TIMEOUT_CODE` (4, reason `heartbeat timeout`) when no heartbeat arrives within the timeout. `PeerSession`'s token-matched cleanup then removes it from the `PeerTable`, and the worker reconnects with backoff and rejoins with a fresh hello. `llm-cluster leader` enables this by default with `--heartbeat-timeout 7s` (three missed beats at the workers' 2s default, plus 1s slack; `0s` disables it), and the leader logs a warning when a planned worker leaves the peer table while serving, and again when it rejoins.
+   - **Remaining:** run `elect()` when the main process dies; call `set_peers` on a live node when the peer table changes, after the M-9 live wiring; send leader-to-worker heartbeats so workers notice a lost leader faster than the QUIC idle timeout.
 5. **Majority commit:** report a job as committed only once a majority of voters have acked it. Needs 3+ voters, and is also the path to safe automatic failover.
 6. **Protocol fields:** `cluster_id`, `prev_hash`, and postcard encoding.
 7. **Size and privacy:** output chunks while generating, chunked snapshots, encryption at rest (every node holds the full chat).

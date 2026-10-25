@@ -39,6 +39,10 @@ const CLOSE_REASON_DONE: &[u8] = b"done";
 /// `--heartbeat-interval` default; matches [`worker::DEFAULT_HEARTBEAT_INTERVAL`].
 const DEFAULT_HEARTBEAT_INTERVAL_ARG: &str = "2s";
 
+/// `leader --heartbeat-timeout` default: three missed beats at [`DEFAULT_HEARTBEAT_INTERVAL_ARG`]
+/// plus a second of slack; matches [`leader::DEFAULT_HEARTBEAT_TIMEOUT`].
+const DEFAULT_HEARTBEAT_TIMEOUT_ARG: &str = "7s";
+
 /// `--worker-wait` default; matches [`leader::DEFAULT_WORKER_WAIT`].
 const DEFAULT_WORKER_WAIT_ARG: &str = "60s";
 
@@ -278,6 +282,11 @@ struct LeaderArgs {
     /// How long llama-server may take to load the model and answer /health (llama backend).
     #[arg(long, default_value = DEFAULT_LLAMA_READY_TIMEOUT_ARG, value_parser = parse_duration)]
     llama_ready_timeout: Duration,
+    /// Close a worker's control connection after this long without a heartbeat, e.g. `7s`;
+    /// the worker reconnects with backoff. Must exceed the workers' --heartbeat-interval.
+    /// `0s` disables the timeout.
+    #[arg(long, default_value = DEFAULT_HEARTBEAT_TIMEOUT_ARG, value_parser = parse_duration)]
+    heartbeat_timeout: Duration,
 }
 
 /// `leader --backend` values.
@@ -318,8 +327,14 @@ impl LeaderArgs {
             upstream_port: self.llama_port,
             api_addr: self.api,
             worker_wait: self.worker_wait,
+            heartbeat_timeout: heartbeat_timeout_option(self.heartbeat_timeout),
         })
     }
+}
+
+/// Maps `--heartbeat-timeout` to the leader's setting: zero disables the timeout.
+fn heartbeat_timeout_option(timeout: Duration) -> Option<Duration> {
+    (!timeout.is_zero()).then_some(timeout)
 }
 
 /// A flag clap already requires with `--backend llama`; checked again so no unwrap is needed.
@@ -715,6 +730,33 @@ mod tests {
         assert_eq!(
             parse_duration(DEFAULT_EVIDENCE_WAIT_ARG),
             Ok(evidence::DEFAULT_EVIDENCE_WAIT)
+        );
+    }
+
+    #[test]
+    fn heartbeat_timeout_defaults_on_and_zero_disables_it() {
+        let llama = [
+            "--plan",
+            "plan.json",
+            "--profile",
+            "profile.json",
+            "--llama-server",
+            "llama-server",
+        ];
+        assert_eq!(
+            parse_duration(DEFAULT_HEARTBEAT_TIMEOUT_ARG),
+            Ok(leader::DEFAULT_HEARTBEAT_TIMEOUT)
+        );
+        assert_eq!(
+            leader_config(&llama).heartbeat_timeout,
+            Some(leader::DEFAULT_HEARTBEAT_TIMEOUT)
+        );
+        let disabled = [&llama[..], &["--heartbeat-timeout", "0s"]].concat();
+        assert_eq!(leader_config(&disabled).heartbeat_timeout, None);
+        let custom = [&llama[..], &["--heartbeat-timeout", "1500ms"]].concat();
+        assert_eq!(
+            leader_config(&custom).heartbeat_timeout,
+            Some(Duration::from_millis(1500))
         );
     }
 

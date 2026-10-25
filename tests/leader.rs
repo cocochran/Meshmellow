@@ -51,6 +51,9 @@ const SHORT_WORKER_WAIT: Duration = Duration::from_millis(500);
 const LLAMA_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const SHORT_LLAMA_READY_TIMEOUT: Duration = Duration::from_secs(2);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(200);
+/// Ten missed beats: the leader runs with its heartbeat timeout on, as in production, without a
+/// slow test machine dropping the worker.
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long the leader is left without its worker, to show it waits instead of launching.
 const WORKER_JOIN_DELAY: Duration = Duration::from_millis(500);
 const BRIDGE_PAYLOAD: &[u8] = b"ggml rpc bytes through the leader bridge";
@@ -122,6 +125,7 @@ impl Cluster {
             upstream_port: llama_port,
             api_addr,
             worker_wait: WORKER_WAIT,
+            heartbeat_timeout: Some(HEARTBEAT_TIMEOUT),
         };
         Self {
             dir,
