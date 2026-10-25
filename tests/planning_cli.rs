@@ -121,6 +121,17 @@ fn infeasible_request_exits_unsuccessfully_without_a_plan() {
 }
 
 #[test]
+fn rejects_throughput_objective_until_concurrent_measurements_exist() {
+    let mut request: llm_cluster::planning::PlanningRequest =
+        serde_json::from_str(include_str!("../examples/placement-profile.json")).unwrap();
+    request.objective = llm_cluster::planning::PlanningObjective::MultiRequestThroughput;
+    assert!(matches!(
+        llm_cluster::planning::build_plan(&request, 2),
+        Err(llm_cluster::placement::PlanError::InvalidInput(_))
+    ));
+}
+
+#[test]
 fn rejects_profile_typos_and_duplicate_device_mappings() {
     let mut input: serde_json::Value =
         serde_json::from_str(include_str!("../examples/placement-profile.json")).unwrap();

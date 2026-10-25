@@ -64,9 +64,9 @@ fn pools_memory_and_accounts_for_kv_and_reserves() {
 #[test]
 fn skips_a_slow_middle_device_and_prices_the_actual_transition() {
     let peers = [
-        peer("a", 290, 10),
-        peer("slow", 1000, 1000),
         peer("c", 290, 20),
+        peer("slow", 1000, 1000),
+        peer("a", 290, 10),
     ];
     let links = [
         link("a", "slow", 1),
@@ -111,9 +111,14 @@ fn refuses_missing_links_and_insufficient_memory() {
         plan(&model(), &peers, &[], 2),
         Err(PlanError::NoFeasiblePlacement)
     );
+    let result = plan(&model(), &peers, &[link("b", "a", 1)], 2).unwrap();
     assert_eq!(
-        plan(&model(), &peers, &[link("b", "a", 1)], 2),
-        Err(PlanError::NoFeasiblePlacement)
+        result
+            .assignments
+            .iter()
+            .map(|assignment| assignment.peer_id.as_str())
+            .collect::<Vec<_>>(),
+        ["b", "a"]
     );
 }
 

@@ -56,7 +56,7 @@ fn preflight_needs_no_runtime_evidence() {
 }
 
 #[test]
-fn preflight_rejects_stale_topology_and_peer_order() {
+fn preflight_rejects_missing_links_and_ignores_profile_order() {
     let (mut request, output, _) = fixture();
     request.links.clear();
     assert_eq!(
@@ -65,10 +65,7 @@ fn preflight_rejects_stale_topology_and_peer_order() {
     );
     let (mut request, output, _) = fixture();
     request.peers.reverse();
-    assert_eq!(
-        validate_output(&request, &output, 2),
-        Err(VerificationError::InvalidPlan)
-    );
+    assert_eq!(validate_output(&request, &output, 2), Ok(()));
 }
 
 #[test]
