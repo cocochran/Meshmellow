@@ -298,10 +298,10 @@ fn plan_with_topology(
         if ring && peer.id != request.origin_peer_id {
             continue;
         }
-        for (&(begin, end), (range, charged)) in &ranges[index] {
-            if begin != 0 {
-                continue;
-            }
+        let Some(starts) = ranges[index].get(&0) else {
+            continue;
+        };
+        for (end, range, charged) in starts {
             let ingress = if peer.id == request.origin_peer_id {
                 None
             } else {
