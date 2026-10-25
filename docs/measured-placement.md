@@ -70,6 +70,33 @@ time. It is a prediction for one sequential request, not a throughput or
 prefill estimate. `measured_placement::validate_output` recomputes a saved plan
 against refreshed inputs and rejects changed or expired profiles.
 
+## Version 2 evidence contract (proposal)
+
+The current planner consumes schema v1 and does not consume profiler output.
+Before extending it, keep these inputs separately versioned and refreshed:
+
+- **Reusable range evidence:** profile ID and schema version; model source and
+  exported-artifact hashes; backend, runtime, build and configuration identity;
+  exact `[begin,end)`; fixture ID/hash and correctness result; separate prefill
+  and decode timings with token counts; context occupancy/limit, batch and
+  sequence count; sample count; scoped peak memory during load and inference
+  by `ram`, `vram` and `shared`; thermal/power state; and terminal outcome with
+  failure/cancel reason. Retries retain earlier failures rather than replacing
+  them with successful evidence. Timings are local to the measured host.
+- **Current peer availability:** authorization/health, owner-approved
+  per-pool budget, fresh usable capacity and existing reservations. This is
+  refreshed for each placement decision and is not reusable range evidence.
+- **Directed transfer evidence:** source/destination, transport/protocol,
+  actual direct/relay path, exact payload size, workload identity, sample
+  distribution including tail, profile ID and freshness. Do not infer link
+  cost from RTT or whole-chain residuals.
+
+The planner remains advisory. Its result should identify the selected ordered
+ranges, all contributing profile IDs, objective and predicted prefill/decode
+costs. Reservation, worker readiness and manifest activation remain runtime
+responsibilities. The existing v1 JSON contract is unchanged until a compatible
+input schema and migration are implemented.
+
 ## Runtime acceptance still required
 
 ### Available Qwen3.8 ring evidence (partial)
