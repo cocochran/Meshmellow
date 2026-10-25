@@ -68,6 +68,10 @@ const SECONDS_PER_MINUTE: u64 = 60;
     about = "Peer-to-peer mesh for splitting one LLM across devices"
 )]
 struct Cli {
+    /// Enable detailed MeshThing diagnostics on stderr (also works with RUST_LOG).
+    #[arg(long, global = true)]
+    debug: bool,
+
     /// File holding this node's secret key; created on first run.
     #[arg(long, global = true, default_value = "meshthing.key")]
     key: PathBuf,
@@ -383,8 +387,8 @@ enum HistoryCommand {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_logging();
     let cli = Cli::parse();
+    init_logging(cli.debug);
     match cli.command {
         Command::Verify {
             plan,
@@ -404,9 +408,20 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Plan { profile, min_peers } => {
             let input = std::fs::read_to_string(profile)?;
-            let request = serde_json::from_str(&input)?;
+            let request: llm_cluster::planning::PlanningRequest = serde_json::from_str(&input)?;
+            tracing::debug!(
+                peers = request.peers.len(),
+                links = request.links.len(),
+                min_peers,
+                "building placement plan"
+            );
             let output = llm_cluster::planning::build_plan(&request, min_peers)
                 .map_err(|error| anyhow::anyhow!("planning failed: {error:?}"))?;
+            tracing::debug!(
+                assignments = output.placement.assignments.len(),
+                predicted_decode_us = output.placement.predicted_decode_us,
+                "placement plan ready"
+            );
             println!("{}", serde_json::to_string_pretty(&output)?);
             Ok(())
         }
@@ -519,12 +534,18 @@ fn history(command: HistoryCommand) -> anyhow::Result<()> {
 }
 
 /// Sends logs to stderr so stdout carries only intentional CLI output such as the node ID.
-fn init_logging() {
-    let filter =
+fn init_logging(debug: bool) {
+    let mut filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
+    if debug {
+        filter = filter.add_directive("llm_cluster=debug".parse().expect("constant log directive"));
+    }
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        .with_thread_ids(debug)
+        .with_file(debug)
+        .with_line_number(debug)
         .init();
 }
 
