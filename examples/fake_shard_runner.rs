@@ -4,7 +4,9 @@
 //! Usage: `fake_shard_runner MODEL BEGIN END CONTEXT GPU_LAYERS BUDGET_BYTES PROMPT RETURN_LOGITS`
 //!
 //! MODEL is a JSON file such as `examples/fake-shard-model.json`:
-//! `{"layers":4,"embd":8,"vocab":300,"reply":"Hello from the shards."}`.
+//! `{"layers":4,"embd":8,"vocab":300,"reply":"Hello from the shards.","source_sha256":"..."}`.
+//! The optional `source_sha256` is reported in the metadata line as an exported shard's model
+//! identity (empty when absent, like a plain GGUF).
 //!
 //! - The prompt tokenizes to BOS (0) followed by each prompt byte plus one.
 //! - The first stage (`BEGIN == 0`) maps token `t` to a row of `embd` copies of `t + END`. A later
@@ -68,6 +70,9 @@ struct FakeModel {
     embd: u32,
     vocab: u32,
     reply: String,
+    /// Model identity reported as the metadata's `source_sha256`; empty when absent.
+    #[serde(default)]
+    source_sha256: String,
 }
 
 /// Parsed command line.
@@ -227,7 +232,7 @@ impl Stage {
             embd: self.model.embd,
             vocab: self.model.vocab,
             allocated_bytes: 0,
-            source_sha256: String::new(),
+            source_sha256: self.model.source_sha256.clone(),
             tokens: self.prompt_tokens.clone(),
             model_sha256: None,
             artifact_sha256: None,
