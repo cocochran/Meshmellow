@@ -17,6 +17,7 @@ use llm_cluster::profiling::{
     ProfileConfig, ProfileError, ProfileInfo, ProfileManager, ProfileStatus,
 };
 use llm_cluster::shard::pipeline::{LocalLaunch, StageLink};
+use llm_cluster::worker_profile::WorkerProfileControl;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
@@ -135,6 +136,151 @@ async fn exists(path: &Path) {
     })
     .await
     .expect("process marker did not appear");
+}
+
+fn assert_native_stopped(fixture: &Fixture) {
+    let pid = std::fs::read_to_string(fixture.dir.path().join("pid")).unwrap();
+    let absent = std::process::Command::new(&fixture.config.python)
+        .arg("-c")
+        .arg("import os,sys;\ntry: os.kill(int(sys.argv[1]),0)\nexcept ProcessLookupError: sys.exit(0)\nsys.exit(1)")
+        .arg(pid)
+        .status().unwrap();
+    assert!(absent.success(), "native profile process survived cleanup");
+}
+
+async fn start_over_http(address: std::net::SocketAddr) -> String {
+    let response = reqwest::Client::new()
+        .post(format!("http://{address}/profiles"))
+        .json(&json!({"candidate":"candidate","compute_enabled":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+    response.json::<Value>().await.unwrap()["run_id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn synchronous_shutdown_cancels_with_manager_handles_still_alive() {
+    let fixture = Fixture::new("step_hang");
+    let manager = fixture.manager().await;
+    let other_handle = manager.clone();
+    let run = manager.start("candidate", true).unwrap();
+    exists(&fixture.dir.path().join("pid")).await;
+    manager.request_shutdown();
+    assert!(matches!(
+        other_handle.start("candidate", true),
+        Err(ProfileError::Unavailable)
+    ));
+    let done = finished(&other_handle, &run.run_id).await;
+    assert_eq!(done.status, ProfileStatus::Finished, "{done:?}");
+    assert_eq!(done.outcome.as_deref(), Some("cancelled"));
+    assert!(done.cleanup_confirmed);
+    assert_native_stopped(&fixture);
+    assert!(fixture.admission.try_profile().is_ok());
+}
+
+#[tokio::test]
+async fn worker_profile_listener_shares_native_admission_and_drains_on_stop() {
+    let fixture = Fixture::new("step_hang");
+    let manager = fixture.manager().await;
+    let controller = WorkerProfileControl::bind(manager.clone(), "127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let address = controller.local_addr().unwrap();
+    let (stop, stopped) = oneshot::channel();
+    let service = tokio::spawn(controller.run(std::future::pending(), async {
+        stopped.await?;
+        Ok(())
+    }));
+    let mut child = AdmittedChild::spawn_on(
+        Command::new(&fixture.config.python).args(["-c", "import time; time.sleep(60)"]),
+        &fixture.admission,
+    )
+    .await
+    .unwrap();
+    let response = reqwest::Client::new()
+        .post(format!("http://{address}/profiles"))
+        .json(&json!({"candidate":"candidate","compute_enabled":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 409);
+    assert!(!fixture.dir.path().join("pid").exists());
+    child.start_kill().unwrap();
+    child.wait().await.unwrap();
+    drop(child);
+    let id = start_over_http(address).await;
+    exists(&fixture.dir.path().join("pid")).await;
+    stop.send(()).unwrap();
+    timeout(WAIT, service).await.unwrap().unwrap().unwrap();
+    let done = manager.status(&id).unwrap();
+    assert_eq!(done.status, ProfileStatus::Finished, "{done:?}");
+    assert_eq!(done.outcome.as_deref(), Some("cancelled"));
+    assert!(done.cleanup_confirmed);
+    assert!(matches!(
+        manager.start("candidate", true),
+        Err(ProfileError::Unavailable)
+    ));
+    assert_native_stopped(&fixture);
+    assert!(fixture.admission.try_profile().is_ok());
+    assert!(tokio::net::TcpStream::connect(address).await.is_err());
+}
+
+#[tokio::test]
+async fn worker_profile_listener_task_abort_cancels_with_external_manager_handle() {
+    let fixture = Fixture::new("step_hang");
+    let manager = fixture.manager().await;
+    let controller = WorkerProfileControl::bind(manager.clone(), "127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let address = controller.local_addr().unwrap();
+    let service = tokio::spawn(controller.run(std::future::pending(), std::future::pending()));
+    let id = start_over_http(address).await;
+    exists(&fixture.dir.path().join("pid")).await;
+    service.abort();
+    assert!(service.await.unwrap_err().is_cancelled());
+    let done = finished(&manager, &id).await;
+    assert_eq!(done.status, ProfileStatus::Finished, "{done:?}");
+    assert_eq!(done.outcome.as_deref(), Some("cancelled"));
+    assert!(done.cleanup_confirmed);
+    assert!(matches!(
+        manager.start("candidate", true),
+        Err(ProfileError::Unavailable)
+    ));
+    assert_native_stopped(&fixture);
+    assert!(fixture.admission.try_profile().is_ok());
+}
+
+#[tokio::test]
+async fn worker_profile_listener_worker_failure_cleans_up_and_preserves_error() {
+    let fixture = Fixture::new("step_hang");
+    let manager = fixture.manager().await;
+    let controller = WorkerProfileControl::bind(manager.clone(), "127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let address = controller.local_addr().unwrap();
+    let (fail, failed) = oneshot::channel();
+    let service = tokio::spawn(controller.run(
+        async {
+            failed.await?;
+            anyhow::bail!("worker sentinel failure")
+        },
+        std::future::pending(),
+    ));
+    let id = start_over_http(address).await;
+    exists(&fixture.dir.path().join("pid")).await;
+    fail.send(()).unwrap();
+    let error = timeout(WAIT, service).await.unwrap().unwrap().unwrap_err();
+    assert_eq!(error.to_string(), "worker sentinel failure");
+    let done = manager.status(&id).unwrap();
+    assert_eq!(done.status, ProfileStatus::Finished, "{done:?}");
+    assert_eq!(done.outcome.as_deref(), Some("cancelled"));
+    assert!(done.cleanup_confirmed);
+    assert_native_stopped(&fixture);
+    assert!(fixture.admission.try_profile().is_ok());
 }
 
 #[tokio::test]

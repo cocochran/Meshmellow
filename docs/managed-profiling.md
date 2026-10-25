@@ -74,6 +74,43 @@ The manager must share the same admission owner as its actual native backend.
 `with_admission` supports explicit ownership in an embedding or isolated tests;
 creating a separate owner for profiling and inference defeats exclusion.
 
+## Standalone shard and ring workers
+
+`shard-serve` and `shard-ring-worker` accept the paired optional flags
+`--profile-config /absolute/path/to/profiles.json` and
+`--profile-api 127.0.0.1:8091`. Use the configuration format above. Supplying
+exactly one flag is rejected. Omitting both preserves existing worker behavior
+and creates no profile listener.
+
+For example, append these flags to the worker's existing launch arguments:
+
+```sh
+--profile-config /absolute/path/to/profiles.json --profile-api 127.0.0.1:8091
+```
+
+The listener accepts only loopback addresses and exposes the same `/profiles`
+routes below. It runs inside the worker process and uses its actual
+`ComputeAdmission::process()` owner. A downloaded candidate must already be
+verified and registered in the trusted configuration; a successful download does
+not start profiling, qualify placement or activate a new range. These flags
+support the POSIX helper; they do not embed it into mobile apps.
+
+Worker completion or failure, profile API failure, and Ctrl-C close profile
+admission, cancel any profile and await its bounded cleanup. The worker accept
+future is dropped first, which cancels native sessions through their existing
+child owners. The Iroh endpoint closes after profile cleanup. If the host aborts
+the control task, a drop guard still requests profile cancellation even when
+other manager handles remain alive; asynchronous cleanup needs a running Tokio
+runtime. Existing child owners retain or fence admission if reaping cannot be
+confirmed. This is not whole-device process supervision or crash recovery.
+
+Embedders can use `worker_profile::WorkerProfileControl::bind(manager, address)`
+and `run(worker_future, stop_future)`. The worker future must cancel its sessions
+on drop, as the native shard and ring workers do. Embedders supplying a custom
+admission owner must share that same owner between native execution and the
+profile manager. `request_shutdown()` requests cancellation synchronously for
+host drop guards; `shutdown().await` waits for normal cleanup.
+
 ## Control contract
 
 | Request | Behavior |
@@ -129,13 +166,12 @@ owner crash; startup reconciliation is a separate gate before unattended use.
 
 ## Integration still required
 
-- Publication integrates M-27's NativeRunner/Shard::spawn_runner/reap path with
-  the same `AdmittedChild` owner. Ring session admission remains process-local;
-  external ring processes are not protected by another process's manager. No ALPN
-  dispatch, accept loop or ring wire protocol changes are made.
-- Standalone workers/diagnostics in other processes do not share this gate.
-  A worker's profile controller must live under the same runtime owner; a separate
-  profile CLI process cannot lock it through this in-memory gate.
+- Ring session admission remains process-local; external ring processes are not
+  protected by another process's manager. No ALPN dispatch, accept loop or ring
+  wire protocol changes are made by the profile listener.
+- Standalone diagnostics in other processes do not share this gate. Configure
+  each worker's own listener; a separate profile CLI process cannot lock it
+  through this in-memory gate.
 - Mobile in-process engines need leases covering actual native context lifetime,
   suspension/cancellation callbacks and device power/thermal policies. The Python
   subprocess helper is not a mobile embedding solution.
@@ -162,8 +198,10 @@ The Rust tests exercise the real helper with synthetic native fixtures, includin
 busy admission, real stage ownership, cancellation before waiting inference can
 start, stale/missing reports, forced-stop fencing, API schema/opt-in checks and
 host shutdown. They establish lifecycle behavior, not hardware performance.
-One test binds a real loopback listener; environments that deny socket binds
-cannot validate that test. The in-process router test covers the same control
-handlers without sockets and is not reported as a substitute for listener coverage.
+Four tests bind real loopback listeners, including worker busy admission, normal
+shutdown, task abort and worker failure; environments that deny socket binds
+cannot validate those tests. The in-process router and synchronous shutdown
+tests cover handlers and cancellation without sockets and are not substitutes
+for listener coverage.
 
 Publication reconciliation also preserves the shared peer API router and static Rust UI. The embedded UI host must still opt into a configured ProfileManager; this patch does not add profiling controls to the app.
