@@ -451,6 +451,7 @@ async fn receive_control_streams(
                 Ok(recv) => {
                     let reader = StreamReader {
                         peer: session.node_id(),
+                        connection_token: session.connection_token(),
                         peers: Arc::clone(peers),
                         accepted_heartbeat: Arc::clone(&accepted_heartbeat),
                     };
@@ -485,6 +486,7 @@ async fn close_for_heartbeat_timeout(
 /// peer table accepts.
 struct StreamReader {
     peer: NodeId,
+    connection_token: u64,
     peers: SharedPeerTable,
     accepted_heartbeat: Arc<Notify>,
 }
@@ -510,7 +512,7 @@ impl StreamReader {
 
     /// Records `heartbeat` and, if the table accepts it, resets the session's watchdog.
     fn on_heartbeat(&self, heartbeat: &Heartbeat) {
-        if record_heartbeat(&self.peers, self.peer, heartbeat) {
+        if record_heartbeat(&self.peers, self.peer, self.connection_token, heartbeat) {
             self.accepted_heartbeat.notify_one();
         }
     }
@@ -518,7 +520,12 @@ impl StreamReader {
 
 /// Records a heartbeat from `peer`, dropping it if it names another node or is stale; returns
 /// whether the table accepted it.
-fn record_heartbeat(peers: &SharedPeerTable, peer: NodeId, heartbeat: &Heartbeat) -> bool {
+fn record_heartbeat(
+    peers: &SharedPeerTable,
+    peer: NodeId,
+    connection_token: u64,
+    heartbeat: &Heartbeat,
+) -> bool {
     if parse_node_id(&heartbeat.node_id).ok() != Some(peer) {
         warn!(%peer, claimed = %heartbeat.node_id, "ignoring heartbeat sent for another node");
         return false;
@@ -527,6 +534,11 @@ fn record_heartbeat(peers: &SharedPeerTable, peer: NodeId, heartbeat: &Heartbeat
         warn!(%peer, "peer table lock poisoned; dropping heartbeat");
         return false;
     };
+    // A superseded connection must not overwrite the replacement's sequence or
+    // liveness. Check under the same lock as the update, just like peer cleanup.
+    if table.get(&peer).map(|info| info.connection_token) != Some(connection_token) {
+        return false;
+    }
     let accepted = table.record_heartbeat(&peer, heartbeat);
     if accepted {
         debug!(%peer, epoch = heartbeat.epoch, sequence = heartbeat.sequence, "heartbeat");
@@ -730,6 +742,58 @@ fn encode_hex(bytes: &[u8; SECRET_KEY_LEN]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn superseded_connection_cannot_update_reconnected_peers_heartbeat() {
+        let peer = SecretKey::generate().public();
+        let hello = Hello {
+            node_id: peer.to_string(),
+            protocol_version: 1,
+            cluster_id: "test".into(),
+            last_log_index: 0,
+        };
+        let peers = Arc::new(Mutex::new(crate::node::PeerTable::new()));
+        let old = peers
+            .lock()
+            .unwrap()
+            .record_connection(peer, &hello)
+            .connection_token;
+        let current = peers
+            .lock()
+            .unwrap()
+            .record_connection(peer, &hello)
+            .connection_token;
+        let stale = Heartbeat {
+            node_id: peer.to_string(),
+            epoch: 0,
+            sequence: 500,
+        };
+        assert!(!record_heartbeat(&peers, peer, old, &stale));
+        assert_eq!(
+            peers
+                .lock()
+                .unwrap()
+                .get(&peer)
+                .unwrap()
+                .last_heartbeat_sequence,
+            None
+        );
+        let fresh = Heartbeat {
+            sequence: 1,
+            ..stale.clone()
+        };
+        assert!(record_heartbeat(&peers, peer, current, &fresh));
+        assert!(!record_heartbeat(&peers, peer, old, &stale));
+        assert_eq!(
+            peers
+                .lock()
+                .unwrap()
+                .get(&peer)
+                .unwrap()
+                .last_heartbeat_sequence,
+            Some(1)
+        );
+    }
 
     fn temp_key_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("meshthing-{}-{name}.key", std::process::id()))
