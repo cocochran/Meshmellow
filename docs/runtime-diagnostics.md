@@ -27,6 +27,25 @@ records the whole serial step. Timeout errors identify whether the write or
 read phase exceeded the shared step deadline. These new events do not include
 prompt text, token IDs or generated text.
 
+The HTTP API's `job running` event includes `queue_wait_ms`, measuring how long
+the request waited for the single inference slot. Streamed responses reject
+individual SSE lines larger than 1 MiB and do not append those lines to the
+history sink. Child process stdout/stderr and local runner stderr are split into
+8 KiB chunks per tracing event, so a process that emits an unusually long line
+cannot force the logger to buffer the entire line at once.
+Non-streaming upstream responses are capped at 16 MiB while buffering. Streaming responses
+continue to the client, but responses over 16 MiB are omitted from conversation history to keep
+history capture bounded; this is logged when the stream completes.
+Mesh membership refreshes log per-member sync failures, and control-session task failures are
+logged with the affected peer when available.
+The enrollment CLI warns on the first periodic membership refresh failure or timeout, uses
+debug logs for continuing failures, and logs when refresh recovers; this avoids hiding an outage
+while keeping the normal two-second polling loop from flooding warning logs.
+Readiness-probe error excerpts are capped at 512 characters (at most 2 KiB read), and the
+external run-evidence file is capped at 1 MiB per poll.
+The CLI rejects plan, profile and shard-manifest JSON files larger than 64 MiB before parsing;
+the limit is also enforced while reading in case a file grows after its size check.
+
 Durations use a local monotonic clock. A stage's `read_us` includes waiting for
 the remote stage to compute and reply; it is not a pure network transfer time.
 Do not subtract timestamps recorded on different machines to infer hop latency.

@@ -416,18 +416,18 @@ async fn main() -> anyhow::Result<()> {
             min_peers,
         } => {
             let output: llm_cluster::planning::PlanningOutput =
-                serde_json::from_str(&std::fs::read_to_string(plan)?)?;
+                llm_cluster::config::read_json_file(&plan, "plan")?;
             let request: llm_cluster::planning::PlanningRequest =
-                serde_json::from_str(&std::fs::read_to_string(profile)?)?;
-            let evidence = serde_json::from_str(&std::fs::read_to_string(evidence)?)?;
+                llm_cluster::config::read_json_file(&profile, "profile")?;
+            let evidence = llm_cluster::config::read_json_file(&evidence, "evidence")?;
             llm_cluster::planning::verify_output(&request, &output, &evidence, min_peers)
                 .map_err(|error| anyhow::anyhow!("verification failed: {error:?}"))?;
             println!("{{\"verified\":true}}");
             Ok(())
         }
         Command::Plan { profile, min_peers } => {
-            let input = std::fs::read_to_string(profile)?;
-            let request: llm_cluster::planning::PlanningRequest = serde_json::from_str(&input)?;
+            let request: llm_cluster::planning::PlanningRequest =
+                llm_cluster::config::read_json_file(&profile, "profile")?;
             tracing::debug!(
                 peers = request.peers.len(),
                 links = request.links.len(),
@@ -446,7 +446,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::MeasuredPlan { profile } => {
             let request: llm_cluster::measured_placement::MeasuredRequest =
-                serde_json::from_str(&std::fs::read_to_string(profile)?)?;
+                llm_cluster::config::read_json_file(&profile, "measured profile")?;
             let output = llm_cluster::measured_placement::plan(&request)
                 .map_err(|error| anyhow::anyhow!("measured planning failed: {error:?}"))?;
             println!("{}", serde_json::to_string_pretty(&output)?);
@@ -454,9 +454,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::ValidateMeasured { plan, profile } => {
             let request: llm_cluster::measured_placement::MeasuredRequest =
-                serde_json::from_str(&std::fs::read_to_string(profile)?)?;
+                llm_cluster::config::read_json_file(&profile, "measured profile")?;
             let output: llm_cluster::measured_placement::MeasuredPlacement =
-                serde_json::from_str(&std::fs::read_to_string(plan)?)?;
+                llm_cluster::config::read_json_file(&plan, "measured plan")?;
             llm_cluster::measured_placement::validate_output(&request, &output)
                 .map_err(|error| anyhow::anyhow!("measured plan validation failed: {error:?}"))?;
             println!("{{\"validated\":true}}");

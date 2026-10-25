@@ -17,9 +17,13 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{Mutex, Semaphore};
+use tracing::{debug, info, warn};
+
+use crate::config::read_file_limited;
 
 const ALPN: &[u8] = b"meshthing/enrollment/1";
 const MAX_WIRE: usize = 128 * 1024;
+const MAX_IDENTITY_KEY_BYTES: usize = 32;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Peer {
@@ -154,7 +158,7 @@ impl Node {
         }
         let key_path = dir.join("identity.key");
         let key =
-            match std::fs::read(&key_path) {
+            match read_file_limited(&key_path, MAX_IDENTITY_KEY_BYTES) {
                 Ok(bytes) => SecretKey::from_bytes(&bytes.try_into().map_err(|_| {
                     anyhow::anyhow!("Invalid saved identity; refusing to replace it.")
                 })?),
@@ -163,14 +167,14 @@ impl Node {
                     write_private(&key_path, &key.to_bytes(), true)?;
                     key
                 }
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                    bail!("Invalid saved identity; refusing to replace it.");
+                }
                 Err(error) => return Err(error.into()),
             };
         let path = dir.join("membership.json");
-        let record: Record = match std::fs::read(&path) {
-            Ok(bytes) => {
-                ensure!(bytes.len() <= MAX_WIRE, "Saved membership is too large.");
-                serde_json::from_slice(&bytes)?
-            }
+        let record: Record = match read_file_limited(&path, MAX_WIRE) {
+            Ok(bytes) => serde_json::from_slice(&bytes)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Record::default(),
             Err(error) => return Err(error.into()),
         };
@@ -243,7 +247,7 @@ impl Node {
         write_private(&temporary, &bytes, false)?;
         std::fs::rename(&temporary, &self.path)?;
         // Persist rename as well as file contents before reporting success.
-        std::fs::File::open(self.path.parent().unwrap())?.sync_all()?;
+        sync_parent_dir(&self.path)?;
         Ok(())
     }
 
@@ -514,26 +518,35 @@ impl Node {
             let ledger = ledger.clone();
             jobs.spawn(async move {
                 // An offline member must not stall every UI refresh or command.
-                let reply = tokio::time::timeout(
+                let member = peer.id.clone();
+                let result = tokio::time::timeout(
                     Duration::from_secs(3),
                     node.rpc(&peer, Wire::Sync { ledger }),
                 )
                 .await
-                .context("Member sync timed out.")??;
-                Ok::<_, anyhow::Error>((peer.id, reply))
+                .context("Member sync timed out.")
+                .and_then(|reply| reply);
+                match result {
+                    Ok(reply) => Ok::<_, (String, anyhow::Error)>((member, reply)),
+                    Err(error) => Err((member, error)),
+                }
             });
         }
         let mut pending = vec![];
         while let Some(result) = jobs.join_next().await {
-            if let Ok(Ok((issuer, response))) = result {
-                if let Some(next) = response.ledger {
-                    self.merge(&next).await?;
-                }
-                pending.extend(
-                    response.pending.into_iter().filter(|p| {
+            match result {
+                Ok(Ok((issuer, response))) => {
+                    if let Some(next) = response.ledger {
+                        self.merge(&next).await?;
+                    }
+                    pending.extend(response.pending.into_iter().filter(|p| {
                         p.issuer == issuer && p.status == "pending" && p.expires > now()
-                    }),
-                );
+                    }));
+                }
+                Ok(Err((member, error))) => {
+                    warn!(%member, %error, "mesh member sync failed");
+                }
+                Err(error) => warn!(%error, "mesh member sync task failed"),
             }
         }
         *self.remote_pending.lock().await = pending;
@@ -864,8 +877,12 @@ impl Node {
                             id.clone(),
                             tokio::spawn(async move {
                                 while !client.endpoint.is_closed() {
-                                    let Ok(hello) = client.control_hello(&remote).await else {
-                                        break;
+                                    let hello = match client.control_hello(&remote).await {
+                                        Ok(hello) => hello,
+                                        Err(error) => {
+                                            debug!(peer = %remote, %error, "mesh control hello failed");
+                                            break;
+                                        }
                                     };
                                     let peer =
                                         client.peers.lock().await.get(&remote).cloned().unwrap_or(
@@ -876,8 +893,12 @@ impl Node {
                                                 relay: None,
                                             },
                                         );
-                                    let Ok(address) = peer.addr() else {
-                                        break;
+                                    let address = match peer.addr() {
+                                        Ok(address) => address,
+                                        Err(error) => {
+                                            debug!(peer = %remote, %error, "mesh peer has no dialable address");
+                                            break;
+                                        }
                                     };
                                     let dial = crate::network::dial_peer(
                                         &client.endpoint,
@@ -885,16 +906,23 @@ impl Node {
                                         &hello,
                                         &client.control_peers,
                                     );
-                                    if let Ok(Ok(session)) =
-                                        tokio::time::timeout(Duration::from_secs(15), dial).await
-                                    {
-                                        crate::network::maintain_peer_session(
-                                            &session,
-                                            &client.id(),
-                                            &client.control_peers,
-                                            Self::control_options(),
-                                        )
-                                        .await;
+                                    match tokio::time::timeout(Duration::from_secs(15), dial).await {
+                                        Ok(Ok(session)) => {
+                                            let reason = crate::network::maintain_peer_session(
+                                                &session,
+                                                &client.id(),
+                                                &client.control_peers,
+                                                Self::control_options(),
+                                            )
+                                            .await;
+                                            info!(peer = %remote, %reason, "mesh control peer disconnected");
+                                        }
+                                        Ok(Err(error)) => {
+                                            debug!(peer = %remote, %error, "mesh control dial failed; retrying");
+                                        }
+                                        Err(_) => {
+                                            debug!(peer = %remote, "mesh control dial timed out; retrying");
+                                        }
                                     }
                                     tokio::time::sleep(Duration::from_secs(2)).await;
                                 }
@@ -920,39 +948,57 @@ impl Node {
                 let node = node.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let Ok(Ok(connection)) =
-                        tokio::time::timeout(Duration::from_secs(10), incoming).await
-                    else {
-                        return;
-                    };
+                    let connection =
+                        match tokio::time::timeout(Duration::from_secs(10), incoming).await {
+                            Ok(Ok(connection)) => connection,
+                            Ok(Err(error)) => {
+                                debug!(%error, "mesh connection handshake failed");
+                                return;
+                            }
+                            Err(_) => {
+                                warn!("mesh connection handshake timed out");
+                                return;
+                            }
+                        };
                     let remote = connection.remote_id().to_string();
                     if connection.alpn() == crate::protocol::CONTROL_ALPN {
-                        let Ok(hello) = node.control_hello(&remote).await else {
-                            connection.close(1u32.into(), b"membership required");
-                            return;
+                        let hello = match node.control_hello(&remote).await {
+                            Ok(hello) => hello,
+                            Err(error) => {
+                                debug!(peer = %remote, %error, "rejecting control connection without membership");
+                                connection.close(1u32.into(), b"membership required");
+                                return;
+                            }
                         };
-                        if let Ok(session) = crate::network::accept_peer_connection(
+                        match crate::network::accept_peer_connection(
                             connection,
                             &hello,
                             &node.control_peers,
                         )
                         .await
                         {
-                            crate::network::maintain_peer_session(
-                                &session,
-                                &node.id(),
-                                &node.control_peers,
-                                Self::control_options(),
-                            )
-                            .await;
+                            Ok(session) => {
+                                let reason = crate::network::maintain_peer_session(
+                                    &session,
+                                    &node.id(),
+                                    &node.control_peers,
+                                    Self::control_options(),
+                                )
+                                .await;
+                                info!(peer = %remote, %reason, "mesh control peer disconnected");
+                            }
+                            Err(error) => {
+                                debug!(peer = %remote, %error, "mesh control handshake failed")
+                            }
                         }
                         return;
                     }
-                    let _ = tokio::time::timeout(Duration::from_secs(30), async move {
+                    let request_peer = remote.clone();
+                    let result = tokio::time::timeout(Duration::from_secs(30), async move {
                         let (mut send, mut recv) = connection.accept_bi().await?;
                         let data = recv.read_to_end(MAX_WIRE).await?;
                         let reply = match serde_json::from_slice::<Wire>(&data) {
-                            Ok(message) => node.dispatch(&remote, message).await,
+                            Ok(message) => node.dispatch(&request_peer, message).await,
                             Err(error) => Err(error.into()),
                         }
                         .unwrap_or_else(|e| Reply {
@@ -966,6 +1012,11 @@ impl Node {
                         Ok::<_, anyhow::Error>(())
                     })
                     .await;
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => warn!(peer = %remote, %error, "mesh request failed"),
+                        Err(_) => warn!(peer = %remote, "mesh request timed out"),
+                    }
                 });
             }
         });
@@ -991,6 +1042,19 @@ impl Node {
         .await
         .context("Device unavailable. Check your Internet connection and keep both apps open.")?
     }
+}
+
+/// Flushes the directory entry after an atomic rename where the platform supports it.
+/// Windows does not allow opening a directory with `File::open`; the membership file itself
+/// has already been synced before the rename.
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 fn write_private(path: &Path, bytes: &[u8], create_new: bool) -> Result<()> {

@@ -36,6 +36,7 @@ use tokio::task::JoinSet;
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
+use crate::config::read_file_limited;
 use crate::node::{NodeId, PeerTable};
 use crate::protocol::{self, CONTROL_ALPN, Heartbeat, Hello, Message, PROTOCOL_VERSION};
 
@@ -85,6 +86,9 @@ const SECRET_KEY_LEN: usize = 32;
 /// Unix permissions for a new key file: read/write for the owner only.
 #[cfg(unix)]
 const OWNER_ONLY_MODE: u32 = 0o600;
+
+/// Encoded secret keys are 64 hex characters; allow a small amount of surrounding whitespace.
+const MAX_SECRET_KEY_FILE_BYTES: usize = 128;
 
 /// Loads the secret key at `key_path` (creating and saving it if absent) and binds an endpoint accepting `alpns`.
 ///
@@ -288,7 +292,11 @@ pub async fn serve_control_with(
             run_control_session(incoming, &local, &peers, options).await;
         });
         // Reap finished sessions so a long-running listener does not accumulate them.
-        while sessions.try_join_next().is_some() {}
+        while let Some(result) = sessions.try_join_next() {
+            if let Err(error) = result {
+                warn!(%error, "control session task failed");
+            }
+        }
     }
     sessions.shutdown().await;
     Ok(())
@@ -492,7 +500,11 @@ async fn receive_control_streams(
                 }
                 Err(reason) => return reason,
             },
-            Some(_) = streams.join_next(), if !streams.is_empty() => {}
+            Some(result) = streams.join_next(), if !streams.is_empty() => {
+                if let Err(error) = result {
+                    warn!(peer = %session.node_id(), %error, "control stream reader task failed");
+                }
+            }
             () = accepted_heartbeat.notified() => watchdog.reset(),
             () = watchdog.expired() => {
                 return close_for_heartbeat_timeout(session, watchdog.timeout).await;
@@ -735,8 +747,9 @@ async fn bind_with_preset(
 
 /// Reads the hex-encoded secret key at `path`, or generates one and writes it there.
 fn load_or_create_secret_key(path: &Path) -> anyhow::Result<SecretKey> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => text
+    match read_file_limited(path, MAX_SECRET_KEY_FILE_BYTES) {
+        Ok(bytes) => String::from_utf8(bytes)
+            .context("secret key file is not valid UTF-8")?
             .trim()
             .parse()
             .with_context(|| format!("invalid secret key in {}", path.display())),
@@ -849,6 +862,18 @@ mod tests {
     fn corrupt_key_file_is_an_error() {
         let path = temp_key_path("corrupt");
         std::fs::write(&path, "not a key").expect("write key");
+
+        let result = load_or_create_secret_key(&path);
+        std::fs::remove_file(&path).expect("remove key");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn oversized_secret_key_file_is_rejected() {
+        let path = temp_key_path("oversized");
+        std::fs::write(&path, vec![b'0'; MAX_SECRET_KEY_FILE_BYTES + 1])
+            .expect("write oversized key");
 
         let result = load_or_create_secret_key(&path);
         std::fs::remove_file(&path).expect("remove key");

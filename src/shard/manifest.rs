@@ -35,6 +35,7 @@ use iroh::EndpointId;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::config::read_json_file;
 use crate::shard::wire::{self, MAX_CONTEXT};
 
 /// Smallest context window the shard runner accepts.
@@ -205,10 +206,7 @@ impl StageSpec {
 impl ShardManifest {
     /// Reads and parses the manifest at `path` (errors name the file), then validates it.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read shard manifest {}", path.display()))?;
-        let manifest: Self = serde_json::from_str(&text)
-            .with_context(|| format!("invalid shard manifest {}", path.display()))?;
+        let manifest: Self = read_json_file(path, "shard manifest")?;
         manifest
             .validate()
             .with_context(|| format!("invalid shard manifest {}", path.display()))?;

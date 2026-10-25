@@ -13,14 +13,14 @@
 //! One generation runs at a time; later requests wait for the lock. A failure before any
 //! response bytes are sent is a JSON error with a 5xx status (400 for a prompt longer than
 //! the context). A failure mid-stream sends an SSE `error` event and ends without `[DONE]`,
-//! which makes the job API fail the job without committing history. A client that disconnects
-//! drops its generation, which kills the local runners and closes the remote streams.
+//! which makes the job API fail the job without committing history. A client disconnect signals
+//! cancellation, then the pipeline kills and reaps local runners before releasing its slot.
 
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
 use axum::body::{Body, Bytes};
@@ -30,13 +30,14 @@ use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use futures_util::future::try_join_all;
+use futures_util::future::join_all;
 use futures_util::{StreamExt, stream};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::{Receiver, Sender, channel};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -44,8 +45,8 @@ use crate::api::CHAT_COMPLETIONS_PATH;
 use crate::shard::manifest::{ChatTemplate, ShardManifest, StageLocation, StageSpec};
 use crate::shard::manifest::{same_sha256, sha256_file};
 use crate::shard::pipeline::{
-    FinishReason, Generation, GenerationLimits, LocalLaunch, METADATA_TIMEOUT, Pipeline,
-    PromptTooLong, StageExpectation, StageIdentity, StageLink,
+    FinishReason, Generation, GenerationCancelled, GenerationLimits, LocalLaunch, METADATA_TIMEOUT,
+    Pipeline, PromptTooLong, StageExpectation, StageIdentity, StageLink,
 };
 
 /// Liveness probe, as llama-server serves it.
@@ -65,6 +66,9 @@ const EVENT_STREAM: &str = "text/event-stream";
 
 /// `Cache-Control` for a streamed reply: proxies must pass chunks through as they come.
 const NO_CACHE: &str = "no-cache";
+
+/// Bounds queued text chunks when a client reads more slowly than inference produces.
+const GENERATION_EVENT_BUFFER: usize = 16;
 
 /// Where the frontend listens, what it serves, and the endpoint remote stages are dialled from.
 pub struct FrontendConfig {
@@ -318,13 +322,17 @@ impl Failure {
     }
 }
 
-/// Aborts the generation task when dropped (the client went away), which drops its stage
-/// links: local runners are killed and remote streams closed.
-struct GenerationTask(JoinHandle<()>);
+/// Signals cancellation when the client goes away; the task remains alive for pipeline cleanup.
+struct GenerationTask {
+    cancel: Option<oneshot::Sender<()>>,
+    _join: JoinHandle<()>,
+}
 
 impl Drop for GenerationTask {
     fn drop(&mut self) {
-        self.0.abort();
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
     }
 }
 
@@ -391,13 +399,18 @@ async fn chat_completions(State(state): State<Arc<FrontendState>>, body: Bytes) 
         max_tokens = request.max_tokens,
         "shard generation requested"
     );
-    let (events_tx, mut events) = unbounded_channel();
-    let task = GenerationTask(tokio::spawn(run_generation(
-        Arc::clone(&state),
-        request.prompt,
-        request.max_tokens,
-        events_tx,
-    )));
+    let (events_tx, mut events) = channel(GENERATION_EVENT_BUFFER);
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    let task = GenerationTask {
+        cancel: Some(cancel_tx),
+        _join: tokio::spawn(run_generation(
+            Arc::clone(&state),
+            request.prompt,
+            request.max_tokens,
+            events_tx,
+            cancel_rx,
+        )),
+    };
     match events.recv().await {
         Some(Event::Started) => {}
         Some(Event::Failed(failure)) => return failure_response(&failure),
@@ -417,10 +430,20 @@ async fn run_generation(
     state: Arc<FrontendState>,
     prompt: String,
     max_tokens: u32,
-    events: UnboundedSender<Event>,
+    events: Sender<Event>,
+    mut cancel: oneshot::Receiver<()>,
 ) {
-    let _turn = Arc::clone(&state.generation_lock).lock_owned().await;
-    let event = match generate(&state, &prompt, max_tokens, &events).await {
+    let queued_at = Instant::now();
+    let _turn = tokio::select! {
+        biased;
+        _ = &mut cancel => return,
+        turn = Arc::clone(&state.generation_lock).lock_owned() => turn,
+    };
+    info!(
+        queue_wait_ms = queued_at.elapsed().as_millis(),
+        "shard generation acquired slot"
+    );
+    let event = match generate(&state, &prompt, max_tokens, &events, cancel).await {
         Ok(generation) => {
             info!(
                 finish = generation.finish.as_str(),
@@ -429,42 +452,80 @@ async fn run_generation(
             );
             Event::Finished(generation)
         }
+        Err(error) if error.downcast_ref::<GenerationCancelled>().is_some() => {
+            info!("client disconnected; shard generation canceled after cleanup");
+            return;
+        }
         Err(error) => {
             warn!(error = %format!("{error:#}"), "shard generation failed");
             Event::Failed(Failure::from_error(&error))
         }
     };
     // The handler may be gone (client disconnected); then nobody needs the outcome.
-    let _ = events.send(event);
+    let _ = events.send(event).await;
 }
 
 async fn generate(
     state: &FrontendState,
     prompt: &str,
     max_tokens: u32,
-    events: &UnboundedSender<Event>,
+    events: &Sender<Event>,
+    mut cancel: oneshot::Receiver<()>,
 ) -> anyhow::Result<Generation> {
-    let links = try_join_all(
-        state
-            .manifest
-            .stages
-            .iter()
-            .map(|stage| open_link(state, stage, prompt)),
-    )
-    .await?;
+    let opened = tokio::select! {
+        biased;
+        _ = &mut cancel => return Err(GenerationCancelled.into()),
+        opened = join_all(
+            state
+                .manifest
+                .stages
+                .iter()
+                .map(|stage| open_link(state, stage, prompt)),
+        ) => opened,
+    };
+    let mut links = Vec::with_capacity(opened.len());
+    let mut first_error = None;
+    for result in opened {
+        match result {
+            Ok(link) => links.push(link),
+            Err(error) if first_error.is_none() => first_error = Some(error),
+            Err(_) => {}
+        }
+    }
+    if cancel.try_recv().is_ok() {
+        Pipeline::close_links(links, true).await;
+        return Err(GenerationCancelled.into());
+    }
+    if let Some(error) = first_error {
+        Pipeline::close_links(links, true).await;
+        return Err(error);
+    }
+    if let Err(error) = Pipeline::validate_links(&links, &state.expectations) {
+        Pipeline::close_links(links, true).await;
+        return Err(error);
+    }
     let pipeline = Pipeline::new(links, &state.expectations)?;
     let context = state.manifest.context;
     // Checked before `Started` so an oversized prompt is still answered with a 400.
-    pipeline.ensure_prompt_fits(context)?;
-    // A send fails only once the handler is gone, and then the task is being aborted anyway.
-    let _ = events.send(Event::Started);
+    if let Err(error) = pipeline.ensure_prompt_fits(context) {
+        pipeline.close(true).await;
+        return Err(error.into());
+    }
+    // A send fails only once the handler is gone; its cancellation signal then ends the run.
+    let _ = events.send(Event::Started).await;
     let limits = GenerationLimits {
         max_tokens,
         context,
     };
     pipeline
-        .generate(limits, |text| {
-            let _ = events.send(Event::Text(text.to_owned()));
+        .generate_cancellable(limits, cancel, {
+            let events = events.clone();
+            move |text| {
+                let events = events.clone();
+                async move {
+                    let _ = events.send(Event::Text(text)).await;
+                }
+            }
         })
         .await
 }
@@ -502,10 +563,7 @@ async fn open_link(
 }
 
 /// Waits for the whole generation and answers with one completion object.
-async fn buffered_response(
-    mut events: UnboundedReceiver<Event>,
-    _task: GenerationTask,
-) -> Response {
+async fn buffered_response(mut events: Receiver<Event>, _task: GenerationTask) -> Response {
     let completion = Completion::new();
     loop {
         match events.recv().await {
@@ -519,9 +577,9 @@ async fn buffered_response(
     }
 }
 
-/// State of one streamed reply; dropping it (client disconnect) aborts the generation.
+/// State of one streamed reply; dropping it signals cooperative generation cancellation.
 struct SseStream {
-    events: UnboundedReceiver<Event>,
+    events: Receiver<Event>,
     completion: Completion,
     _task: GenerationTask,
     ended: bool,
@@ -559,7 +617,7 @@ impl SseStream {
 
 /// Streams the reply: a role chunk, content chunks, a final chunk with `finish_reason`, then
 /// `[DONE]`; or an `error` event and no `[DONE]` if the generation fails.
-fn stream_response(events: UnboundedReceiver<Event>, task: GenerationTask) -> Response {
+fn stream_response(events: Receiver<Event>, task: GenerationTask) -> Response {
     let completion = Completion::new();
     let role = completion.chunk(json!({"role": "assistant", "content": ""}), None);
     let state = SseStream {

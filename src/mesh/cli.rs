@@ -7,6 +7,7 @@ use std::{
     io::{BufRead, Write},
     time::Duration,
 };
+use tracing::{debug, info, warn};
 
 pub async fn run(directory: std::path::PathBuf) -> Result<()> {
     let node = Node::open(directory).await?;
@@ -31,9 +32,33 @@ pub async fn run(directory: std::path::PathBuf) -> Result<()> {
     let refresh_task = tokio::spawn(async move {
         let mut timer = tokio::time::interval(Duration::from_secs(2));
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut unavailable = false;
         loop {
             timer.tick().await;
-            let _ = tokio::time::timeout(Duration::from_secs(6), refresh_node.refresh()).await;
+            match tokio::time::timeout(Duration::from_secs(6), refresh_node.refresh()).await {
+                Ok(Ok(())) => {
+                    if unavailable {
+                        info!("mesh membership refresh recovered");
+                    }
+                    unavailable = false;
+                }
+                Ok(Err(error)) => {
+                    if unavailable {
+                        debug!(%error, "mesh membership refresh still failing");
+                    } else {
+                        warn!(%error, "mesh membership refresh failed");
+                    }
+                    unavailable = true;
+                }
+                Err(_) => {
+                    if unavailable {
+                        debug!("mesh membership refresh still timed out");
+                    } else {
+                        warn!("mesh membership refresh timed out after 6 seconds");
+                    }
+                    unavailable = true;
+                }
+            }
         }
     });
     while let Some(line) = rx.recv().await {

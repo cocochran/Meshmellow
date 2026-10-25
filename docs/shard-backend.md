@@ -25,6 +25,13 @@ forwards to it just as it forwards to `llama-server`.
    samples the next token greedily, and the token is fed back to the prefix. Pieces stream back
    to the job API as OpenAI-style SSE.
 
+The frontend buffers at most 16 text events for a slow HTTP reader; generation applies
+backpressure instead of accumulating an unbounded queue. A disconnected client signals
+cooperative cancellation. Requests still waiting for the generation slot exit without starting
+workers; an active pipeline closes remote streams and waits for local runners to be killed and
+reaped before releasing the slot. If disconnect happens during stage startup, already-started
+links are closed as soon as startup finishes.
+
 ## Commands
 
 On the worker that serves the prefix:

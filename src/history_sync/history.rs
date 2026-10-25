@@ -70,7 +70,11 @@ impl History {
 
     /// Entries from `start` onward; empty if `start` is past the end.
     pub fn since(&self, start: Seq) -> &[Entry] {
-        let start = (start as usize).min(self.entries.len());
+        // A sequence number can come from a peer and may not fit `usize` on 32-bit builds.
+        // Treat an unrepresentable index as past the end instead of letting it wrap.
+        let start = usize::try_from(start)
+            .unwrap_or(usize::MAX)
+            .min(self.entries.len());
         &self.entries[start..]
     }
 
@@ -92,5 +96,20 @@ impl History {
                 _ => None,
             })
             .unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn since_returns_empty_for_unrepresentable_or_past_end_sequence() {
+        let history = History::from_entries(vec![Entry::JobCompleted {
+            request_id: "request".into(),
+        }]);
+
+        assert!(history.since(u64::MAX).is_empty());
+        assert!(history.since(history.len()).is_empty());
     }
 }

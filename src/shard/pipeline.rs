@@ -13,6 +13,7 @@
 //! and any error closes every link and fails the generation without retrying.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -20,8 +21,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail, ensure};
 use iroh::endpoint::{Connection, VarInt};
 use iroh::{Endpoint, EndpointId};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 use tokio::process::{Child, Command};
+use tokio::sync::oneshot;
 use tokio::time::{timeout, timeout_at};
 use tracing::{debug, info, warn};
 
@@ -47,6 +51,9 @@ const CHILD_EXIT_GRACE: Duration = Duration::from_secs(5);
 
 /// `tracing` target for lines a local runner writes to stderr.
 const RUNNER_LOG_TARGET: &str = "shard_runner";
+
+/// Maximum runner stderr buffered for one tracing event; longer lines are split into chunks.
+const MAX_RUNNER_LOG_LINE_BYTES: u64 = 8 * 1024;
 
 /// Application close code for a remote stage connection the generation is done with.
 const CONNECTION_DONE: VarInt = VarInt::from_u32(0);
@@ -113,14 +120,26 @@ impl StageLink {
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("failed to start {label} ({})", launch.runner.display()))?;
-        let stdin = child.stdin.take().context("runner stdin was not piped")?;
-        let stdout = child.stdout.take().context("runner stdout was not piped")?;
+        let Some(stdin) = child.stdin.take() else {
+            stop_child(child, &label, true).await;
+            bail!("runner stdin was not piped");
+        };
+        let Some(stdout) = child.stdout.take() else {
+            stop_child(child, &label, true).await;
+            bail!("runner stdout was not piped");
+        };
         if let Some(stderr) = child.stderr.take() {
             tokio::spawn(forward_stderr(label.clone(), stderr));
         }
         info!(stage = %label, pid = ?child.id(), "shard runner started");
         let mut reader = BufReader::new(stdout);
-        let metadata = read_metadata(&mut reader, &label, metadata_timeout).await?;
+        let metadata = match read_metadata(&mut reader, &label, metadata_timeout).await {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                stop_child(child, &label, true).await;
+                return Err(error);
+            }
+        };
         debug!(stage = %label, startup_us = startup_started.elapsed().as_micros(), "local stage metadata ready");
         Ok(Self {
             reader: Box::new(reader),
@@ -330,6 +349,11 @@ pub struct PromptTooLong {
     pub context: u32,
 }
 
+/// Cooperative request cancellation caused by a disconnected HTTP client.
+#[derive(Debug, thiserror::Error)]
+#[error("generation canceled because the HTTP client disconnected")]
+pub(crate) struct GenerationCancelled;
+
 /// Validated stage links, ready for one generation.
 pub struct Pipeline {
     links: Vec<StageLink>,
@@ -344,6 +368,24 @@ impl Pipeline {
     /// range, protocol version, model identity, a nonzero hidden size shared by every stage,
     /// and only the last stage being final. The prompt tokens come from the final stage.
     pub fn new(links: Vec<StageLink>, expected: &[StageExpectation]) -> anyhow::Result<Self> {
+        Self::validate_links(&links, expected)?;
+        let last = links.len() - 1;
+        let final_meta = &links[last].metadata;
+        Ok(Self {
+            vocab: final_meta.vocab,
+            prompt_tokens: final_meta.tokens.clone(),
+            embd: links[0].metadata.embd,
+            links,
+            step_timeout: STEP_TIMEOUT,
+        })
+    }
+
+    /// Validates link metadata without taking ownership, allowing callers to close links if
+    /// validation fails.
+    pub fn validate_links(
+        links: &[StageLink],
+        expected: &[StageExpectation],
+    ) -> anyhow::Result<()> {
         ensure!(!links.is_empty(), "a pipeline needs at least one stage");
         ensure!(
             links.len() == expected.len(),
@@ -363,13 +405,19 @@ impl Pipeline {
             "{} reported no prompt tokens",
             links[last].label
         );
-        Ok(Self {
-            vocab: final_meta.vocab,
-            prompt_tokens: final_meta.tokens.clone(),
-            links,
-            embd,
-            step_timeout: STEP_TIMEOUT,
-        })
+        Ok(())
+    }
+
+    /// Closes stage links and, for local processes, waits until they have been reaped.
+    pub async fn close_links(links: Vec<StageLink>, kill: bool) {
+        for link in links {
+            link.close(kill).await;
+        }
+    }
+
+    /// Closes every link held by this pipeline.
+    pub async fn close(self, kill: bool) {
+        Self::close_links(self.links, kill).await;
     }
 
     /// Replaces the per-step timeout (default [`STEP_TIMEOUT`]).
@@ -399,47 +447,93 @@ impl Pipeline {
     /// UTF-8 text as it is produced, then closes every link. On any error the links are killed
     /// and the error is returned; nothing is retried.
     pub async fn generate<F: FnMut(&str)>(
+        self,
+        limits: GenerationLimits,
+        mut on_text: F,
+    ) -> anyhow::Result<Generation> {
+        self.generate_inner(
+            limits,
+            move |text| {
+                on_text(&text);
+                std::future::ready(())
+            },
+            None,
+        )
+        .await
+    }
+
+    /// Runs generation with async text delivery and cooperative cancellation. The pipeline
+    /// closes remote links and kills and reaps local runners before returning on cancellation.
+    pub async fn generate_cancellable<F, Fut>(
+        self,
+        limits: GenerationLimits,
+        cancel: oneshot::Receiver<()>,
+        on_text: F,
+    ) -> anyhow::Result<Generation>
+    where
+        F: FnMut(String) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        self.generate_inner(limits, on_text, Some(cancel)).await
+    }
+
+    async fn generate_inner<F, Fut>(
         mut self,
         limits: GenerationLimits,
         on_text: F,
-    ) -> anyhow::Result<Generation> {
-        let result = self.run(limits, on_text).await;
+        cancel: Option<oneshot::Receiver<()>>,
+    ) -> anyhow::Result<Generation>
+    where
+        F: FnMut(String) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let result = self.run(limits, on_text, cancel).await;
         let kill = result.is_err();
-        for link in self.links {
-            link.close(kill).await;
-        }
+        Self::close_links(self.links, kill).await;
         result
     }
 
-    async fn run<F: FnMut(&str)>(
+    async fn run<F, Fut>(
         &mut self,
         limits: GenerationLimits,
         on_text: F,
-    ) -> anyhow::Result<Generation> {
+        mut cancel: Option<oneshot::Receiver<()>>,
+    ) -> anyhow::Result<Generation>
+    where
+        F: FnMut(String) -> Fut,
+        Fut: Future<Output = ()>,
+    {
         ensure!(limits.max_tokens >= 1, "max_tokens must be at least 1");
         self.ensure_prompt_fits(limits.context)?;
         let mut decoder = Decoder::default();
-        let mut reply = self.prefill(&mut decoder).await?;
+        let mut reply = match cancel.as_mut() {
+            Some(cancel) => await_or_cancel(self.prefill(&mut decoder), cancel).await?,
+            None => self.prefill(&mut decoder).await?,
+        };
         let mut text = TextSink {
             assembler: Utf8Assembler::default(),
             text: String::new(),
             on_text,
+            _future: std::marker::PhantomData,
         };
         let finish = loop {
             if reply.eog {
                 break FinishReason::Stop;
             }
             let token = self.sampled_token(&reply)?;
-            text.push(&reply.piece_bytes()?);
+            text.push(&reply.piece_bytes()?).await;
             decoder.completion_tokens += 1;
             if decoder.completion_tokens >= limits.max_tokens || decoder.position >= limits.context
             {
                 break FinishReason::Length;
             }
-            reply = self.step(&mut decoder, &[token]).await?;
+            reply = match cancel.as_mut() {
+                Some(cancel) => await_or_cancel(self.step(&mut decoder, &[token]), cancel).await?,
+                None => self.step(&mut decoder, &[token]).await?,
+            };
         };
         Ok(Generation {
-            text: text.finish(),
+            text: text.finish().await,
             finish,
             prompt_tokens: self.prompt_tokens(),
             completion_tokens: decoder.completion_tokens,
@@ -533,30 +627,46 @@ impl Decoder {
 }
 
 /// Collects the completion and hands each newly completed piece of text to the caller.
-struct TextSink<F> {
+struct TextSink<F, Fut> {
     assembler: Utf8Assembler,
     text: String,
     on_text: F,
+    _future: std::marker::PhantomData<Fut>,
 }
 
-impl<F: FnMut(&str)> TextSink<F> {
-    fn push(&mut self, piece: &[u8]) {
+impl<F, Fut> TextSink<F, Fut>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    async fn push(&mut self, piece: &[u8]) {
         let fresh = self.assembler.push(piece);
-        self.deliver(&fresh);
+        self.deliver(fresh).await;
     }
 
     /// Flushes any incomplete trailing bytes and returns the whole completion.
-    fn finish(mut self) -> String {
+    async fn finish(mut self) -> String {
         let rest = std::mem::take(&mut self.assembler).finish();
-        self.deliver(&rest);
+        self.deliver(rest).await;
         self.text
     }
 
-    fn deliver(&mut self, fresh: &str) {
+    async fn deliver(&mut self, fresh: String) {
         if !fresh.is_empty() {
-            (self.on_text)(fresh);
-            self.text.push_str(fresh);
+            (self.on_text)(fresh.clone()).await;
+            self.text.push_str(&fresh);
         }
+    }
+}
+
+async fn await_or_cancel<T>(
+    future: impl Future<Output = anyhow::Result<T>>,
+    cancel: &mut oneshot::Receiver<()>,
+) -> anyhow::Result<T> {
+    tokio::select! {
+        biased;
+        _ = cancel => Err(GenerationCancelled.into()),
+        result = future => result,
     }
 }
 
@@ -700,11 +810,17 @@ async fn forward_stderr(label: String, stderr: impl AsyncRead + Unpin) {
     let mut line = Vec::new();
     loop {
         line.clear();
-        match lines.read_until(b'\n', &mut line).await {
+        match (&mut lines)
+            .take(MAX_RUNNER_LOG_LINE_BYTES)
+            .read_until(b'\n', &mut line)
+            .await
+        {
             Ok(0) => return,
             Ok(_) => {
+                let truncated =
+                    line.last() != Some(&b'\n') && line.len() as u64 == MAX_RUNNER_LOG_LINE_BYTES;
                 let text = String::from_utf8_lossy(line.trim_ascii_end());
-                info!(target: RUNNER_LOG_TARGET, stage = %label, "{text}");
+                info!(target: RUNNER_LOG_TARGET, stage = %label, truncated, "{text}");
             }
             Err(error) => {
                 warn!(target: RUNNER_LOG_TARGET, stage = %label, %error, "failed to read runner stderr");
