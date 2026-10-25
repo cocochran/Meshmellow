@@ -220,12 +220,7 @@ impl Node {
                 .await;
             }
         });
-        if let Some(previous) = self
-            .control_tasks
-            .lock()
-            .await
-            .insert("native-compute".into(), task)
-        {
+        if let Some(previous) = self.compute_task.lock().await.replace(task) {
             previous.abort();
         }
     }
@@ -234,7 +229,7 @@ impl Node {
         ensure!(
             config.layers >= 2
                 && config.layers <= 4096
-                && (32..=4096).contains(&config.context)
+                && (32..=crate::shard::wire::MAX_CONTEXT).contains(&config.context)
                 && config.budget_bytes > 0,
             "Invalid compute configuration"
         );

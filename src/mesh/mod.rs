@@ -172,6 +172,9 @@ pub struct Node {
     membership_epoch: tokio::sync::watch::Sender<u64>,
     control_peers: crate::network::SharedPeerTable,
     control_tasks: Arc<Mutex<BTreeMap<String, tokio::task::JoinHandle<()>>>>,
+    /// Native model verification; kept apart from per-member control links,
+    /// which membership maintenance prunes.
+    compute_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl Node {
@@ -268,6 +271,7 @@ impl Node {
             membership_epoch: tokio::sync::watch::channel(0).0,
             control_peers: Default::default(),
             control_tasks: Default::default(),
+            compute_task: Default::default(),
         };
         node.serve();
         node.maintain_mesh();
@@ -357,6 +361,9 @@ impl Node {
         self.inference_worker.lock().await.take();
         self.endpoint.close().await;
         for (_, task) in std::mem::take(&mut *self.control_tasks.lock().await) {
+            task.abort();
+        }
+        if let Some(task) = self.compute_task.lock().await.take() {
             task.abort();
         }
     }

@@ -512,3 +512,40 @@ async fn leaving_disconnects_persists_and_rejoining_requires_approval() {
     a.close().await;
     b.close().await;
 }
+
+/// Membership maintenance prunes per-member control tasks. Model verification
+/// must survive that pruning and report its outcome rather than stay "verifying".
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compute_verification_outlives_membership_maintenance() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open_local(dir.path()).await.unwrap();
+    node.create("Our mesh", "Laptop").await.unwrap();
+    node.close().await;
+    // A FIFO holds the hash open until written, so maintenance runs meanwhile.
+    let model = dir.path().join("model.gguf");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&model)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let config = json!({"runner": "/nonexistent", "model": model, "model_sha256": "0".repeat(64),
+        "layers": 16, "context": 128, "gpu_layers": 0, "budget_bytes": 1});
+    std::fs::write(dir.path().join("compute.json"), config.to_string()).unwrap();
+    let node = Node::open_local(dir.path()).await.unwrap();
+    assert_eq!(node.compute_status().await.unwrap().phase, "verifying");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    std::fs::write(&model, b"not the pinned model").unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        let status = node.compute_status().await.unwrap();
+        if status.phase != "verifying" || tokio::time::Instant::now() > deadline {
+            break status;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(status.phase, "failed", "{status:?}");
+    node.close().await;
+}
