@@ -13,6 +13,7 @@ use axum::routing::post;
 use llm_cluster::api::{self, ApiConfig, REQUEST_ID_HEADER};
 use llm_cluster::history::{CompletedTurn, HistorySink};
 use llm_cluster::jobs::{JobQueue, JobStatus};
+use llm_cluster::node::PeerTable;
 use serde_json::{Value, json};
 use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
@@ -127,6 +128,7 @@ impl TestApi {
         let config = ApiConfig {
             listen: addr,
             upstream,
+            peers: Arc::new(Mutex::new(PeerTable::new())),
         };
         let server = tokio::spawn(api::serve_api(
             config,
@@ -472,6 +474,7 @@ async fn non_loopback_listen_address_is_refused() {
     let config = ApiConfig {
         listen: "0.0.0.0:0".parse().unwrap(),
         upstream: free_loopback_addr(),
+        peers: Arc::new(Mutex::new(PeerTable::new())),
     };
     let result = tokio::time::timeout(
         WAIT_LIMIT,

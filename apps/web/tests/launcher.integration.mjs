@@ -42,6 +42,10 @@ test('one runtime owns static UI, enrollment, API queue, settings and shutdown',
     const status = await get('/api/status'); assert.equal(status.pid,child.pid); assert.equal(status.api.base_url,origin+'/v1'); assert.equal(status.api.inference_ready,false);
     assert.equal((await send('/v1/chat/completions',{messages:[]})).status,503);
     assert.equal((await fetch(origin+'/v1/models')).status,503);
+    assert.deepEqual(await get('/peers'), []);
+    const telemetry = await get('/api/mesh');
+    assert.equal(telemetry.peerStatusAvailable, true);
+    assert.deepEqual(telemetry.peers, []);
   } finally { await stop(); }
   try {
     await start();

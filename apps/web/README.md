@@ -38,6 +38,10 @@ endpoint on its card, labeled **On that device only**. Devices with no listener
 show API not running (self) or API not reported (remote). Missing measurements,
 layer assignments and native mobile inference are not invented.
 
+The same listener retains `GET /peers` for authenticated control connections,
+with connection/heartbeat timestamps. Dashboard telemetry reads that shared table
+directly; membership, connection status and inference readiness are distinct.
+
 ## Membership and QR
 
 Core-owned create, signed full invitations, camera scanning, trusted approval,

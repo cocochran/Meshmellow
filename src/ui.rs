@@ -264,6 +264,7 @@ fn router(app: Arc<App>, assets: PathBuf) -> Result<Router> {
         .layer(DefaultBodyLimit::max(8192))
         .with_state(app.clone())
         .merge(inference)
+        .merge(api::peer_router(app.node.control_peer_table()))
         .fallback_service(ServeDir::new(assets))
         .layer(middleware::from_fn_with_state(app, local_access)))
 }
@@ -362,11 +363,23 @@ async fn models(State(app): State<Arc<App>>) -> Response {
 async fn telemetry(State(app): State<Arc<App>>) -> Json<Value> {
     let api = app.api_status().await;
     let jobs = app.queue.jobs();
+    let observed_peers = api::peer_snapshot(&app.node.control_peer_table());
+    let peer_status_available = observed_peers.is_ok();
+    let peers = observed_peers
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| {
+            json!({
+                "id": p.node_id, "connectedAt": p.connected_at_unix_ms,
+                "lastHeartbeat": p.last_heartbeat_unix_ms
+            })
+        })
+        .collect::<Vec<_>>();
     Json(
         json!({"connected": true, "source": "core", "endpoint": app.origin,
         "checkedAt": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
         "message": api.message, "active": jobs.iter().any(|j| !j.status.is_finished()), "event": if api.inference_ready {"ready"} else {"waiting"},
-        "model":"Qwen3.8-27B", "devices":[], "layers":null, "decodeRate":null, "outputSteps":null,
+        "model":"Qwen3.8-27B", "devices":[], "peers":peers, "peerStatusAvailable":peer_status_available, "layers":null, "decodeRate":null, "outputSteps":null,
         "jobs": jobs.iter().map(|j| json!({"id":j.request_id,"status":j.status,"createdAt":j.created_at_unix_ms})).collect::<Vec<_>>() }),
     )
 }

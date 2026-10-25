@@ -235,6 +235,11 @@ impl Node {
         *self.local_api.lock().await = api;
     }
 
+    /// Shared authenticated control connections for the embedded read-only API.
+    pub fn control_peer_table(&self) -> crate::network::SharedPeerTable {
+        self.control_peers.clone()
+    }
+
     pub fn id(&self) -> String {
         self.endpoint.id().to_string()
     }

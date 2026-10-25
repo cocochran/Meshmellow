@@ -50,6 +50,20 @@ test('fresh web mesh creates signed invites, approves a real peer, and persists 
     await post({op:'decide',issuer:pending.issuer,request:pending.id,approve:true});
     await command({op:'refresh'});
     assert.equal((await command({op:'snapshot'})).members.length,2);
+    let connected = [];
+    const deadline = Date.now() + 10000;
+    while (Date.now() < deadline) {
+      const response = await fetch(origin+'/peers');
+      assert.equal(response.status, 200);
+      connected = await response.json();
+      if (connected.some(p => p.node_id === joined.id)) break;
+      await new Promise(r => setTimeout(r, 100));
+    }
+    assert.ok(connected.some(p => p.node_id === joined.id), 'embedded API shares the mesh control table');
+    const telemetry = await (await fetch(origin+'/api/mesh')).json();
+    assert.equal(telemetry.peerStatusAvailable, true);
+    assert.ok(telemetry.peers.some(p => p.id === joined.id));
+
     await command({op:'refresh'});
     const peerSnapshot = await command({op:'snapshot'});
     assert.equal(peerSnapshot.members.find(m => m.id === created.id).api.base_url, origin+'/v1');
