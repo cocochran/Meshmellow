@@ -86,6 +86,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Run a persistent mesh node. Send create/invite/join/decide/snapshot JSON commands on stdin.
+    Mesh {
+        /// Private identity and signed membership directory, one per running device.
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
     /// Check caller-collected memory and compute evidence for an advisory plan.
     Verify {
         /// JSON produced by the plan command.
@@ -402,6 +408,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_logging(cli.debug);
     match cli.command {
+        Command::Mesh { state_dir } => llm_cluster::mesh::cli::run(state_dir).await,
         Command::Verify {
             plan,
             profile,

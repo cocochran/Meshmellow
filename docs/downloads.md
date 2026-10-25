@@ -37,3 +37,8 @@ The workflow runs on relevant pull requests and main-branch updates, and support
 
 For a source checkout, the original terminal-launched web server remains available:
 see [web UI instructions](../apps/web/README.md).
+
+Desktop launcher and packaging source lives in [apps/desktop](../apps/desktop/README.md),
+separate from the core. Native [Android](../apps/android/README.md) and
+[iOS](../apps/ios/README.md) source and local build instructions are also available
+under `apps/`; the desktop workflow does not produce mobile release builds.

@@ -8,6 +8,7 @@ pub mod jobs;
 pub mod launch;
 pub mod leader;
 pub mod measured_placement;
+pub mod mesh;
 pub mod network;
 pub mod node;
 pub mod placement;
