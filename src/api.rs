@@ -102,9 +102,30 @@ pub async fn serve_api(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     ensure_loopback(config.listen)?;
-    let router = queued_router(config.upstream, queue, sink)?
+    let profiles = match std::env::var_os("LAYERCAKE_PROFILE_CONFIG") {
+        Some(path) => {
+            Some(crate::profiling::ProfileManager::from_file(std::path::Path::new(&path)).await?)
+        }
+        None => None,
+    };
+    serve_api_with_profiles(config, queue, sink, profiles, shutdown).await
+}
+
+/// Existing API with optional managed profiling; native execution must share admission.
+pub async fn serve_api_with_profiles(
+    config: ApiConfig,
+    queue: Arc<JobQueue>,
+    sink: Arc<dyn HistorySink>,
+    profiles: Option<crate::profiling::ProfileManager>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
+    ensure_loopback(config.listen)?;
+    let mut router = queued_router(config.upstream, queue, sink)?
         .merge(peer_router(config.peers))
         .route(WEB_CLIENT_PATH, get(web_client));
+    if let Some(profiles) = &profiles {
+        router = router.merge(profiles.router());
+    }
     let listener = TcpListener::bind(config.listen)
         .await
         .with_context(|| format!("failed to bind api listener on {}", config.listen))?;
@@ -112,10 +133,14 @@ pub async fn serve_api(
         .local_addr()
         .context("failed to read api listener address")?;
     info!(listen = %local, upstream = %config.upstream, "api listening");
-    axum::serve(listener, router)
+    let result = axum::serve(listener, router)
         .with_graceful_shutdown(shutdown)
         .await
-        .context("api server failed")
+        .context("api server failed");
+    if let Some(profiles) = profiles {
+        profiles.shutdown().await?;
+    }
+    result
 }
 
 /// Reusable queued inference routes for the integrated desktop runtime.
