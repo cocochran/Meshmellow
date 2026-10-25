@@ -1,8 +1,9 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import Enrollment from '#lib/Enrollment.svelte';
   import NetworkView from '#lib/NetworkView.svelte';
   import ModelStatus from '#lib/ModelStatus.svelte';
+  import { readChatStream } from '#lib/chat.ts';
   import type { EnrollmentState } from '#lib/enrollment.ts';
   import Icon from '#lib/Icon.svelte';
   import { defaultPreferences, type MeshSnapshot, type Preferences, type Device } from '#lib/types.ts';
@@ -25,31 +26,56 @@
   let error = $state('');
   let notice = $state('');
   let saving = $state(false);
-  let prompt = $state('What is 2 plus 2? Answer briefly.');
+  let prompt = $state('');
+  type ChatMessage = { role: 'user' | 'assistant'; content: string };
+  let conversation = $state<ChatMessage[]>([]);
+  let submittedPrompt = $state('');
+  let replyTokens = $state(512);
+  let finishReason = $state<string | null>(null);
   let completion = $state('');
   let generationError = $state('');
   let generating = $state(false);
   let generationController: AbortController | null = null;
+  let transcript = $state<HTMLDivElement>();
   async function generate(event: SubmitEvent) {
     event.preventDefault();
     if (generating || !prompt.trim()) return;
-    generating = true; completion = ''; generationError = '';
-    document.getElementById('network-title')?.scrollIntoView({ behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'start' });
+    const message: ChatMessage = { role: 'user', content: prompt.trim() };
+    generating = true; completion = ''; generationError = ''; finishReason = null;
+    submittedPrompt = message.content;
+    await tick();
+    transcript?.scrollTo({ top: transcript.scrollHeight });
     const controller = new AbortController();
     generationController = controller;
     try {
       const response = await fetch('/v1/chat/completions', {
         method: 'POST', signal: controller.signal,
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: 'meshthing-shard', messages: [{ role: 'user', content: prompt.trim() }], max_tokens: 32, stream: false })
+        body: JSON.stringify({ model: 'meshthing-shard', messages: [...conversation, message], max_tokens: replyTokens, stream: true })
       });
-      const result = await response.json();
-      if (!response.ok) throw new Error(result.error?.message || result.error || 'Shared inference failed.');
-      completion = result.choices?.[0]?.message?.content ?? '';
+      if (!response.ok) {
+        const result = await response.json();
+        throw new Error(result.error?.message || result.error || 'Shared inference failed.');
+      }
+      finishReason = await readChatStream(response, text => {
+        const follow = transcript && transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 100;
+        completion += text;
+        if (follow) void tick().then(() => transcript?.scrollTo({ top: transcript.scrollHeight }));
+      });
+      conversation = [...conversation, message, { role: 'assistant', content: completion }];
+      completion = ''; submittedPrompt = ''; prompt = '';
       await refresh();
     } catch (e) {
+      if (e instanceof Error && e.name === 'AbortError' && completion) {
+        conversation = [...conversation, message, { role: 'assistant', content: completion }];
+        completion = ''; submittedPrompt = ''; prompt = '';
+      }
       generationError = e instanceof Error && e.name === 'AbortError' ? 'Request cancelled.' : e instanceof Error ? e.message : 'Shared inference failed.';
     } finally { generating = false; generationController = null; }
+  }
+  function newChat() {
+    if (generating) return;
+    conversation = []; submittedPrompt = ''; completion = ''; prompt = ''; generationError = ''; finishReason = null;
   }
   let detailDialog: HTMLDialogElement;
   let enrollmentPanel: Enrollment;
@@ -165,14 +191,18 @@
 
       {#if section === 'overview'}
         <section class="panel ask-panel" aria-labelledby="inference-title">
-          <div class="panel-heading"><div><h2 id="inference-title">Ask the mesh</h2><p>{inferenceReady ? 'Runs across every device in the execution route.' : snapshot?.message || 'Waiting for contributing devices.'}</p></div></div>
+          <div class="panel-heading"><div><h2 id="inference-title">Chat with the mesh</h2><p>{inferenceReady ? 'Conversation stays in this tab. Earlier messages are included with each reply.' : snapshot?.message || 'Waiting for contributing devices.'}</p></div><button class="text-button" disabled={generating || (!conversation.length && !submittedPrompt)} onclick={newChat}>New chat</button></div>
+          {#if conversation.length || submittedPrompt}<div bind:this={transcript} class="chat-transcript" role="log" aria-label="Conversation" aria-live="off">
+            {#each conversation as message}<article class="chat-message" class:from-user={message.role === 'user'}><strong>{message.role === 'user' ? 'You' : 'Layercake'}</strong><div>{message.content}</div></article>{/each}
+            {#if submittedPrompt}<article class="chat-message from-user"><strong>You</strong><div>{submittedPrompt}</div></article><article class="chat-message"><strong>Layercake <span>{generating ? completion ? 'Replying…' : 'Preparing reply…' : 'Interrupted'}</span></strong><div>{completion}</div></article>{/if}
+          </div>{/if}
+          {#if finishReason === 'length'}<p class="chat-limit" role="status">The reply reached the output or context limit. Send “continue” to carry on, or start a new chat if the conversation is full.</p>{/if}
           <form class="ask-form" onsubmit={generate}>
             <label class="visually-hidden" for="mesh-prompt">Prompt</label>
-            <textarea id="mesh-prompt" bind:value={prompt} rows="2" maxlength="2048" required></textarea>
-            <div class="ask-actions">{#if generating}<button type="button" class="button secondary" onclick={() => generationController?.abort()}>Cancel</button>{/if}<button class="button primary" disabled={generating || !inferenceReady}>{generating ? 'Running across devices…' : 'Run'}</button></div>
+            <textarea id="mesh-prompt" bind:value={prompt} rows="3" placeholder={conversation.length ? 'Reply to the mesh…' : 'Ask the mesh anything…'} disabled={generating} required></textarea>
+            <div class="ask-actions"><label class="reply-limit">Reply limit<select bind:value={replyTokens} disabled={generating}><option value={128}>128 tokens</option><option value={256}>256 tokens</option><option value={512}>512 tokens</option></select></label>{#if generating}<button type="button" class="button secondary" onclick={() => generationController?.abort()}>Stop</button>{/if}<button class="button primary" disabled={generating || !inferenceReady || !prompt.trim()}>{generating ? 'Replying…' : 'Send'}</button></div>
           </form>
           {#if generationError}<p class="ask-result error" role="alert">{generationError}</p>{/if}
-          {#if completion}<div class="ask-result" role="status">{completion}</div>{/if}
         </section>
         <NetworkView {snapshot} {membership} {connected}/>
       {/if}
@@ -221,6 +251,7 @@
 <style>
 .ask-form{display:flex;gap:12px;align-items:flex-end;padding:0 22px 20px}.ask-form textarea{flex:1;font:inherit;font-size:13px;min-height:42px;border:1px solid #d9d4cd;border-radius:5px;padding:10px 12px;background:#fff;color:var(--ink);resize:vertical}.ask-form textarea:focus-visible{outline:2px solid var(--accent);outline-offset:1px}.ask-actions{display:flex;gap:8px}.ask-actions .button{min-width:76px}
 .ask-result{margin:0 22px 20px;white-space:pre-wrap;padding:14px 16px;border:1px solid var(--line);border-radius:6px;background:#faf9f7;font-size:13px;line-height:1.6}.ask-result.error{border-color:#e5c3bd;background:#fbf3f1;color:#a14336}
+.chat-transcript{margin:0 22px 18px;max-height:440px;overflow:auto;display:flex;flex-direction:column;gap:14px;scrollbar-gutter:stable}.chat-message{padding:14px 16px;background:#f5f6f2;border:1px solid var(--line);border-radius:8px}.chat-message.from-user{background:#faf8f4;margin-left:24px}.chat-message strong{display:block;font-size:11px;color:var(--muted);margin-bottom:8px}.chat-message strong span{font-weight:400;margin-left:8px}.chat-message>div{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px;line-height:1.7}.chat-limit{margin:0 22px 16px;color:#80572d;font-size:12px;line-height:1.5}.reply-limit{display:flex;flex-direction:column;gap:5px;font-size:10px;color:var(--muted)}.reply-limit select{font:inherit;font-size:12px;padding:9px;border:1px solid var(--line);border-radius:5px;background:white;color:var(--ink)}.ask-actions{align-items:flex-end;flex-wrap:wrap}
 .visually-hidden{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 @media(max-width:760px){.ask-form{flex-direction:column;align-items:stretch;padding:0 16px 16px}.ask-actions{justify-content:flex-end}.ask-result{margin:0 16px 16px}}
 </style>
