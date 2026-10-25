@@ -270,8 +270,9 @@ impl ProfileManager {
         Ok(run.info.clone())
     }
 
-    /// Request cleanup and wait before the host tears down its async runtime.
-    pub async fn shutdown(&self) -> anyhow::Result<()> {
+    /// Close admission to new profiles and request cancellation synchronously.
+    /// Hosts use this from drop guards; call shutdown to await cleanup normally.
+    pub fn request_shutdown(&self) {
         self.0.closed.store(true, Ordering::Release);
         for run in lock(&self.0.runs).iter_mut() {
             if matches!(
@@ -282,6 +283,11 @@ impl ProfileManager {
                 run.cancel.send_replace(true);
             }
         }
+    }
+
+    /// Request cleanup and wait before the host tears down its async runtime.
+    pub async fn shutdown(&self) -> anyhow::Result<()> {
+        self.request_shutdown();
         let stopped = timeout(
             Duration::from_secs(self.0.config.cleanup_grace_seconds + 5),
             async {

@@ -3,6 +3,7 @@
 pub mod admission;
 pub mod api;
 pub mod artifact;
+pub mod config;
 pub mod evidence;
 pub mod history;
 pub mod history_sync;
@@ -23,5 +24,6 @@ pub mod rpc_plan;
 pub mod shard;
 pub mod verification;
 pub mod worker;
+pub mod worker_profile;
 
 pub mod ui;

@@ -27,6 +27,41 @@ records the whole serial step. Timeout errors identify whether the write or
 read phase exceeded the shared step deadline. These new events do not include
 prompt text, token IDs or generated text.
 
+The HTTP API's `job running` event includes `queue_wait_ms`, measuring how long
+the request waited for the single inference slot. Streamed responses reject
+individual SSE lines larger than 1 MiB and do not append those lines to the
+history sink. Child process stdout/stderr and local runner stderr are split into
+8 KiB chunks per tracing event, so a process that emits an unusually long line
+cannot force the logger to buffer the entire line at once.
+Non-streaming upstream responses and `llm-cluster prompt` replies are capped at 16 MiB while
+buffering. Streaming responses continue to the client, but responses over 16 MiB are omitted
+from conversation history to keep history capture bounded; this is logged when the stream
+completes.
+The inference queue admits at most 16 active or waiting jobs; additional requests receive HTTP
+429 so retained queued request bodies and job records remain bounded.
+Mesh membership refreshes warn on the first sync failure for a member, use debug logs for
+retries, and log when sync recovers. Mesh control connections follow the same pattern for
+hello, address, dial and timeout failures; the member ID is included in each event. The
+enrollment CLI warns on the first periodic membership refresh failure or timeout, uses
+debug logs for continuing failures, and logs when refresh recovers; this avoids hiding an
+outage while keeping the normal two-second polling loop from flooding warning logs.
+The shared control listener accepts at most 128 concurrent sessions, and each session reads at
+most 16 concurrent heartbeat streams; excess connections are refused and excess streams are
+stopped. Handshake frames are capped at 64 KiB and heartbeat frames at 1 KiB, below the general
+16 MiB protocol frame limit. This bounds task and frame-buffer growth from peers that open many
+idle streams.
+RPC bridges cap local clients at 128 across the leader's worker bridges, worker endpoints at 128
+incoming connections, and worker-side streams at 64 per connection and 256 total. When a cap is
+reached, new clients are dropped or streams are reset; connection limits log at debug level and
+excess streams generate at most one warning per connection.
+The shard relay caps incoming connections at 128, including sessions waiting for the single
+runner slot. Experimental ring workers cap them at 16. Excess connections are refused and
+logged at debug level.
+Readiness-probe error excerpts are capped at 512 characters (at most 2 KiB read), and the
+external run-evidence file is capped at 1 MiB per poll.
+The CLI rejects plan, profile and shard-manifest JSON files larger than 64 MiB before parsing;
+the limit is also enforced while reading in case a file grows after its size check.
+
 Durations use a local monotonic clock. A stage's `read_us` includes waiting for
 the remote stage to compute and reply; it is not a pure network transfer time.
 Do not subtract timestamps recorded on different machines to infer hop latency.
