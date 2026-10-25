@@ -16,3 +16,12 @@
 /dist/
 
 __pycache__/
+
+# Local secrets / per-person MCP config
+.mcp.json
+.claude/settings.local.json
+.env
+.env.*
+
+# Per-person editor settings
+.vscode/
