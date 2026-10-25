@@ -969,6 +969,7 @@ mod tests {
                 upstream,
                 origin,
                 next,
+                ..
             } = cli.command
             else {
                 panic!("expected ring worker");
