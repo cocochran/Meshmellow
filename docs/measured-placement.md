@@ -224,14 +224,13 @@ and ownership boundaries are documented in
 implement a candidate-range executor, fleet memory reservation, or deployment
 activation.
 
-The main-branch v1 shard backend currently accepts one remote prefix followed
-by a local final stage. Yash's separate M-27 ring contract instead requires
-stage 0 to be leader-local beginning at layer 0, followed by one or more
-contiguous remote stages. The current measured search is backend-agnostic and
-can choose a remote first stage; an M-27 adapter must reject or re-plan such an
-output, require at least two stages, and map the remaining ordered ranges to
-the static ring manifest. M-27's branch must land before this integration can
-be implemented against its production manifest type.
+Pipeline mode accepts one remote prefix followed by a local final stage. The
+experimental M-27 ring now accepts a leader-local prefix followed by contiguous
+remote stages ending at the final layer. `plan_ring` searches under that
+constraint and requires at least two stages; `plan` retains its unconstrained
+behavior. The `prepare-ring` adapter binds exact ranges to the static ring
+manifest and worker arguments. Neither planning nor preparation qualifies raw
+diagnostics, reserves capacity, stages artifacts, or activates a deployment.
 
 To make this evidence eligible, collect exact exported-artifact hashes, fresh
 usable capacity and reservations, complete contribution peaks across load and

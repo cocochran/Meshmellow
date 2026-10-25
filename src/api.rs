@@ -541,24 +541,6 @@ impl JobFinish {
         self.sink.ended(self.request_id(), outcome);
         permit.fail(reason);
     }
-
-    /// Completes the job without retaining its oversized reply in history. The sink hears
-    /// `ended(Failed)`, since no reply is committed, so the turn still gets exactly one outcome.
-    fn complete_without_history(mut self) {
-        let Some(permit) = self.permit.take() else {
-            return;
-        };
-        warn!(
-            request_id = self.request_id(),
-            limit_bytes = MAX_HISTORY_RESPONSE_BYTES,
-            "job completed but response was too large to retain in history"
-        );
-        let reason =
-            format!("response exceeded the {MAX_HISTORY_RESPONSE_BYTES}-byte history limit");
-        self.sink
-            .ended(self.request_id(), TurnOutcome::Failed { reason });
-        permit.complete();
-    }
 }
 
 impl Drop for JobFinish {
@@ -863,25 +845,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_reply_completes_the_job_and_ends_history_once() {
+    async fn completed_response_without_history_reports_terminal_outcome() {
         let queue = JobQueue::new();
         let sink = Arc::new(RecordingSink::default());
-        let (mut relay, request_id) = start_relay(&queue, &sink, "").await;
-        let finish = relay.finish.take().expect("relay owns the job");
+        let permit = queue.acquire(None).await;
+        let request_id = permit.request_id().to_owned();
+        let turn = StartedTurn {
+            request_id: request_id.clone(),
+            conversation_id: None,
+            request: json!({}),
+        };
+        let finish = JobFinish::start(permit, turn, sink.clone());
+
         finish.complete_without_history();
-        let hooks = sink.hooks();
-        assert_eq!(
-            hooks.len(),
-            2,
-            "started plus exactly one outcome: {hooks:?}"
-        );
-        assert_eq!(hooks[0], Hook::Started(request_id.clone()));
-        assert!(
-            matches!(&hooks[1], Hook::Ended(id, TurnOutcome::Failed { reason }) if *id == request_id && reason.contains("history limit")),
-            "unexpected outcome: {:?}",
-            hooks[1]
-        );
+
         assert_eq!(queue.jobs()[0].status, JobStatus::Completed);
+        assert_eq!(
+            *sink.hooks(),
+            [
+                Hook::Started(request_id.clone()),
+                Hook::Ended(
+                    request_id,
+                    TurnOutcome::CompletedWithoutHistory {
+                        limit_bytes: MAX_HISTORY_RESPONSE_BYTES,
+                    }
+                ),
+            ]
+        );
     }
 
     #[tokio::test]
