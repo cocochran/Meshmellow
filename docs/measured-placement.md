@@ -132,6 +132,53 @@ qualified record remains a whole-range observation. Placement admission then
 joins it with fresh capacity/reservation and directed-link evidence; neither
 step mutates or upgrades the diagnostic report itself.
 
+### Qualification and admission gates
+
+Keep four states distinct; they are not a single `passed` or `eligible` flag:
+
+1. **Diagnostic only.** Preserve every raw report and sample file with its
+   outcome and provenance. The diagnostic runner's `eligible_for_placement`
+   value remains false. Neither a passed fixture comparison nor a valid hash
+   makes its range eligible.
+2. **Qualified range observation.** A versioned M-5 qualification record may
+   refer to a whole native range only when source and exported-artifact hashes,
+   exact range, runner/dependency/runtime identity, effective backend and how
+   it was observed, context/batch/sequence, and independently validated
+   fixture/reference provenance match. Qualification thresholds and required
+   sample/session counts must be declared in a versioned policy before the
+   run. Required prefill and decode histories must be complete, and every
+   repetition used must complete and pass all required output checks. Keep
+   failed or excluded repetitions with reasons; do not combine successful
+   steps from an incomplete repetition. Require complete physical-pool peaks
+   over both load and inference, separated into `ram`, `vram`, and `shared`
+   with shared memory counted once, plus condition measurements and timing
+   distributions. Requested offload settings, buffer totals, RSS, or an
+   operator-entered thermal label alone cannot satisfy these requirements.
+   A missing or ambiguous identity, scope, backend, condition, or output keeps
+   the range diagnostic-only. Do not invent universal memory, thermal, or
+   timing cutoffs.
+3. **Admissible for a placement decision.** Join a qualified range with fresh
+   peer authorization/health, owner-approved per-pool budgets, current usable
+   capacity and reservations, and directed link samples for the exact peers,
+   path/protocol, payload size, and workload. Any stale, mismatched, unknown,
+   or missing input excludes that candidate route. Refresh capacity and link
+   observations independently from reusable range qualification.
+4. **Activation ready.** The runtime/deployment owner sets this only after
+   holding local compute admission and destination memory reservations,
+   staging and hash-verifying the required artifacts and runtime builds on
+   each host, checking device identities and the expected contiguous worker
+   chain, and completing an end-to-end generation check. A process-local
+   compute lease prevents conflicting compute in that process; it is not a
+   fleet-wide memory reservation. A plan, manifest, artifact download, or
+   diagnostic pass alone is not activation readiness.
+
+Changing model or shard bytes, runner/dependencies/backend, workload, fixture
+or reference, memory-accounting scope, or qualification policy invalidates the
+affected range record and requires new evidence. Availability and transfer
+observations expire on their own freshness limits. A qualified range remains
+whole; do not derive per-layer times by dividing it or edge costs from RTT or
+whole-chain residuals.
+
 ## Runtime acceptance still required
 
 ### Available Qwen3.8 ring evidence (partial)
