@@ -33,13 +33,11 @@ export async function readSnapshot(): Promise<MeshSnapshot> {
       return JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown;
     };
     if (source === 'core') {
-      const jobs = await readJson('/jobs');
-      let peers: unknown = null;
-      try {
-        peers = await readJson('/peers');
-      } catch {
-        // Older cores expose the job API without connected-peer status.
-      }
+      // Read independent endpoints together. Peer status stays best-effort for older cores.
+      const [jobs, peers] = await Promise.all([
+        readJson('/jobs'),
+        readJson('/peers').catch(() => null)
+      ]);
       return normalize({ jobs, peers }, source, endpoint, model);
     }
     return normalize(await readJson('/state'), source, endpoint, model);

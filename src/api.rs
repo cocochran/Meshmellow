@@ -186,11 +186,13 @@ struct PeerSummary {
     last_heartbeat_unix_ms: Option<u64>,
 }
 
-async fn list_peers(State(state): State<Arc<ApiState>>) -> Json<Vec<PeerSummary>> {
-    let peers = state
-        .peers
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+async fn list_peers(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<Vec<PeerSummary>>, StatusCode> {
+    let peers = state.peers.lock().map_err(|error| {
+        warn!(%error, "peer table lock poisoned; refusing to report peer status");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     let mut summaries = peers
         .peers()
         .map(|peer| PeerSummary {
@@ -200,7 +202,7 @@ async fn list_peers(State(state): State<Arc<ApiState>>) -> Json<Vec<PeerSummary>
         })
         .collect::<Vec<_>>();
     summaries.sort_by(|a, b| a.node_id.cmp(&b.node_id));
-    Json(summaries)
+    Ok(Json(summaries))
 }
 
 async fn chat_completions(State(state): State<Arc<ApiState>>, body: Bytes) -> Response {

@@ -38,8 +38,9 @@ To inspect the production core's queue instead:
 - The core peer endpoint returns a JSON array with `node_id`,
   `connected_at_unix_ms`, and nullable `last_heartbeat_unix_ms` fields. The
   dashboard reads both endpoints from the configured loopback origin; if an
-  older core has no `/peers` route, the queue remains available and peer status
-  is shown as unavailable.
+  older core has no `/peers` route, or peer status is temporarily unavailable,
+  the queue remains available and peer status is shown as unavailable. Both
+  endpoints are read concurrently.
 - Device observations are labeled as last reported when idle; configured stages
   do not prove membership or liveness. Buffers do not claim total-memory coverage.
 - Saved local display name and polling interval. Refreshes do not overlap;
