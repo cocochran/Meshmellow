@@ -178,7 +178,7 @@ async fn list_jobs(State(state): State<Arc<ApiState>>) -> Json<Vec<JobInfo>> {
 
 #[derive(Serialize)]
 struct PeerSummary {
-    /// Authenticated Iroh endpoint ID in lowercase hexadecimal.
+    /// Authenticated Iroh endpoint ID in its canonical display form.
     node_id: String,
     /// Unix milliseconds when this peer's current control connection was recorded.
     connected_at_unix_ms: u64,

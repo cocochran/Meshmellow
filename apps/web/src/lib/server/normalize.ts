@@ -11,7 +11,8 @@ function normalizePeers(value: unknown): Peer[] {
   for (const entry of array(value).slice(0, 64)) {
     const peer = object(entry);
     const id = peer.node_id;
-    if (typeof id !== 'string' || !/^[a-f0-9]{64}$/i.test(id)) continue;
+    // Iroh's display form is not hex; accept a bounded printable ID string instead.
+    if (typeof id !== 'string' || id.length === 0 || id.length > 128 || /[^\x21-\x7e]/.test(id)) continue;
     peers.push({
       id,
       connectedAt: number(peer.connected_at_unix_ms),

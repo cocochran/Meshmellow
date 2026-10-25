@@ -1,4 +1,4 @@
-# MeshThing web UI
+# Layercake web UI
 
 A terminal-launched SvelteKit + Tailwind dashboard. The Node server binds to
 `127.0.0.1`; closing it leaves the Rust core and native workers running. Fonts and
@@ -86,3 +86,7 @@ or inference requests are needed to validate this application.
 
 Framework setup follows [SvelteKit's Node adapter](https://svelte.dev/docs/kit/adapter-node)
 and [Tailwind's SvelteKit integration](https://tailwindcss.com/docs/installation/framework-guides/sveltekit).
+
+## Visual identity
+
+The cake logo uses the [Cake JE4 render from Minecraft Wiki](https://minecraft.wiki/images/Cake_JE4.png?7c59e), supplied for this project’s Layercake branding.

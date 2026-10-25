@@ -14,7 +14,7 @@ enum Source {
     LiveDemo,
 }
 #[derive(Parser)]
-#[command(about = "Start the MeshThing web dashboard and open it in your browser")]
+#[command(about = "Start the Layercake web dashboard and open it in your browser")]
 struct Options {
     /// Local core or diagnostic state API.
     #[arg(long, value_enum, default_value = "core")]
@@ -127,7 +127,7 @@ async fn main() -> anyhow::Result<()> {
     }
     let url = format!("http://{address}");
     println!(
-        "MeshThing dashboard: {url}\nPress Ctrl+C to stop the dashboard. Core and inference workers remain running."
+        "Layercake dashboard: {url}\nPress Ctrl+C to stop the dashboard. Core and inference workers remain running."
     );
     if !options.no_open
         && let Err(error) = open_browser(&url)

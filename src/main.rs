@@ -36,8 +36,20 @@ const CLOSE_CODE_DONE: u32 = 0;
 /// QUIC close reason sent alongside [`CLOSE_CODE_DONE`].
 const CLOSE_REASON_DONE: &[u8] = b"done";
 
-/// `--heartbeat-interval` default; matches [`worker::DEFAULT_HEARTBEAT_INTERVAL`].
+/// `worker --heartbeat-interval` default; matches [`worker::DEFAULT_HEARTBEAT_INTERVAL`].
 const DEFAULT_HEARTBEAT_INTERVAL_ARG: &str = "2s";
+
+/// `leader --heartbeat-interval` default; matches [`leader::DEFAULT_HEARTBEAT_INTERVAL`].
+const DEFAULT_LEADER_HEARTBEAT_INTERVAL_ARG: &str = "2s";
+
+/// `leader --heartbeat-timeout` default: three missed beats at [`DEFAULT_HEARTBEAT_INTERVAL_ARG`]
+/// plus a second of slack; matches [`leader::DEFAULT_HEARTBEAT_TIMEOUT`].
+const DEFAULT_HEARTBEAT_TIMEOUT_ARG: &str = "7s";
+
+/// `worker --leader-heartbeat-timeout` default: three missed beats at
+/// [`DEFAULT_LEADER_HEARTBEAT_INTERVAL_ARG`] plus a second of slack; matches
+/// [`worker::DEFAULT_LEADER_HEARTBEAT_TIMEOUT`].
+const DEFAULT_LEADER_HEARTBEAT_TIMEOUT_ARG: &str = "7s";
 
 /// `--worker-wait` default; matches [`leader::DEFAULT_WORKER_WAIT`].
 const DEFAULT_WORKER_WAIT_ARG: &str = "60s";
@@ -56,6 +68,10 @@ const SECONDS_PER_MINUTE: u64 = 60;
     about = "Peer-to-peer mesh for splitting one LLM across devices"
 )]
 struct Cli {
+    /// Enable detailed MeshThing diagnostics on stderr (also works with RUST_LOG).
+    #[arg(long, global = true)]
+    debug: bool,
+
     /// File holding this node's secret key; created on first run.
     #[arg(long, global = true, default_value = "meshthing.key")]
     key: PathBuf,
@@ -70,6 +86,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Run a persistent mesh node. Send create/invite/join/decide/snapshot JSON commands on stdin.
+    Mesh {
+        /// Private identity and signed membership directory, one per running device.
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
     /// Check caller-collected memory and compute evidence for an advisory plan.
     Verify {
         /// JSON produced by the plan command.
@@ -88,6 +110,18 @@ enum Command {
         /// Require at least this many contributors.
         #[arg(long, default_value_t = 2)]
         min_peers: usize,
+    },
+    /// Search exact measured shard ranges and directed links; advisory JSON only.
+    MeasuredPlan {
+        /// Versioned JSON with fresh range, link and memory observations.
+        profile: PathBuf,
+    },
+    /// Recheck a saved measured plan against refreshed observations; no runtime verification.
+    ValidateMeasured {
+        /// JSON produced by `measured-plan`.
+        plan: PathBuf,
+        /// Versioned measured profile with current capacity and time.
+        profile: PathBuf,
     },
     /// Print this node's ID and accept control connections from peers.
     Listen,
@@ -175,6 +209,12 @@ enum Command {
         /// Time between heartbeats to the leader, e.g. `2s` or `500ms`.
         #[arg(long, default_value = DEFAULT_HEARTBEAT_INTERVAL_ARG, value_parser = parse_duration)]
         heartbeat_interval: Duration,
+        /// Drop the control link and redial after this long without a heartbeat from the
+        /// leader, e.g. `7s`. Must exceed the leader's --heartbeat-interval. Applies only once
+        /// the leader has sent one, so leaders that never heartbeat are not timed out. `0s`
+        /// disables it.
+        #[arg(long, default_value = DEFAULT_LEADER_HEARTBEAT_TIMEOUT_ARG, value_parser = parse_duration)]
+        leader_heartbeat_timeout: Duration,
     },
     /// Run the main process: start the execution backend (llama-server from a plan, or the shard
     /// runner pipeline from a manifest) and serve the job API in front of it.
@@ -278,6 +318,15 @@ struct LeaderArgs {
     /// How long llama-server may take to load the model and answer /health (llama backend).
     #[arg(long, default_value = DEFAULT_LLAMA_READY_TIMEOUT_ARG, value_parser = parse_duration)]
     llama_ready_timeout: Duration,
+    /// Close a worker's control connection after this long without a heartbeat, e.g. `7s`;
+    /// the worker reconnects with backoff. Must exceed the workers' --heartbeat-interval.
+    /// `0s` disables the timeout.
+    #[arg(long, default_value = DEFAULT_HEARTBEAT_TIMEOUT_ARG, value_parser = parse_duration)]
+    heartbeat_timeout: Duration,
+    /// Time between the leader's own heartbeats to each connected worker, e.g. `2s`; workers
+    /// redial after their --leader-heartbeat-timeout without one. `0s` disables them.
+    #[arg(long, default_value = DEFAULT_LEADER_HEARTBEAT_INTERVAL_ARG, value_parser = parse_duration)]
+    heartbeat_interval: Duration,
 }
 
 /// `leader --backend` values.
@@ -318,8 +367,15 @@ impl LeaderArgs {
             upstream_port: self.llama_port,
             api_addr: self.api,
             worker_wait: self.worker_wait,
+            heartbeat_timeout: zero_disables(self.heartbeat_timeout),
+            heartbeat_interval: zero_disables(self.heartbeat_interval),
         })
     }
+}
+
+/// Maps a heartbeat timeout or interval flag to its setting: `0s` disables it.
+fn zero_disables(duration: Duration) -> Option<Duration> {
+    (!duration.is_zero()).then_some(duration)
 }
 
 /// A flag clap already requires with `--backend llama`; checked again so no unwrap is needed.
@@ -349,9 +405,10 @@ enum HistoryCommand {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_logging();
     let cli = Cli::parse();
+    init_logging(cli.debug);
     match cli.command {
+        Command::Mesh { state_dir } => llm_cluster::mesh::cli::run(state_dir).await,
         Command::Verify {
             plan,
             profile,
@@ -370,10 +427,39 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Plan { profile, min_peers } => {
             let input = std::fs::read_to_string(profile)?;
-            let request = serde_json::from_str(&input)?;
+            let request: llm_cluster::planning::PlanningRequest = serde_json::from_str(&input)?;
+            tracing::debug!(
+                peers = request.peers.len(),
+                links = request.links.len(),
+                min_peers,
+                "building placement plan"
+            );
             let output = llm_cluster::planning::build_plan(&request, min_peers)
                 .map_err(|error| anyhow::anyhow!("planning failed: {error:?}"))?;
+            tracing::debug!(
+                assignments = output.placement.assignments.len(),
+                predicted_decode_us = output.placement.predicted_decode_us,
+                "placement plan ready"
+            );
             println!("{}", serde_json::to_string_pretty(&output)?);
+            Ok(())
+        }
+        Command::MeasuredPlan { profile } => {
+            let request: llm_cluster::measured_placement::MeasuredRequest =
+                serde_json::from_str(&std::fs::read_to_string(profile)?)?;
+            let output = llm_cluster::measured_placement::plan(&request)
+                .map_err(|error| anyhow::anyhow!("measured planning failed: {error:?}"))?;
+            println!("{}", serde_json::to_string_pretty(&output)?);
+            Ok(())
+        }
+        Command::ValidateMeasured { plan, profile } => {
+            let request: llm_cluster::measured_placement::MeasuredRequest =
+                serde_json::from_str(&std::fs::read_to_string(profile)?)?;
+            let output: llm_cluster::measured_placement::MeasuredPlacement =
+                serde_json::from_str(&std::fs::read_to_string(plan)?)?;
+            llm_cluster::measured_placement::validate_output(&request, &output)
+                .map_err(|error| anyhow::anyhow!("measured plan validation failed: {error:?}"))?;
+            println!("{{\"validated\":true}}");
             Ok(())
         }
         Command::Listen => listen(&cli.key, &cli.cluster).await,
@@ -421,6 +507,7 @@ async fn main() -> anyhow::Result<()> {
             leader,
             allow_peers,
             heartbeat_interval,
+            leader_heartbeat_timeout,
         } => {
             let config = WorkerConfig {
                 key_path: cli.key,
@@ -431,6 +518,7 @@ async fn main() -> anyhow::Result<()> {
                 leader: leader.as_deref().map(network::parse_node_id).transpose()?,
                 allowed_peers: parse_node_ids(&allow_peers)?,
                 heartbeat_interval,
+                leader_heartbeat_timeout: zero_disables(leader_heartbeat_timeout),
             };
             until_ctrl_c(worker::run_worker(config)).await
         }
@@ -483,12 +571,18 @@ fn history(command: HistoryCommand) -> anyhow::Result<()> {
 }
 
 /// Sends logs to stderr so stdout carries only intentional CLI output such as the node ID.
-fn init_logging() {
-    let filter =
+fn init_logging(debug: bool) {
+    let mut filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
+    if debug {
+        filter = filter.add_directive("llm_cluster=debug".parse().expect("constant log directive"));
+    }
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        .with_thread_ids(debug)
+        .with_file(debug)
+        .with_line_number(debug)
         .init();
 }
 
@@ -715,6 +809,94 @@ mod tests {
         assert_eq!(
             parse_duration(DEFAULT_EVIDENCE_WAIT_ARG),
             Ok(evidence::DEFAULT_EVIDENCE_WAIT)
+        );
+    }
+
+    #[test]
+    fn heartbeat_timeout_defaults_on_and_zero_disables_it() {
+        let llama = [
+            "--plan",
+            "plan.json",
+            "--profile",
+            "profile.json",
+            "--llama-server",
+            "llama-server",
+        ];
+        assert_eq!(
+            parse_duration(DEFAULT_HEARTBEAT_TIMEOUT_ARG),
+            Ok(leader::DEFAULT_HEARTBEAT_TIMEOUT)
+        );
+        assert_eq!(
+            leader_config(&llama).heartbeat_timeout,
+            Some(leader::DEFAULT_HEARTBEAT_TIMEOUT)
+        );
+        let disabled = [&llama[..], &["--heartbeat-timeout", "0s"]].concat();
+        assert_eq!(leader_config(&disabled).heartbeat_timeout, None);
+        let custom = [&llama[..], &["--heartbeat-timeout", "1500ms"]].concat();
+        assert_eq!(
+            leader_config(&custom).heartbeat_timeout,
+            Some(Duration::from_millis(1500))
+        );
+    }
+
+    #[test]
+    fn leader_heartbeat_interval_defaults_on_and_zero_disables_it() {
+        let llama = [
+            "--plan",
+            "plan.json",
+            "--profile",
+            "profile.json",
+            "--llama-server",
+            "llama-server",
+        ];
+        assert_eq!(
+            parse_duration(DEFAULT_LEADER_HEARTBEAT_INTERVAL_ARG),
+            Ok(leader::DEFAULT_HEARTBEAT_INTERVAL)
+        );
+        assert_eq!(
+            leader_config(&llama).heartbeat_interval,
+            Some(leader::DEFAULT_HEARTBEAT_INTERVAL)
+        );
+        let disabled = [&llama[..], &["--heartbeat-interval", "0s"]].concat();
+        assert_eq!(leader_config(&disabled).heartbeat_interval, None);
+        let custom = [&llama[..], &["--heartbeat-interval", "500ms"]].concat();
+        assert_eq!(
+            leader_config(&custom).heartbeat_interval,
+            Some(Duration::from_millis(500))
+        );
+    }
+
+    /// The worker's `--leader-heartbeat-timeout`, as its `WorkerConfig` setting.
+    fn worker_leader_heartbeat_timeout(extra: &[&str]) -> Option<Duration> {
+        let args = [&["meshthing", "worker", "--rpc-server", "rpc"][..], extra].concat();
+        let cli = Cli::try_parse_from(args).expect("worker args");
+        let Command::Worker {
+            leader_heartbeat_timeout,
+            ..
+        } = cli.command
+        else {
+            panic!("expected worker, got {:?}", cli.command);
+        };
+        zero_disables(leader_heartbeat_timeout)
+    }
+
+    #[test]
+    fn worker_leader_heartbeat_timeout_defaults_on_and_zero_disables_it() {
+        assert_eq!(
+            parse_duration(DEFAULT_LEADER_HEARTBEAT_TIMEOUT_ARG),
+            Ok(worker::DEFAULT_LEADER_HEARTBEAT_TIMEOUT)
+        );
+        assert_eq!(
+            worker_leader_heartbeat_timeout(&[]),
+            Some(worker::DEFAULT_LEADER_HEARTBEAT_TIMEOUT)
+        );
+        assert_eq!(
+            worker_leader_heartbeat_timeout(&["--leader-heartbeat-timeout", "0s"]),
+            None
+        );
+        assert_eq!(
+            worker_leader_heartbeat_timeout(&["--leader-heartbeat-timeout", "900ms"]),
+            Some(Duration::from_millis(900))
         );
     }
 

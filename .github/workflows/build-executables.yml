@@ -2,13 +2,13 @@ name: Build executables
 
 on:
   push:
+    branches: [main]
     paths:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'src/**'
       - 'apps/web/**'
-      - 'scripts/package-executable.py'
-      - 'scripts/smoke-packaged-ui.py'
+      - 'apps/desktop/**'
       - '.github/workflows/build-executables.yml'
   pull_request:
     paths:
@@ -16,8 +16,7 @@ on:
       - 'Cargo.lock'
       - 'src/**'
       - 'apps/web/**'
-      - 'scripts/package-executable.py'
-      - 'scripts/smoke-packaged-ui.py'
+      - 'apps/desktop/**'
       - '.github/workflows/build-executables.yml'
   workflow_dispatch:
 
@@ -25,7 +24,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: executables-${{ github.ref }}
+  group: executables-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -77,9 +76,9 @@ jobs:
       - name: Smoke test browser launcher
         run: cargo run --release --locked --bin meshthing --target ${{ matrix.target }} -- --help
       - name: Package executable and checksums
-        run: python scripts/package-executable.py --target ${{ matrix.target }} --revision ${{ github.sha }}
+        run: python apps/desktop/scripts/package-executable.py --target ${{ matrix.target }} --revision ${{ github.sha }}
       - name: Test extracted terminal launcher
-        run: python scripts/smoke-packaged-ui.py --target ${{ matrix.target }}
+        run: python apps/desktop/scripts/smoke-packaged-ui.py --target ${{ matrix.target }}
       - uses: actions/upload-artifact@v4
         with:
           name: meshthing-${{ matrix.target }}

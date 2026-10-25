@@ -15,17 +15,18 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail, ensure};
 use iroh::endpoint::{Connection, VarInt};
 use iroh::{Endpoint, EndpointId};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::time::timeout;
-use tracing::{info, warn};
+use tokio::time::{timeout, timeout_at};
+use tracing::{debug, info, warn};
 
 use crate::protocol::RPC_BRIDGE_ALPN;
+use crate::rpc_bridge::path_kind;
 use crate::shard::manifest::same_sha256;
 use crate::shard::wire::{self, MAX_BATCH_TOKENS, StageInput, StageMetadata, StepReply};
 
@@ -101,6 +102,7 @@ impl StageLink {
         metadata_timeout: Duration,
     ) -> anyhow::Result<Self> {
         let label = format!("local stage {}..{}", launch.begin, launch.end);
+        let startup_started = Instant::now();
         let mut child = Command::new(launch.runner)
             .arg(launch.model)
             .args(runner_args(launch))
@@ -119,6 +121,7 @@ impl StageLink {
         info!(stage = %label, pid = ?child.id(), "shard runner started");
         let mut reader = BufReader::new(stdout);
         let metadata = read_metadata(&mut reader, &label, metadata_timeout).await?;
+        debug!(stage = %label, startup_us = startup_started.elapsed().as_micros(), "local stage metadata ready");
         Ok(Self {
             reader: Box::new(reader),
             writer: Box::new(stdin),
@@ -136,10 +139,12 @@ impl StageLink {
         metadata_timeout: Duration,
     ) -> anyhow::Result<Self> {
         let label = format!("remote stage on {}", worker.fmt_short());
+        let connect_started = Instant::now();
         let connection = endpoint
             .connect(worker, RPC_BRIDGE_ALPN)
             .await
             .with_context(|| format!("failed to connect to {label}"))?;
+        debug!(stage = %label, path = path_kind(&connection), connect_us = connect_started.elapsed().as_micros(), "remote stage connected");
         let (mut send, recv) = connection
             .open_bi()
             .await
@@ -148,7 +153,9 @@ impl StageLink {
             .await
             .with_context(|| format!("failed to greet {label}"))?;
         let mut reader = BufReader::new(recv);
+        let metadata_started = Instant::now();
         let metadata = read_metadata(&mut reader, &label, metadata_timeout).await?;
+        debug!(stage = %label, metadata_us = metadata_started.elapsed().as_micros(), "remote stage metadata ready");
         info!(stage = %label, begin = metadata.begin, end = metadata.end, "remote stage ready");
         Ok(Self {
             reader: Box::new(reader),
@@ -173,19 +180,47 @@ impl StageLink {
         max_floats: usize,
         step_timeout: Duration,
     ) -> anyhow::Result<wire::StepOutput> {
-        let round_trip = async {
-            wire::write_request(&mut self.writer, step, position, input).await?;
-            wire::read_step(&mut self.reader, max_floats).await
+        let started = Instant::now();
+        let deadline = tokio::time::Instant::now() + step_timeout;
+        let (input_kind, input_bytes) = match input {
+            StageInput::Tokens(tokens) => ("tokens", tokens.len().saturating_mul(4)),
+            StageInput::Hidden { rows, .. } => ("hidden", rows.len().saturating_mul(4)),
         };
-        let output = timeout(step_timeout, round_trip)
+        timeout_at(
+            deadline,
+            wire::write_request(&mut self.writer, step, position, input),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "{} timed out writing step {step} within {step_timeout:?}",
+                self.label
+            )
+        })?
+        .with_context(|| format!("{} failed writing step {step}", self.label))?;
+        let write_us = started.elapsed().as_micros();
+        let read_started = Instant::now();
+        let output = timeout_at(deadline, wire::read_step(&mut self.reader, max_floats))
             .await
             .with_context(|| {
                 format!(
-                    "{} did not answer step {step} within {step_timeout:?}",
+                    "{} timed out reading step {step} within {step_timeout:?}",
                     self.label
                 )
             })?
-            .with_context(|| format!("{} failed at step {step}", self.label))?;
+            .with_context(|| format!("{} failed reading step {step}", self.label))?;
+        debug!(
+            stage = %self.label,
+            step,
+            position,
+            input_kind,
+            input_bytes,
+            output_bytes = output.floats.len().saturating_mul(4),
+            write_us,
+            read_us = read_started.elapsed().as_micros(),
+            total_us = started.elapsed().as_micros(),
+            "shard stage exchange"
+        );
         ensure!(
             output.reply.step == step,
             "{} answered step {} to request {step}",
@@ -424,10 +459,12 @@ impl Pipeline {
 
     /// Sends one batch of tokens through every stage and returns the final stage's reply.
     async fn step(&mut self, decoder: &mut Decoder, tokens: &[u32]) -> anyhow::Result<StepReply> {
+        let started = Instant::now();
         let (step, position) = (decoder.step, decoder.position);
         let count = tokens.len();
         let row_values = count * self.embd as usize;
-        let last = self.links.len() - 1;
+        let stage_count = self.links.len();
+        let last = stage_count - 1;
         let mut rows = Vec::new();
         for (index, link) in self.links.iter_mut().enumerate() {
             let input = if index == 0 {
@@ -444,6 +481,14 @@ impl Pipeline {
                 .await?;
             if index == last {
                 decoder.advance(count);
+                debug!(
+                    step,
+                    position,
+                    token_count = count,
+                    stage_count,
+                    total_us = started.elapsed().as_micros(),
+                    "shard pipeline step"
+                );
                 return Ok(output.reply);
             }
             ensure!(

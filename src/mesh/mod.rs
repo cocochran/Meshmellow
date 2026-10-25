@@ -1,0 +1,1057 @@
+pub mod cli;
+pub mod membership;
+pub mod rendezvous;
+#[cfg(test)]
+mod tests;
+
+use anyhow::{Context, Result, bail, ensure};
+use iroh::{Endpoint, EndpointAddr, SecretKey};
+use membership::{INVITE_SECONDS, Ledger, emoji_code, name, normalize_code, now};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::{
+    collections::BTreeMap,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
+use tokio::sync::{Mutex, Semaphore};
+
+const ALPN: &[u8] = b"meshthing/enrollment/1";
+const MAX_WIRE: usize = 128 * 1024;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Peer {
+    pub id: String,
+    #[serde(default)]
+    pub addresses: Vec<SocketAddr>,
+    #[serde(default)]
+    pub invite: String,
+    #[serde(default)]
+    pub relay: Option<String>,
+}
+impl Peer {
+    fn addr(&self) -> Result<EndpointAddr> {
+        ensure!(self.addresses.len() <= 16, "Too many peer addresses.");
+        let mut addr = EndpointAddr::new(self.id.parse()?);
+        for address in &self.addresses {
+            addr = addr.with_ip_addr(*address);
+        }
+        if let Some(relay) = &self.relay {
+            addr = addr.with_relay_url(relay.parse()?);
+        }
+        Ok(addr)
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Invite {
+    id: String,
+    expires: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Pending {
+    pub id: String,
+    pub applicant: String,
+    pub name: String,
+    pub issuer: String,
+    pub expires: u64,
+    pub status: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Joining {
+    peer: Peer,
+    request: String,
+    ledger: Ledger,
+    expires: u64,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct Record {
+    ledger: Option<Ledger>,
+    invite: Option<Invite>,
+    #[serde(default)]
+    requests: Vec<Pending>,
+    joining: Option<Joining>,
+    #[serde(default)]
+    notice: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+enum Wire {
+    Join {
+        invite: String,
+        name: String,
+    },
+    Poll {
+        request: String,
+    },
+    Cancel {
+        request: String,
+    },
+    Sync {
+        ledger: Ledger,
+    },
+    Decide {
+        ledger: Ledger,
+        request: String,
+        approve: bool,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+struct Reply {
+    error: Option<String>,
+    ledger: Option<Ledger>,
+    #[serde(default)]
+    pending: Vec<Pending>,
+    status: Option<String>,
+}
+impl Reply {
+    fn empty() -> Self {
+        Self {
+            error: None,
+            ledger: None,
+            pending: vec![],
+            status: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct Node {
+    endpoint: Endpoint,
+    key: SecretKey,
+    path: PathBuf,
+    record: Arc<Mutex<Record>>,
+    peers: Arc<Mutex<BTreeMap<String, Peer>>>,
+    remote_pending: Arc<Mutex<Vec<Pending>>>,
+    registry: Option<EndpointAddr>,
+    internet: bool,
+    published: Arc<Mutex<(String, u64)>>,
+    control_peers: crate::network::SharedPeerTable,
+    control_tasks: Arc<Mutex<BTreeMap<String, tokio::task::JoinHandle<()>>>>,
+}
+
+impl Node {
+    pub async fn open(directory: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with(directory.as_ref(), true, rendezvous::configured_address()?).await
+    }
+
+    #[cfg(test)]
+    async fn open_local(directory: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with(directory.as_ref(), false, None).await
+    }
+
+    async fn open_with(dir: &Path, internet: bool, registry: Option<EndpointAddr>) -> Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let key_path = dir.join("identity.key");
+        let key =
+            match std::fs::read(&key_path) {
+                Ok(bytes) => SecretKey::from_bytes(&bytes.try_into().map_err(|_| {
+                    anyhow::anyhow!("Invalid saved identity; refusing to replace it.")
+                })?),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let key = SecretKey::generate();
+                    write_private(&key_path, &key.to_bytes(), true)?;
+                    key
+                }
+                Err(error) => return Err(error.into()),
+            };
+        let path = dir.join("membership.json");
+        let record: Record = match std::fs::read(&path) {
+            Ok(bytes) => {
+                ensure!(bytes.len() <= MAX_WIRE, "Saved membership is too large.");
+                serde_json::from_slice(&bytes)?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Record::default(),
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(ledger) = &record.ledger {
+            ensure!(
+                ledger.members()?.contains_key(&key.public().to_string()),
+                "Saved identity is not a member of this mesh."
+            );
+        }
+        let endpoint = if internet {
+            let builder = crate::network::endpoint_builder_with_key(
+                key.clone(),
+                vec![ALPN.to_vec(), crate::protocol::CONTROL_ALPN.to_vec()],
+            );
+            // Internet integration tests deliberately have no IP transport, so
+            // successful pairing cannot accidentally use loopback or the LAN.
+            #[cfg(test)]
+            let builder = builder.clear_ip_transports();
+            builder.bind().await?
+        } else {
+            Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .secret_key(key.clone())
+                .alpns(vec![ALPN.to_vec(), crate::protocol::CONTROL_ALPN.to_vec()])
+                .bind()
+                .await?
+        };
+        let node = Self {
+            endpoint,
+            key,
+            path,
+            record: Arc::new(Mutex::new(record)),
+            peers: Default::default(),
+            remote_pending: Default::default(),
+            registry,
+            internet,
+            published: Default::default(),
+            control_peers: Default::default(),
+            control_tasks: Default::default(),
+        };
+        node.serve();
+        node.maintain_mesh();
+        Ok(node)
+    }
+
+    pub fn id(&self) -> String {
+        self.endpoint.id().to_string()
+    }
+    pub fn address(&self) -> Peer {
+        Peer {
+            id: self.id(),
+            addresses: self.endpoint.addr().ip_addrs().copied().collect(),
+            invite: String::new(),
+            relay: self
+                .endpoint
+                .addr()
+                .relay_urls()
+                .next()
+                .map(ToString::to_string),
+        }
+    }
+    pub async fn close(&self) {
+        self.endpoint.close().await;
+        for (_, task) in std::mem::take(&mut *self.control_tasks.lock().await) {
+            task.abort();
+        }
+    }
+
+    fn persist(&self, record: &Record) -> Result<()> {
+        let bytes = serde_json::to_vec(record)?;
+        ensure!(bytes.len() <= MAX_WIRE, "Membership storage limit reached.");
+        let temporary = self.path.with_extension("tmp");
+        write_private(&temporary, &bytes, false)?;
+        std::fs::rename(&temporary, &self.path)?;
+        // Persist rename as well as file contents before reporting success.
+        std::fs::File::open(self.path.parent().unwrap())?.sync_all()?;
+        Ok(())
+    }
+
+    async fn change<T>(&self, f: impl FnOnce(&mut Record) -> Result<T>) -> Result<T> {
+        let mut record = self.record.lock().await;
+        let mut next = record.clone();
+        let result = f(&mut next)?;
+        if serde_json::to_vec(&next)? != serde_json::to_vec(&*record)? {
+            self.persist(&next)?;
+            *record = next;
+        }
+        Ok(result)
+    }
+
+    pub async fn create(&self, mesh_name: &str, device_name: &str) -> Result<()> {
+        self.change(|r| {
+            ensure!(
+                r.ledger.is_none() && r.joining.is_none(),
+                "This device already has a mesh or a pending join."
+            );
+            r.ledger = Some(Ledger::create(&self.key, mesh_name, device_name)?);
+            r.notice.clear();
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn invite(&self) -> Result<String> {
+        if self.internet {
+            tokio::time::timeout(Duration::from_secs(15), self.endpoint.online())
+                .await
+                .context("Cannot reach Iroh. Check your Internet connection.")?;
+        }
+        let code = self
+            .change(|r| {
+                ensure!(r.ledger.is_some(), "Create or join a mesh first.");
+                ensure!(
+                    !r.requests
+                        .iter()
+                        .any(|p| p.status == "pending" && p.expires > now()),
+                    "Approve or decline the current request first."
+                );
+                r.requests
+                    .retain(|p| p.status == "approved" || p.expires > now());
+                ensure!(
+                    r.requests.len() < 64,
+                    "Too many recent invitations. Try again later."
+                );
+                let invite = Invite {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    expires: now() + INVITE_SECONDS,
+                };
+                let code = emoji_code(&self.id(), &invite.id);
+                r.invite = Some(invite);
+                Ok(code)
+            })
+            .await?;
+        // A directory outage must not prevent sharing a self-contained ticket.
+        if let Err(error) = self.publish_invitation().await {
+            self.change(|r| {
+                r.notice = format!(
+                    "Short-code lookup unavailable: {error}. Share the full invitation instead."
+                );
+                Ok(())
+            })
+            .await?;
+        }
+        Ok(code)
+    }
+
+    async fn publish_invitation(&self) -> Result<()> {
+        let Some(registry) = &self.registry else {
+            return Ok(());
+        };
+        let invite = self.record.lock().await.invite.clone();
+        let Some(invite) = invite.filter(|i| i.expires > now()) else {
+            return Ok(());
+        };
+        let mut published = self.published.lock().await;
+        if published.0 == invite.id && now().saturating_sub(published.1) < 60 {
+            return Ok(());
+        }
+        tokio::time::timeout(Duration::from_secs(15), self.endpoint.online())
+            .await
+            .context("Cannot reach Iroh. Check your Internet connection.")?;
+        let relay = self
+            .endpoint
+            .addr()
+            .relay_urls()
+            .next()
+            .map(ToString::to_string);
+        let locator =
+            rendezvous::Locator::signed(&self.key, invite.id.clone(), invite.expires, relay);
+        rendezvous::publish(&self.endpoint, registry.clone(), locator).await?;
+        *published = (invite.id, now());
+        Ok(())
+    }
+
+    pub async fn discover(&self, peers: Vec<Peer>) -> Result<()> {
+        ensure!(peers.len() <= 128, "Too many discovered devices.");
+        let mut next = BTreeMap::new();
+        for peer in peers {
+            peer.addr()?;
+            if peer.id != self.id() {
+                next.insert(peer.id.clone(), peer);
+            }
+        }
+        *self.peers.lock().await = next;
+        Ok(())
+    }
+
+    pub async fn join_code(&self, code: &str, device_name: &str) -> Result<()> {
+        if code.trim().starts_with("layercake://join/") {
+            return self
+                .join(rendezvous::Locator::from_ticket(code)?.peer(), device_name)
+                .await;
+        }
+        let code = normalize_code(code)?;
+        if let Some(registry) = &self.registry {
+            let peer = rendezvous::resolve(&self.endpoint, registry.clone(), &code).await?;
+            return self.join(peer, device_name).await;
+        }
+        ensure!(
+            !self.internet,
+            "Paste the full invitation from the trusted device. Eight-emoji lookup is not configured."
+        );
+        let peers = self.peers.lock().await.clone();
+        let matches: Vec<_> = peers
+            .values()
+            .filter(|p| !p.invite.is_empty() && emoji_code(&p.id, &p.invite) == code)
+            .cloned()
+            .collect();
+        ensure!(
+            matches.len() == 1,
+            "Invitation not found. Keep the inviting app open and check the eight emojis."
+        );
+        self.join(matches[0].clone(), device_name).await
+    }
+
+    pub async fn join(&self, peer: Peer, device_name: &str) -> Result<()> {
+        {
+            let r = self.record.lock().await;
+            ensure!(
+                r.ledger.is_none() && r.joining.is_none(),
+                "This device already has a mesh or a pending join."
+            );
+        }
+        let reply = self
+            .rpc(
+                &peer,
+                Wire::Join {
+                    invite: peer.invite.clone(),
+                    name: name(device_name)?,
+                },
+            )
+            .await?;
+        let ledger = reply.ledger.context("Missing mesh identity.")?;
+        ensure!(
+            ledger.members()?.contains_key(&peer.id),
+            "Invitation issuer is not trusted in this mesh."
+        );
+        let request = reply.pending.first().context("Missing join request.")?;
+        ensure!(
+            request.applicant == self.id()
+                && request.issuer == peer.id
+                && request.status == "pending"
+                && request.expires > now(),
+            "Invalid join response."
+        );
+        self.change(|r| {
+            ensure!(
+                r.ledger.is_none() && r.joining.is_none(),
+                "Device membership changed during join."
+            );
+            r.joining = Some(Joining {
+                peer,
+                request: request.id.clone(),
+                ledger,
+                expires: request.expires,
+            });
+            r.notice.clear();
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn decide(&self, issuer: &str, request: &str, approve: bool) -> Result<()> {
+        let ledger = self
+            .record
+            .lock()
+            .await
+            .ledger
+            .clone()
+            .context("This device is not trusted yet.")?;
+        if issuer == self.id() {
+            self.dispatch(
+                &self.id(),
+                Wire::Decide {
+                    ledger,
+                    request: request.to_owned(),
+                    approve,
+                },
+            )
+            .await?;
+        } else {
+            ensure!(
+                ledger.members()?.contains_key(issuer),
+                "Unknown invitation issuer."
+            );
+            let peer = self
+                .peers
+                .lock()
+                .await
+                .get(issuer)
+                .cloned()
+                .unwrap_or(Peer {
+                    id: issuer.to_owned(),
+                    addresses: vec![],
+                    invite: String::new(),
+                    relay: None,
+                });
+            let response = self
+                .rpc(
+                    &peer,
+                    Wire::Decide {
+                        ledger,
+                        request: request.to_owned(),
+                        approve,
+                    },
+                )
+                .await?;
+            if let Some(next) = response.ledger {
+                self.merge(&next).await?;
+            }
+        }
+        self.remote_pending
+            .lock()
+            .await
+            .retain(|p| p.id != request || p.issuer != issuer);
+        Ok(())
+    }
+
+    async fn merge(&self, next: &Ledger) -> Result<()> {
+        self.change(|r| r.ledger.as_mut().context("No mesh.")?.merge(next))
+            .await
+    }
+
+    pub async fn refresh(&self) -> Result<()> {
+        let publication = self.publish_invitation().await;
+        let r = self.record.lock().await.clone();
+        if let Some(joining) = r.joining {
+            {
+                let peer = self
+                    .peers
+                    .lock()
+                    .await
+                    .get(&joining.peer.id)
+                    .cloned()
+                    .unwrap_or(joining.peer.clone());
+                let reply = self
+                    .rpc(
+                        &peer,
+                        Wire::Poll {
+                            request: joining.request.clone(),
+                        },
+                    )
+                    .await?;
+                match reply.status.as_deref() {
+                    Some("approved") => {
+                        let mut ledger = joining.ledger;
+                        ledger.merge(&reply.ledger.context("Missing membership.")?)?;
+                        ensure!(
+                            ledger.members()?.contains_key(&self.id()),
+                            "Approval does not include this device."
+                        );
+                        self.change(|r| {
+                            r.ledger = Some(ledger);
+                            r.joining = None;
+                            r.notice.clear();
+                            Ok(())
+                        })
+                        .await?;
+                    }
+                    Some("declined" | "expired") => {
+                        self.change(|r| {
+                            r.joining = None;
+                            r.notice =
+                                "The request was declined or expired. Ask for a new invitation."
+                                    .into();
+                            Ok(())
+                        })
+                        .await?;
+                    }
+                    Some("pending") => {}
+                    _ => bail!("Invalid join status."),
+                }
+            }
+            return Ok(());
+        }
+        let Some(ledger) = r.ledger else {
+            return Ok(());
+        };
+        let members = ledger.members()?;
+        let peers = self.peers.lock().await.clone();
+        let mut jobs = tokio::task::JoinSet::new();
+        for id in members.keys().filter(|id| **id != self.id()) {
+            let node = self.clone();
+            let peer = peers.get(id).cloned().unwrap_or(Peer {
+                id: id.clone(),
+                addresses: vec![],
+                invite: String::new(),
+                relay: None,
+            });
+            let ledger = ledger.clone();
+            jobs.spawn(async move {
+                let reply = node.rpc(&peer, Wire::Sync { ledger }).await?;
+                Ok::<_, anyhow::Error>((peer.id, reply))
+            });
+        }
+        let mut pending = vec![];
+        while let Some(result) = jobs.join_next().await {
+            if let Ok(Ok((issuer, response))) = result {
+                if let Some(next) = response.ledger {
+                    self.merge(&next).await?;
+                }
+                pending.extend(
+                    response.pending.into_iter().filter(|p| {
+                        p.issuer == issuer && p.status == "pending" && p.expires > now()
+                    }),
+                );
+            }
+        }
+        *self.remote_pending.lock().await = pending;
+        publication
+    }
+
+    pub async fn snapshot(&self) -> Result<Value> {
+        let r = self.record.lock().await.clone();
+        let mut pending: Vec<_> = r
+            .requests
+            .iter()
+            .filter(|p| p.status == "pending" && p.expires > now())
+            .cloned()
+            .collect();
+        pending.extend(
+            self.remote_pending
+                .lock()
+                .await
+                .clone()
+                .into_iter()
+                .filter(|p| p.expires > now()),
+        );
+        let published = self.published.lock().await.0.clone();
+        let invite = r.invite.filter(|i| i.expires > now());
+        let connected: Vec<String> = self
+            .control_peers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Peer state unavailable."))?
+            .peers()
+            .map(|p| p.node_id.to_string())
+            .collect();
+        let members = if let Some(ledger) = &r.ledger {
+            ledger
+                .members()?
+                .into_iter()
+                .map(|(id, name)| json!({"id": id, "name": name, "self": id == self.id(), "online": id == self.id() || connected.contains(&id)}))
+                .collect::<Vec<_>>()
+        } else {
+            vec![]
+        };
+        Ok(json!({
+            "id": self.id(), "port": self.endpoint.bound_sockets().iter().find(|s| s.is_ipv4()).map(|s| s.port()).unwrap_or(0),
+            "mesh": r.ledger.as_ref().map(|l| json!({"id": l.genesis.id(), "name": l.genesis.name})),
+            "members": members, "pending": pending,
+            "invite": invite.map(|i| {
+                let locator = rendezvous::Locator::signed(&self.key, i.id.clone(), i.expires, self.endpoint.addr().relay_urls().next().map(ToString::to_string));
+                json!({"id": i.id, "code": emoji_code(&self.id(), &i.id), "expires": i.expires, "ticket": locator.ticket(), "code_available": published == i.id})
+            }),
+            "connected_peers": connected,
+            "joining": r.joining.map(|j| json!({"name": j.ledger.genesis.name, "expires": j.expires})),
+            "notice": r.notice
+        }))
+    }
+
+    pub async fn command(&self, command: Value) -> Result<Value> {
+        let text = |key: &str| {
+            command
+                .get(key)
+                .and_then(Value::as_str)
+                .context(format!("Missing {key}."))
+        };
+        match text("op")? {
+            "snapshot" => {}
+            "create" => self.create(text("name")?, text("device_name")?).await?,
+            "invite" => {
+                self.invite().await?;
+            }
+            "discover" => {
+                self.discover(serde_json::from_value(command["peers"].clone())?)
+                    .await?
+            }
+            "join" => self.join_code(text("code")?, text("device_name")?).await?,
+            "refresh" => self.refresh().await?,
+            "decide" => {
+                self.decide(
+                    text("issuer")?,
+                    text("request")?,
+                    command["approve"].as_bool().context("Missing decision.")?,
+                )
+                .await?
+            }
+            "cancel_join" => {
+                let joining = self
+                    .record
+                    .lock()
+                    .await
+                    .joining
+                    .clone()
+                    .context("No join request.")?;
+                {
+                    let peer = self
+                        .peers
+                        .lock()
+                        .await
+                        .get(&joining.peer.id)
+                        .cloned()
+                        .unwrap_or(joining.peer);
+                    self.rpc(
+                        &peer,
+                        Wire::Cancel {
+                            request: joining.request,
+                        },
+                    )
+                    .await?;
+                }
+                self.change(|r| {
+                    r.joining = None;
+                    r.notice.clear();
+                    Ok(())
+                })
+                .await?;
+            }
+            _ => bail!("Unknown enrollment command."),
+        }
+        self.snapshot().await
+    }
+
+    async fn handle(&self, remote: &str, message: Wire) -> Result<Reply> {
+        self.change(|r| {
+            let mut reply = Reply::empty();
+            match message {
+                Wire::Join {
+                    invite,
+                    name: device_name,
+                } => {
+                    let ledger = r.ledger.as_ref().context("This device has no mesh.")?;
+                    ensure!(
+                        !ledger.members()?.contains_key(remote),
+                        "This device is already trusted."
+                    );
+                    let active = r.invite.as_ref().context("Invitation unavailable.")?;
+                    ensure!(
+                        active.id == invite && active.expires > now(),
+                        "This invitation expired or was replaced."
+                    );
+                    let device_name = name(&device_name)?;
+                    r.requests
+                        .retain(|p| p.status == "approved" || p.expires > now());
+                    if let Some(existing) = r.requests.iter().find(|p| p.id == invite) {
+                        ensure!(
+                            existing.applicant == remote && existing.status == "pending",
+                            "This invitation is already in use. Ask for a new code."
+                        );
+                        reply.pending.push(existing.clone());
+                    } else {
+                        ensure!(r.requests.len() < 64, "Too many requests.");
+                        let pending = Pending {
+                            id: invite,
+                            applicant: remote.to_owned(),
+                            name: device_name,
+                            issuer: self.id(),
+                            expires: active.expires,
+                            status: "pending".into(),
+                        };
+                        r.requests.push(pending.clone());
+                        reply.pending.push(pending);
+                    }
+                    reply.ledger = Some(ledger.clone());
+                }
+                Wire::Poll { request } => {
+                    if let Some(pending) = r
+                        .requests
+                        .iter()
+                        .find(|p| p.id == request && p.applicant == remote)
+                    {
+                        reply.status =
+                            Some(if pending.status == "pending" && pending.expires <= now() {
+                                "expired".into()
+                            } else {
+                                pending.status.clone()
+                            });
+                        if pending.status == "approved" {
+                            reply.ledger = r.ledger.clone();
+                        }
+                    } else {
+                        bail!("Join request is unavailable.");
+                    }
+                }
+                Wire::Cancel { request } => {
+                    let pending = r
+                        .requests
+                        .iter_mut()
+                        .find(|p| p.id == request && p.applicant == remote)
+                        .context("Request unavailable.")?;
+                    ensure!(
+                        pending.status != "approved",
+                        "Already approved. Refresh to finish joining."
+                    );
+                    pending.status = "declined".into();
+                    if r.invite.as_ref().is_some_and(|i| i.id == request) {
+                        r.invite = None;
+                    }
+                }
+                Wire::Sync { ledger } | Wire::Decide { ledger, .. } => {
+                    // Handled below, where the decision is retained separately.
+                    let _ = ledger;
+                    unreachable!();
+                }
+            }
+            Ok(reply)
+        })
+        .await
+    }
+
+    async fn handle_trusted(
+        &self,
+        remote: &str,
+        ledger: Ledger,
+        decision: Option<(String, bool)>,
+    ) -> Result<Reply> {
+        self.change(|r| {
+            let current = r.ledger.as_mut().context("This device has no mesh.")?;
+            ensure!(
+                ledger.members()?.contains_key(remote),
+                "The sender is not trusted."
+            );
+            current.merge(&ledger)?;
+            ensure!(
+                current.members()?.contains_key(remote),
+                "Only a trusted device can approve."
+            );
+            if let Some((request, approve)) = decision {
+                let pending = r
+                    .requests
+                    .iter_mut()
+                    .find(|p| p.id == request)
+                    .context("Request is no longer available.")?;
+                let desired = if approve { "approved" } else { "declined" };
+                if pending.status != "pending" {
+                    ensure!(
+                        pending.status == desired,
+                        "Another trusted device already decided this request."
+                    );
+                } else {
+                    ensure!(
+                        pending.expires > now(),
+                        "This request expired. Ask for a new code."
+                    );
+                    if approve {
+                        current.admit(&self.key, &pending.applicant, &pending.name, &pending.id)?;
+                    }
+                    pending.status = desired.into();
+                    if r.invite.as_ref().is_some_and(|i| i.id == request) {
+                        r.invite = None;
+                    }
+                }
+            }
+            Ok(Reply {
+                error: None,
+                ledger: Some(current.clone()),
+                pending: r
+                    .requests
+                    .iter()
+                    .filter(|p| p.status == "pending" && p.expires > now())
+                    .cloned()
+                    .collect(),
+                status: None,
+            })
+        })
+        .await
+    }
+
+    async fn dispatch(&self, remote: &str, message: Wire) -> Result<Reply> {
+        match message {
+            Wire::Sync { ledger } => self.handle_trusted(remote, ledger, None).await,
+            Wire::Decide {
+                ledger,
+                request,
+                approve,
+            } => {
+                self.handle_trusted(remote, ledger, Some((request, approve)))
+                    .await
+            }
+            other => self.handle(remote, other).await,
+        }
+    }
+
+    /// Snapshot the authoritative mesh identity and admit only signed members.
+    async fn control_hello(&self, remote: &str) -> Result<crate::protocol::Hello> {
+        let record = self.record.lock().await;
+        let ledger = record
+            .ledger
+            .as_ref()
+            .context("Create or join a mesh first.")?;
+        ensure!(
+            ledger.members()?.contains_key(remote),
+            "This device is not a trusted member."
+        );
+        Ok(crate::network::local_hello(
+            &self.endpoint,
+            &ledger.genesis.id(),
+            0,
+        ))
+    }
+
+    fn control_options() -> crate::network::ControlOptions {
+        crate::network::ControlOptions {
+            heartbeat_interval: Some(crate::leader::DEFAULT_HEARTBEAT_INTERVAL),
+            heartbeat_timeout: Some(crate::leader::DEFAULT_HEARTBEAT_TIMEOUT),
+        }
+    }
+
+    /// Maintain one dialer per pair, independent of UI refresh and lookup service.
+    fn maintain_mesh(&self) {
+        let node = self.clone();
+        tokio::spawn(async move {
+            while !node.endpoint.is_closed() {
+                let ledger = node.record.lock().await.ledger.clone();
+                if let Some(ledger) = ledger
+                    && let Ok(members) = ledger.members()
+                {
+                    let mut tasks = node.control_tasks.lock().await;
+                    tasks.retain(|id, task| {
+                        if !members.contains_key(id) {
+                            task.abort();
+                            return false;
+                        }
+                        !task.is_finished()
+                    });
+                    for id in members.keys().filter(|id| **id > node.id()) {
+                        if tasks.contains_key(id) {
+                            continue;
+                        }
+                        let remote = id.clone();
+                        let client = node.clone();
+                        tasks.insert(
+                            id.clone(),
+                            tokio::spawn(async move {
+                                while !client.endpoint.is_closed() {
+                                    let Ok(hello) = client.control_hello(&remote).await else {
+                                        break;
+                                    };
+                                    let peer =
+                                        client.peers.lock().await.get(&remote).cloned().unwrap_or(
+                                            Peer {
+                                                id: remote.clone(),
+                                                addresses: vec![],
+                                                invite: String::new(),
+                                                relay: None,
+                                            },
+                                        );
+                                    let Ok(address) = peer.addr() else {
+                                        break;
+                                    };
+                                    let dial = crate::network::dial_peer(
+                                        &client.endpoint,
+                                        address,
+                                        &hello,
+                                        &client.control_peers,
+                                    );
+                                    if let Ok(Ok(session)) =
+                                        tokio::time::timeout(Duration::from_secs(15), dial).await
+                                    {
+                                        crate::network::maintain_peer_session(
+                                            &session,
+                                            &client.id(),
+                                            &client.control_peers,
+                                            Self::control_options(),
+                                        )
+                                        .await;
+                                    }
+                                    tokio::time::sleep(Duration::from_secs(2)).await;
+                                }
+                            }),
+                        );
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        });
+    }
+
+    fn serve(&self) {
+        let node = self.clone();
+        tokio::spawn(async move {
+            // At most 63 member control links plus bounded enrollment/handshake work.
+            let permits = Arc::new(Semaphore::new(96));
+            while let Some(incoming) = node.endpoint.accept().await {
+                let Ok(permit) = permits.clone().try_acquire_owned() else {
+                    incoming.refuse();
+                    continue;
+                };
+                let node = node.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let Ok(Ok(connection)) =
+                        tokio::time::timeout(Duration::from_secs(10), incoming).await
+                    else {
+                        return;
+                    };
+                    let remote = connection.remote_id().to_string();
+                    if connection.alpn() == crate::protocol::CONTROL_ALPN {
+                        let Ok(hello) = node.control_hello(&remote).await else {
+                            connection.close(1u32.into(), b"membership required");
+                            return;
+                        };
+                        if let Ok(session) = crate::network::accept_peer_connection(
+                            connection,
+                            &hello,
+                            &node.control_peers,
+                        )
+                        .await
+                        {
+                            crate::network::maintain_peer_session(
+                                &session,
+                                &node.id(),
+                                &node.control_peers,
+                                Self::control_options(),
+                            )
+                            .await;
+                        }
+                        return;
+                    }
+                    let _ = tokio::time::timeout(Duration::from_secs(30), async move {
+                        let (mut send, mut recv) = connection.accept_bi().await?;
+                        let data = recv.read_to_end(MAX_WIRE).await?;
+                        let reply = match serde_json::from_slice::<Wire>(&data) {
+                            Ok(message) => node.dispatch(&remote, message).await,
+                            Err(error) => Err(error.into()),
+                        }
+                        .unwrap_or_else(|e| Reply {
+                            error: Some(e.to_string()),
+                            ..Reply::empty()
+                        });
+                        send.write_all(&serde_json::to_vec(&reply)?).await?;
+                        send.finish()?;
+                        let _ = send.stopped().await;
+                        connection.close(0u32.into(), b"complete");
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await;
+                });
+            }
+        });
+    }
+
+    async fn rpc(&self, peer: &Peer, wire: Wire) -> Result<Reply> {
+        tokio::time::timeout(Duration::from_secs(25), async {
+            let connection = self.endpoint.connect(peer.addr()?, ALPN).await?;
+            let result = async {
+                let (mut send, mut recv) = connection.open_bi().await?;
+                send.write_all(&serde_json::to_vec(&wire)?).await?;
+                send.finish()?;
+                let reply: Reply = serde_json::from_slice(&recv.read_to_end(MAX_WIRE).await?)?;
+                if let Some(error) = &reply.error {
+                    bail!("{error}");
+                }
+                Ok(reply)
+            }
+            .await;
+            connection.close(0u32.into(), b"complete");
+            result
+        })
+        .await
+        .context("Device unavailable. Check your Internet connection and keep both apps open.")?
+    }
+}
+
+fn write_private(path: &Path, bytes: &[u8], create_new: bool) -> Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true);
+    if create_new {
+        options.create_new(true);
+    } else {
+        options.create(true).truncate(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
