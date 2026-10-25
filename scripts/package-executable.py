@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -58,6 +59,31 @@ def main() -> None:
         for name in ['serve.mjs', 'validation.mjs']:
             shutil.copy2(Path('apps/web/scripts') / name, bundle / 'web/scripts' / name)
         (bundle / 'web/package.json').write_text('{"type":"module"}\n', encoding='utf-8')
+        # Preserve notices for dependencies compiled into the dashboard, including its fonts.
+        notices = bundle / 'third-party-licenses'
+        notices.mkdir()
+        packages = []
+        modules = Path('apps/web/node_modules')
+        for manifest in sorted(modules.rglob('package.json')):
+            parent = manifest.parent.parent
+            if parent.name != 'node_modules' and not (parent.name.startswith('@') and parent.parent.name == 'node_modules'):
+                continue
+            package = json.loads(manifest.read_text(encoding='utf-8'))
+            if not package.get('name') or not package.get('version'):
+                continue
+            label = re.sub(r'[^a-zA-Z0-9_.@+-]', '_', package['name'] + '@' + package['version'])
+            files = [f for f in manifest.parent.iterdir() if f.is_file() and f.name.lower().startswith(('license', 'licence', 'copying', 'notice'))]
+            if files:
+                destination = notices / label
+                destination.mkdir(exist_ok=True)
+                for file in files:
+                    shutil.copy2(file, destination / file.name)
+            packages.append({key: package.get(key) for key in ['name', 'version', 'license']})
+        (notices / 'packages.json').write_text(json.dumps(packages, indent=2) + '\n', encoding='utf-8')
+        for font in ['manrope', 'dm-sans']:
+            if not (modules / '@fontsource-variable' / font / 'LICENSE').is_file():
+                raise SystemExit(f'Missing bundled font license: {font}')
+
         (bundle / 'build.json').write_text(json.dumps({
             'revision': args.revision, 'target': args.target,
             'executables': {binary.name: digest(binary) for binary in binaries},

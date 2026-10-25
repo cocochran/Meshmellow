@@ -53,6 +53,8 @@ def main():
         for name, digest in build['executables'].items():
             assert hashlib.sha256((root / name).read_bytes()).hexdigest() == digest
         assert (root / 'runtime/Node-LICENSE.txt').stat().st_size > 1000
+        assert any((root / 'third-party-licenses').glob('*manrope*/LICENSE'))
+        assert any((root / 'third-party-licenses').glob('*dm-sans*/LICENSE'))
         with socket.socket() as listener:
             listener.bind(('127.0.0.1', 0))
             port = listener.getsockname()[1]
