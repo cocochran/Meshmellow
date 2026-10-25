@@ -226,6 +226,15 @@ pub async fn accept_peer(
     peers: &SharedPeerTable,
 ) -> anyhow::Result<PeerSession> {
     let connection = incoming.await.context("incoming connection failed")?;
+    accept_peer_connection(connection, local, peers).await
+}
+
+/// Like [`accept_peer`], for a connection already accepted on [`CONTROL_ALPN`].
+async fn accept_peer_connection(
+    connection: Connection,
+    local: &Hello,
+    peers: &SharedPeerTable,
+) -> anyhow::Result<PeerSession> {
     let (hello, token) =
         finish_handshake(&connection, acceptor_handshake(&connection, local, peers)).await?;
     Ok(PeerSession::start(connection, hello, token, peers))
@@ -288,7 +297,35 @@ async fn run_control_session(
     peers: &SharedPeerTable,
     options: ControlOptions,
 ) {
-    match accept_peer(incoming, local, peers).await {
+    let accepted = accept_peer(incoming, local, peers).await;
+    run_accepted_session(accepted, local, peers, options).await;
+}
+
+/// Like the sessions [`serve_control_with`] runs, for a connection that an accept loop serving
+/// several ALPNs has already accepted on [`CONTROL_ALPN`]: hello, heartbeats both ways and the
+/// heartbeat timeout as `options` set them, until the peer disconnects.
+pub async fn serve_control_connection(
+    connection: Connection,
+    local: &Hello,
+    peers: &SharedPeerTable,
+    options: ControlOptions,
+) {
+    let options = ControlOptions {
+        heartbeat_timeout: nonzero(options.heartbeat_timeout),
+        heartbeat_interval: nonzero(options.heartbeat_interval),
+    };
+    let accepted = accept_peer_connection(connection, local, peers).await;
+    run_accepted_session(accepted, local, peers, options).await;
+}
+
+/// Runs a handshaken control session until the peer disconnects, or logs why the hello failed.
+async fn run_accepted_session(
+    accepted: anyhow::Result<PeerSession>,
+    local: &Hello,
+    peers: &SharedPeerTable,
+    options: ControlOptions,
+) {
+    match accepted {
         Ok(session) => {
             let watchdog = HeartbeatWatchdog::new(options.heartbeat_timeout, Arming::AtStart);
             let sender = send_heartbeats(

@@ -10,6 +10,10 @@
 //!   `seed` are accepted and ignored; `max_tokens` / `max_completion_tokens` are honoured up to
 //!   the manifest's `max_tokens`.
 //!
+//! With an EXPERIMENTAL ring manifest each request instead starts the local stage 0 and a fresh
+//! shard-ring session ([`RingLink`]); [`FrontendConfig::ring`] must then carry the registry the
+//! leader's endpoint delivers result channels to.
+//!
 //! One generation runs at a time; later requests wait for the lock. A failure before any
 //! response bytes are sent is a JSON error with a 5xx status (400 for a prompt longer than
 //! the context). A failure mid-stream sends an SSE `error` event and ends without `[DONE]`,
@@ -47,6 +51,7 @@ use crate::shard::pipeline::{
     FinishReason, Generation, GenerationLimits, LocalLaunch, METADATA_TIMEOUT, Pipeline,
     PromptTooLong, StageExpectation, StageIdentity, StageLink,
 };
+use crate::shard::ring_origin::{RingLink, RingPlan, RingSettings};
 
 /// Liveness probe, as llama-server serves it.
 pub const HEALTH_PATH: &str = "/health";
@@ -74,6 +79,15 @@ pub struct FrontendConfig {
     pub manifest: ShardManifest,
     /// Iroh endpoint used to dial remote stages.
     pub endpoint: iroh::Endpoint,
+    /// Required for a ring manifest (`"execution": "ring"`) and ignored otherwise: the registry
+    /// the endpoint's accept loop delivers terminals' result channels to, and the readiness wait.
+    pub ring: Option<RingSettings>,
+}
+
+/// What a ring manifest's generations need besides the manifest.
+struct RingRuntime {
+    plan: RingPlan,
+    settings: RingSettings,
 }
 
 /// Serves `GET /health` and `POST /v1/chat/completions` on `config.listen` until `shutdown`
@@ -87,11 +101,13 @@ pub async fn serve_frontend(
 ) -> anyhow::Result<()> {
     ensure_loopback(config.listen)?;
     config.manifest.validate()?;
+    let ring = ring_runtime(&config.manifest, config.ring)?;
     verify_artifacts(&config.manifest).await?;
     let state = Arc::new(FrontendState {
         expectations: stage_expectations(&config.manifest),
         manifest: config.manifest,
         endpoint: config.endpoint,
+        ring,
         generation_lock: Arc::new(Mutex::new(())),
     });
     let router = Router::new()
@@ -117,8 +133,28 @@ struct FrontendState {
     manifest: ShardManifest,
     endpoint: iroh::Endpoint,
     expectations: Vec<StageExpectation>,
+    /// Set for a ring manifest only.
+    ring: Option<RingRuntime>,
     /// Held for the whole of a generation, so only one runs at a time.
     generation_lock: Arc<Mutex<()>>,
+}
+
+/// The ring runtime of a ring manifest, which needs `settings`; `None` for a pipeline manifest.
+fn ring_runtime(
+    manifest: &ShardManifest,
+    settings: Option<RingSettings>,
+) -> anyhow::Result<Option<RingRuntime>> {
+    if !manifest.is_ring() {
+        return Ok(None);
+    }
+    let settings = settings.context(
+        "a ring manifest (\"execution\": \"ring\") needs the leader's ring settings: \
+         FrontendConfig::ring must carry the result-channel registry its endpoint feeds",
+    )?;
+    Ok(Some(RingRuntime {
+        plan: RingPlan::from_manifest(manifest)?,
+        settings,
+    }))
 }
 
 fn ensure_loopback(listen: SocketAddr) -> anyhow::Result<()> {
@@ -444,15 +480,10 @@ async fn generate(
     max_tokens: u32,
     events: &UnboundedSender<Event>,
 ) -> anyhow::Result<Generation> {
-    let links = try_join_all(
-        state
-            .manifest
-            .stages
-            .iter()
-            .map(|stage| open_link(state, stage, prompt)),
-    )
-    .await?;
-    let pipeline = Pipeline::new(links, &state.expectations)?;
+    let pipeline = match &state.ring {
+        None => open_pipeline(state, prompt).await?,
+        Some(ring) => open_ring_pipeline(state, ring, prompt).await?,
+    };
     let context = state.manifest.context;
     // Checked before `Started` so an oversized prompt is still answered with a 400.
     pipeline.ensure_prompt_fits(context)?;
@@ -467,6 +498,38 @@ async fn generate(
             let _ = events.send(Event::Text(text.to_owned()));
         })
         .await
+}
+
+/// Opens every stage of a pipeline manifest at once and validates them.
+async fn open_pipeline(state: &FrontendState, prompt: &str) -> anyhow::Result<Pipeline> {
+    let links = try_join_all(
+        state
+            .manifest
+            .stages
+            .iter()
+            .map(|stage| open_link(state, stage, prompt)),
+    )
+    .await?;
+    Pipeline::new(links, &state.expectations)
+}
+
+/// Starts the local stage 0 and the ring session at once and validates them together.
+async fn open_ring_pipeline(
+    state: &FrontendState,
+    ring: &RingRuntime,
+    prompt: &str,
+) -> anyhow::Result<Pipeline> {
+    let (stage, expected) = state
+        .manifest
+        .stages
+        .first()
+        .zip(state.expectations.first())
+        .context("the ring manifest has no local stage")?;
+    let (local, link) = tokio::try_join!(
+        open_link(state, stage, prompt),
+        RingLink::open(&state.endpoint, &ring.plan, &ring.settings),
+    )?;
+    Pipeline::with_ring(local, link, expected)
 }
 
 async fn open_link(

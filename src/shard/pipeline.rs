@@ -11,6 +11,11 @@
 //! The pipeline handles any number of stages; only the manifest restricts v1 topologies. Each
 //! runner serves one sequence, so links are single-use: [`Pipeline::generate`] consumes them,
 //! and any error closes every link and fails the generation without retrying.
+//!
+//! In EXPERIMENTAL ring execution ([`Pipeline::with_ring`]) the pipeline is the local stage 0,
+//! which tokenizes, followed by a [`RingLink`] that stands for every remote stage: stage 0's
+//! hidden rows go to the ring's entry worker and each step's token comes back from the terminal.
+//! The same decoding loop, stop rules and UTF-8 assembly apply.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -28,6 +33,7 @@ use tracing::{debug, info, warn};
 use crate::protocol::RPC_BRIDGE_ALPN;
 use crate::rpc_bridge::path_kind;
 use crate::shard::manifest::same_sha256;
+use crate::shard::ring_origin::{RingLink, check_origin_stage};
 use crate::shard::wire::{self, MAX_BATCH_TOKENS, StageInput, StageMetadata, StepReply};
 
 /// Bound on waiting for a stage's metadata line; loading a large model can take minutes.
@@ -333,6 +339,8 @@ pub struct PromptTooLong {
 /// Validated stage links, ready for one generation.
 pub struct Pipeline {
     links: Vec<StageLink>,
+    /// In ring execution, the remote stages after `links`; the ring's terminal is final.
+    ring: Option<RingLink>,
     embd: u32,
     vocab: u32,
     prompt_tokens: Vec<u32>,
@@ -367,7 +375,36 @@ impl Pipeline {
             vocab: final_meta.vocab,
             prompt_tokens: final_meta.tokens.clone(),
             links,
+            ring: None,
             embd,
+            step_timeout: STEP_TIMEOUT,
+        })
+    }
+
+    /// Ring execution: the local stage 0 (checked against `expected`, and required not to be
+    /// final) followed by `ring`, whose chain must continue stage 0 ([`check_origin_stage`]).
+    /// Stage 0 tokenizes, so the prompt tokens come from its metadata.
+    pub fn with_ring(
+        local: StageLink,
+        ring: RingLink,
+        expected: &StageExpectation,
+    ) -> anyhow::Result<Self> {
+        let meta = &local.metadata;
+        ensure!(meta.embd > 0, "{} reports a zero hidden size", local.label);
+        check_metadata(&local, expected, meta.embd, false)?;
+        check_origin_stage(meta, ring.stages())
+            .with_context(|| format!("{} does not continue into the ring", local.label))?;
+        ensure!(
+            !meta.tokens.is_empty(),
+            "{} reported no prompt tokens",
+            local.label
+        );
+        Ok(Self {
+            vocab: meta.vocab,
+            prompt_tokens: meta.tokens.clone(),
+            embd: meta.embd,
+            links: vec![local],
+            ring: Some(ring),
             step_timeout: STEP_TIMEOUT,
         })
     }
@@ -405,6 +442,9 @@ impl Pipeline {
     ) -> anyhow::Result<Generation> {
         let result = self.run(limits, on_text).await;
         let kill = result.is_err();
+        if let Some(ring) = self.ring {
+            ring.close(!kill).await;
+        }
         for link in self.links {
             link.close(kill).await;
         }
@@ -457,14 +497,17 @@ impl Pipeline {
         last.context("the prompt has no tokens")
     }
 
-    /// Sends one batch of tokens through every stage and returns the final stage's reply.
+    /// Sends one batch of tokens through every stage (and the ring, if any) and returns the
+    /// final stage's reply.
     async fn step(&mut self, decoder: &mut Decoder, tokens: &[u32]) -> anyhow::Result<StepReply> {
         let started = Instant::now();
         let (step, position) = (decoder.step, decoder.position);
         let count = tokens.len();
         let row_values = count * self.embd as usize;
-        let stage_count = self.links.len();
-        let last = stage_count - 1;
+        let ring_stages = self.ring.as_ref().map_or(0, |ring| ring.stages().len());
+        let stage_count = self.links.len() + ring_stages;
+        // With a ring, the terminal is final and every local link forwards its rows.
+        let final_link = self.ring.is_none().then(|| self.links.len() - 1);
         let mut rows = Vec::new();
         for (index, link) in self.links.iter_mut().enumerate() {
             let input = if index == 0 {
@@ -475,11 +518,12 @@ impl Pipeline {
                     embd: self.embd,
                 }
             };
-            let max_floats = if index == last { 0 } else { row_values };
+            let is_final = final_link == Some(index);
+            let max_floats = if is_final { 0 } else { row_values };
             let output = link
                 .exchange(step, position, &input, max_floats, self.step_timeout)
                 .await?;
-            if index == last {
+            if is_final {
                 decoder.advance(count);
                 debug!(
                     step,
@@ -500,7 +544,21 @@ impl Pipeline {
             );
             rows = output.floats;
         }
-        bail!("the pipeline has no final stage")
+        let ring = self
+            .ring
+            .as_mut()
+            .context("the pipeline has no final stage")?;
+        let reply = ring.exchange(step, position, count, &rows).await?;
+        decoder.advance(count);
+        debug!(
+            step,
+            position,
+            token_count = count,
+            stage_count,
+            total_us = started.elapsed().as_micros(),
+            "shard pipeline step"
+        );
+        Ok(reply)
     }
 
     /// The final stage's greedy token, checked to be inside the vocabulary.

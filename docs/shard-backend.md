@@ -114,17 +114,150 @@ Unknown fields are refused everywhere, so a typo cannot silently drop a setting.
 ## v1 limits
 
 - Topology: one remote prefix plus a local final stage, or a single local stage that runs the
-  whole model. Chained remote stages and a remote final stage need ring forwarding over
-  david-codex's `meshthing/shard-ring/1` (M-27). Hidden states never take an extra hop through
-  the leader ("hub forwarding"); that design was rejected.
+  whole model. Chained remote stages and a remote final stage need ring forwarding: see
+  [Experimental: ring execution](#experimental-ring-execution-shard-ring1) below. Hidden states
+  never take an extra hop through the leader ("hub forwarding"); that design was rejected.
 - Greedy decoding only. `temperature`, `top_p`, `seed` and similar fields are accepted and
   ignored.
-- `chatml` is the only chat template. The pinned official Qwen template is future work (M-27).
+- `chatml` is the only chat template so far. The pinned official Qwen template is still open;
+  it is being added later in the same M-27 run.
 - One sequence per runner process and no reset, so every job starts fresh runner processes
   (and a fresh Iroh connection to the worker). Model load time is paid on every job.
 - One generation runs at a time, matching the job queue.
 
+## Experimental: ring execution (shard-ring/1)
+
+Ring execution runs chained remote stages and a remote final stage without sending hidden
+states back through the leader. It is opt-in (`"execution": "ring"` in the manifest) and
+EXPERIMENTAL: it is pending david-codex's production sign-off. Manifests without `execution`,
+or with `"execution": "pipeline"`, behave exactly as described above.
+
+### Wire compatibility
+
+The leader and `llm-cluster shard-ring-worker` speak `meshthing/shard-ring/1` byte for byte as
+david-codex's diagnostic `experiments/mobile-probe/iroh-core/src/ring.rs` does (see
+[QWEN38_RING.md](../experiments/model-validation/QWEN38_RING.md)): the same ALPN, one bounded
+JSON line per control message (at most 65,536 bytes), raw little-endian `f32` payloads of at
+most 16 MiB, a 32-hex job id consumed once, strict step and position order, batches of 1 to
+128 rows, and the same chain checks (contiguous ranges; the same layers, hidden size,
+vocabulary and 64-hex `source_sha256` throughout). Our leader and workers are designed to mix
+with his gateway and `mesh-ring worker` in one ring; that mix has not been run yet.
+
+### Topology
+
+- The leader is the ring's origin. It renders the prompt, runs stage 0 (`0..k`) in a local
+  runner that tokenizes it, and sends stage 0's hidden rows to the entry worker.
+- Each worker runs its own range in a fresh runner per session and forwards its rows straight
+  to the next worker. Only small progress lines travel back toward the leader, hop by hop.
+- The terminal worker (the one owning the last layer) opens a result channel straight back to
+  the leader and returns each step's token and text piece on it.
+- The leader never receives activations. Every byte it reads from ring streams is counted, and
+  the tests check that all of it was JSON control lines.
+
+For each generation the leader registers a fresh job id for the manifest's terminal, starts
+the session at the entry, checks the `ready` chain against the manifest (ranges and workers
+in order, `source_sha256` equal to `model_sha256`, and layers, hidden size and vocabulary
+matching stage 0), and waits for the terminal's result channel. Its endpoint also accepts the
+ring ALPN: result channels are accepted only from the manifest's terminal and only for a
+pending job, and any other peer is closed with code 3 ("peer not approved").
+
+### Worker commands
+
+Each hop names its neighbours by node ID: `--upstream` is the only peer allowed to start
+sessions, `--origin` is the leader, and `--next` is the following worker. A worker without
+`--next` is the terminal. Print the leader's node ID first with
+`llm-cluster --key leader.key listen`.
+
+Entry worker (layers `16..40`, upstream is the leader):
+
+```sh
+llm-cluster --key entry.key shard-ring-worker \
+  --runner /path/to/mesh-shard-runner --model /path/to/shard-16-40.gguf \
+  --range 16:40 --context 512 --gpu-layers 99 --budget-bytes 11811160064 \
+  --expected-sha256 <sha256 of the --model file> \
+  --source-sha256 <sha256 of the original full model> \
+  --upstream <leader node id> --origin <leader node id> --next <terminal node id>
+```
+
+Terminal worker (layers `40..64`, upstream is the entry worker, no `--next`):
+
+```sh
+llm-cluster --key terminal.key shard-ring-worker \
+  --runner /path/to/mesh-shard-runner --model /path/to/shard-40-64.gguf \
+  --range 40:64 --context 512 --gpu-layers 99 --budget-bytes 11811160064 \
+  --expected-sha256 <sha256 of the --model file> \
+  --source-sha256 <sha256 of the original full model> \
+  --upstream <entry node id> --origin <leader node id>
+```
+
+A middle worker takes `--upstream <previous worker>` and `--next <following worker>`. Every
+ring worker must load an exported shard whose runner reports the 64-hex `source_sha256`, as in
+ring.rs. Then start the leader as usual:
+`llm-cluster --key leader.key leader --backend shard --shard-manifest ring.json --worker-wait 5m`.
+
+### Manifest
+
+```json
+{
+  "runner": "/path/to/mesh-shard-runner",
+  "model_sha256": "<sha256 of the original full model>",
+  "layers": 64,
+  "context": 512,
+  "max_tokens": 64,
+  "chat_template": "chatml",
+  "execution": "ring",
+  "stages": [
+    {"begin": 0, "end": 16, "local": {
+      "model": "/path/to/shard-0-16.gguf", "gpu_layers": 99, "budget_bytes": 11811160064
+    }},
+    {"begin": 16, "end": 40, "remote": {"worker": "<entry node id>"}},
+    {"begin": 40, "end": 64, "remote": {"worker": "<terminal node id>"}}
+  ]
+}
+```
+
+Ring rules: `stages[0]` is local, begins at layer 0 and ends before the last layer (it
+tokenizes and runs the first layers); every later stage is remote, there is at least one,
+they are contiguous up to `layers`, and no worker appears twice. The last remote stage is the
+terminal. All the other manifest rules (hashes, context, `max_tokens`, `chat_template`,
+unknown fields) apply unchanged.
+
+### Diagnostics
+
+With the global `--debug` flag (or `RUST_LOG=llm_cluster::shard=debug`) the leader logs the
+origin side of each ring session, following the conventions in
+[runtime-diagnostics.md](runtime-diagnostics.md): `ring session ready` (the entry's and the
+terminal's selected Iroh path, and `ready_us` from the start to the result channel), then for
+every step `ring activations sent` (`input_bytes`, `write_us`) and `shard ring exchange`
+(`input_bytes`, `output_bytes`, `write_us`, `read_us` until the terminal's result arrived,
+`total_us`), plus the whole-step `shard pipeline step`. Each worker's relayed progress lines
+are logged as `ring progress`. A timeout error says whether sending the activations or waiting
+for the result ran out of the step deadline. At `info`, `ring session closed` reports the
+session's step count, activation bytes sent and bytes read (with `activation_bytes_read`,
+always 0). `read_us` includes every worker's compute time, so it is not a network latency.
+
+### Limits
+
+- Fixed order: the manifest's ranges and workers must match the running ring exactly. There is
+  no automatic placement yet.
+- One job per worker: a worker runs one session at a time and drops a concurrent one, and the
+  leader runs one generation at a time.
+- No retries, rerouting or re-prefill: any error (a bad chain, a missing result channel, a
+  worker failure) fails the job. A ring must become ready, including the terminal's result
+  channel, within 300 s by default (`RingSettings::result_channel_wait`).
+- `chatml` only. The pinned official Qwen template remains open; it is being added later in
+  the same M-27 run.
+- The manual multi-device run of ring execution through `llm-cluster prompt` is still pending
+  on hardware. It has only been tested on loopback with the fake runner.
+
 ## Tests
+
+`tests/shard_ring.rs` runs the job API end to end on a three-stage ring: the leader's local
+stage `0..1`, then two real `serve_ring_worker`s (entry `1..3`, terminal `3..4`) on the
+`fake_shard_runner` example. It checks buffered and streamed prompts, that no activation byte
+reached the leader, a `ready` chain that does not match the manifest, workers in the wrong
+order, a result channel from a peer that is not the terminal (and a replayed job), and a
+terminal that never opens its result channel, which fails within the bounded wait.
 
 `tests/shard_backend.rs` runs the job API end to end on the shard backend: a real
 `shard-serve` worker drives the `fake_shard_runner` example as the prefix, and the leader runs
@@ -135,6 +268,7 @@ first:
 ```sh
 cargo build --examples
 cargo test --test shard_backend
+cargo test --test shard_ring
 ```
 
 ## Reproducing the two-Mac 32B run through `llm-cluster prompt`

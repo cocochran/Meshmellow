@@ -19,6 +19,7 @@ use llm_cluster::network::{self, SharedPeerTable};
 use llm_cluster::node::PeerTable;
 use llm_cluster::protocol::{CONTROL_ALPN, RPC_BRIDGE_ALPN};
 use llm_cluster::shard::ring::{RING_ALPN, RingWorkerConfig, serve_ring_worker};
+use llm_cluster::shard::ring_origin::RingSettings;
 use llm_cluster::shard::serve::{ShardServeConfig, serve_shard};
 use llm_cluster::worker::{self, WorkerConfig};
 use llm_cluster::{api, rpc_bridge};
@@ -380,6 +381,7 @@ impl LeaderArgs {
                 manifest_path: self
                     .shard_manifest
                     .context("--shard-manifest is required with --backend shard")?,
+                ring: RingSettings::default(),
             }),
         };
         Ok(LeaderConfig {

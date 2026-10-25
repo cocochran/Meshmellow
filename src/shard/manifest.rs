@@ -22,8 +22,13 @@
 //!
 //! [`ShardManifest::validate`] enforces the structural rules (contiguous coverage of
 //! `0..layers`, bounds on `context` and `max_tokens`, well-formed hashes, no duplicate worker)
-//! and the v1 topology: a single local whole-model stage, or one remote prefix followed by a
-//! local final stage. Chained and remote-final stages need ring forwarding (M-27).
+//! and the topology of the manifest's [`Execution`] mode:
+//!
+//! - `"execution": "pipeline"` (the default, M-25 v1): a single local whole-model stage, or one
+//!   remote prefix followed by a local final stage.
+//! - `"execution": "ring"` (EXPERIMENTAL, `meshthing/shard-ring/1`): a local stage `0..k` that
+//!   tokenizes, then one or more remote ring workers covering `k..layers` in order. The last
+//!   remote stage is the terminal, which returns tokens straight to the leader.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
@@ -49,8 +54,9 @@ const SHA256_HEX_LEN: usize = 64;
 /// Bytes read per chunk while hashing a model file.
 const HASH_CHUNK_BYTES: usize = 1 << 20;
 
-/// Ticket for chained and remote-final stages, named in the v1 topology errors.
-const RING_FORWARDING_TICKET: &str = "M-27";
+/// Where pipeline-mode topology errors point: the experimental ring execution mode (M-27).
+const RING_ALTERNATIVE: &str =
+    "set \"execution\": \"ring\" for experimental ring forwarding (M-27)";
 
 /// A sharded model: the runner binary, the model's identity, and its stages in layer order.
 #[derive(Clone, Debug, Deserialize)]
@@ -71,17 +77,34 @@ pub struct ShardManifest {
     /// Prompt template the front end renders chat messages with. Required: a wrong template
     /// silently degrades output, so it is never assumed.
     pub chat_template: ChatTemplate,
+    /// How the stages are driven; `pipeline` when absent.
+    #[serde(default)]
+    pub execution: Execution,
     /// Stages in layer order, covering `0..layers` without gaps or overlap.
     pub stages: Vec<StageSpec>,
 }
 
-/// How chat messages become the prompt string the final stage tokenizes.
+/// How the leader drives a manifest's stages.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Execution {
+    /// M-25 v1: the leader exchanges hidden rows with every stage in turn.
+    #[default]
+    Pipeline,
+    /// EXPERIMENTAL `meshthing/shard-ring/1`: the leader runs stage 0 and sends its rows to the
+    /// first ring worker; workers forward activations peer to peer and the terminal returns
+    /// tokens straight to the leader. Pending david-codex's production sign-off.
+    Ring,
+}
+
+/// How chat messages become the prompt string the tokenizing stage (the final stage, or stage 0
+/// in a ring) tokenizes. New templates are added as new variants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChatTemplate {
     /// `<|im_start|>{role}\n{content}<|im_end|>\n` per message, then
-    /// `<|im_start|>assistant\n`. The only v1 template; the pinned official Qwen template
-    /// is future work (M-27).
+    /// `<|im_start|>assistant\n`. The only template so far; the pinned official Qwen template
+    /// is still open and is being added later in the same M-27 run.
     Chatml,
 }
 
@@ -96,8 +119,8 @@ pub struct StageSpec {
     pub location: StageLocation,
 }
 
-/// Where a stage runs. Open for more roles (for example a ring next-hop in M-27), so match it
-/// with a wildcard arm outside this crate.
+/// Where a stage runs. Open for more roles, so match it with a wildcard arm outside this crate.
+/// In a ring manifest every `Remote` stage is a `shard-ring-worker`, not a `shard-serve` relay.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum StageLocation {
@@ -215,12 +238,20 @@ impl ShardManifest {
         Ok(manifest)
     }
 
-    /// Checks the structural rules and the v1 topology; see the module docs.
+    /// Checks the structural rules and the topology of the execution mode; see the module docs.
     pub fn validate(&self) -> anyhow::Result<()> {
         self.validate_limits()?;
         self.validate_coverage()?;
         self.validate_stages()?;
-        self.validate_v1_topology()
+        match self.execution {
+            Execution::Pipeline => self.validate_v1_topology(),
+            Execution::Ring => self.validate_ring_topology(),
+        }
+    }
+
+    /// Whether the manifest opts into ring execution.
+    pub fn is_ring(&self) -> bool {
+        self.execution == Execution::Ring
     }
 
     /// Remote workers in stage order.
@@ -305,18 +336,49 @@ impl ShardManifest {
         ensure!(
             ends_local,
             "the final stage must be local in v1 (it tokenizes and samples); \
-             remote final stages need ring forwarding ({RING_FORWARDING_TICKET})"
+             for a remote final stage, {RING_ALTERNATIVE}"
         );
         ensure!(
             remote <= 1,
             "v1 allows at most one remote stage, found {remote}; \
-             chained remote stages need ring forwarding ({RING_FORWARDING_TICKET})"
+             for chained remote stages, {RING_ALTERNATIVE}"
         );
         ensure!(
             local <= 1,
             "v1 runs only the final stage locally, found {local} local stages; \
-             other topologies need ring forwarding ({RING_FORWARDING_TICKET})"
+             for other topologies, {RING_ALTERNATIVE}"
         );
+        Ok(())
+    }
+
+    /// Ring execution: a local stage 0 that does not reach the last layer, then only remote
+    /// stages (at least one) up to `layers`. Coverage and duplicate workers are checked before.
+    fn validate_ring_topology(&self) -> anyhow::Result<()> {
+        let (first, rest) = self
+            .stages
+            .split_first()
+            .context("the manifest has no stages")?;
+        ensure!(
+            first.is_local() && first.begin == 0,
+            "ring execution needs a local stage 0 starting at layer 0 (it tokenizes and runs \
+             the first layers), but stage {}..{} is remote",
+            first.begin,
+            first.end
+        );
+        ensure!(
+            first.end < self.layers && !rest.is_empty(),
+            "ring execution needs at least one remote stage after the local stage {}..{}",
+            first.begin,
+            first.end
+        );
+        if let Some(local) = rest.iter().find(|stage| stage.is_local()) {
+            bail!(
+                "ring execution runs only stage 0 locally, but stage {}..{} is local too; \
+                 every later stage must be a remote ring worker",
+                local.begin,
+                local.end
+            );
+        }
         Ok(())
     }
 }
@@ -523,7 +585,7 @@ mod tests {
     fn v1_requires_a_local_final_stage() {
         let error = error_of(manifest_json(vec![local(0, 2), remote(2, 4, 1)]));
         assert!(error.contains("final stage must be local"), "{error}");
-        assert!(error.contains(RING_FORWARDING_TICKET), "{error}");
+        assert!(error.contains("\"execution\": \"ring\""), "{error}");
     }
 
     #[test]
@@ -531,14 +593,107 @@ mod tests {
         let value = manifest_json(vec![remote(0, 1, 1), remote(1, 2, 2), local(2, 4)]);
         let error = error_of(value);
         assert!(error.contains("at most one remote"), "{error}");
-        assert!(error.contains(RING_FORWARDING_TICKET), "{error}");
+        assert!(error.contains("\"execution\": \"ring\""), "{error}");
     }
 
     #[test]
     fn v1_runs_only_the_final_stage_locally() {
         let error = error_of(manifest_json(vec![local(0, 2), local(2, 4)]));
         assert!(error.contains("only the final stage locally"), "{error}");
-        assert!(error.contains(RING_FORWARDING_TICKET), "{error}");
+        assert!(error.contains("\"execution\": \"ring\""), "{error}");
+    }
+
+    fn ring_json(stages: Vec<Value>) -> Value {
+        let mut value = manifest_json(stages);
+        value["execution"] = json!("ring");
+        value
+    }
+
+    #[test]
+    fn execution_defaults_to_pipeline_and_rejects_unknown_modes() {
+        let manifest = validate(manifest_json(vec![local(0, 4)])).unwrap();
+        assert_eq!(manifest.execution, Execution::Pipeline);
+        assert!(!manifest.is_ring());
+        let mut explicit = manifest_json(vec![remote(0, 2, 1), local(2, 4)]);
+        explicit["execution"] = json!("pipeline");
+        assert_eq!(validate(explicit).unwrap().execution, Execution::Pipeline);
+        let mut unknown = manifest_json(vec![local(0, 4)]);
+        unknown["execution"] = json!("p2p_ring");
+        assert!(parse(unknown).is_err());
+    }
+
+    #[test]
+    fn pipeline_rules_are_unchanged_by_the_ring_mode() {
+        // Shapes only a ring accepts stay refused without the opt-in.
+        let chained = manifest_json(vec![local(0, 1), remote(1, 3, 1), remote(3, 4, 2)]);
+        assert!(error_of(chained).contains("final stage must be local"));
+        let remote_final = manifest_json(vec![local(0, 2), remote(2, 4, 1)]);
+        assert!(validate(remote_final).is_err());
+    }
+
+    #[test]
+    fn ring_with_local_stage_0_and_remote_workers_is_valid() {
+        let manifest = validate(ring_json(vec![
+            local(0, 1),
+            remote(1, 3, 1),
+            remote(3, 4, 2),
+        ]))
+        .unwrap();
+        assert!(manifest.is_ring());
+        let workers: Vec<String> = manifest
+            .remote_workers()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(workers, [worker_id(1), worker_id(2)]);
+        // A single remote worker is both the entry and the terminal.
+        assert!(validate(ring_json(vec![local(0, 2), remote(2, 4, 1)])).is_ok());
+    }
+
+    #[test]
+    fn ring_stage_0_must_be_local() {
+        let error = error_of(ring_json(vec![remote(0, 1, 1), remote(1, 4, 2)]));
+        assert!(error.contains("local stage 0"), "{error}");
+    }
+
+    #[test]
+    fn ring_needs_a_remote_stage() {
+        let error = error_of(ring_json(vec![local(0, 4)]));
+        assert!(error.contains("at least one remote stage"), "{error}");
+    }
+
+    #[test]
+    fn ring_runs_only_stage_0_locally() {
+        let middle = ring_json(vec![local(0, 1), local(1, 3), remote(3, 4, 1)]);
+        assert!(error_of(middle).contains("only stage 0 locally"));
+        let last = ring_json(vec![local(0, 1), remote(1, 3, 1), local(3, 4)]);
+        assert!(error_of(last).contains("only stage 0 locally"));
+    }
+
+    #[test]
+    fn ring_workers_must_be_distinct_and_contiguous() {
+        let duplicate = ring_json(vec![local(0, 1), remote(1, 3, 7), remote(3, 4, 7)]);
+        assert!(error_of(duplicate).contains("more than one stage"));
+        let gap = ring_json(vec![local(0, 1), remote(2, 4, 1)]);
+        assert!(error_of(gap).contains("begin at layer 1"));
+        let short = ring_json(vec![local(0, 1), remote(1, 3, 1)]);
+        assert!(error_of(short).contains("4 layers"));
+    }
+
+    #[test]
+    fn ring_keeps_the_common_rules() {
+        let mut bad_hash = ring_json(vec![local(0, 1), remote(1, 4, 1)]);
+        bad_hash["model_sha256"] = json!("abc");
+        assert!(error_of(bad_hash).contains("model_sha256"));
+        let mut context = ring_json(vec![local(0, 1), remote(1, 4, 1)]);
+        context["context"] = json!(MIN_CONTEXT - 1);
+        assert!(error_of(context).contains("context"));
+        let mut template = ring_json(vec![local(0, 1), remote(1, 4, 1)]);
+        template.as_object_mut().unwrap().remove("chat_template");
+        assert!(parse(template).is_err());
+        let mut budget = local(0, 1);
+        budget["local"]["budget_bytes"] = json!(0);
+        assert!(error_of(ring_json(vec![budget, remote(1, 4, 1)])).contains("budget_bytes"));
     }
 
     #[test]
