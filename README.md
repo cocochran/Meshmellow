@@ -47,6 +47,8 @@ Because history is synced after each task, at most the in-progress task is lost 
  
 Early development.
 
+The leader can also run jobs on david-codex's shard runner (`leader --backend shard`); see [shard backend](docs/shard-backend.md).
+
 ## Browser client
 
 When the leader is running, open `http://127.0.0.1:8080` for the built-in chat
