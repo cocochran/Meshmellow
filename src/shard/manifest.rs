@@ -11,7 +11,8 @@
 //!   "max_tokens": 512,
 //!   "chat_template": "chatml",
 //!   "stages": [
-//!     {"begin": 0, "end": 32, "remote": {"worker": "<iroh endpoint id>"}},
+//!     {"begin": 0, "end": 32, "remote": {"worker": "<iroh endpoint id>"},
+//!      "fallbacks": [{"remote": {"worker": "<another endpoint id>"}}]},
 //!     {"begin": 32, "end": 64, "local": {"model": "/models/qwen-32-64.gguf", "budget_bytes": 1073741824}}
 //!   ]
 //! }
@@ -20,10 +21,18 @@
 //! Each stage object carries `begin`, `end` and exactly one location key (`remote` or `local`).
 //! Unknown fields are refused everywhere, so a typo cannot silently drop a setting.
 //!
+//! A stage before the final one may list `fallbacks`: other locations that serve the same layer
+//! range, each written like a stage's location (exactly one of `remote` or `local`). When the
+//! stage's node is unreachable or fails mid-generation, the front end restarts the generation on
+//! the next fallback (see [`crate::shard::frontend`]). A remote fallback is another worker
+//! running `shard-serve` on the same range; a local one runs the range on the leader too.
+//!
 //! [`ShardManifest::validate`] enforces the structural rules (contiguous coverage of
 //! `0..layers`, bounds on `context` and `max_tokens`, well-formed hashes, no duplicate worker)
 //! and the v1 topology: a single local whole-model stage, or one remote prefix followed by a
-//! local final stage. Chained and remote-final stages need ring forwarding (M-27).
+//! local final stage. Chained and remote-final stages need ring forwarding (M-27). The topology
+//! rules apply to each stage's primary location; the final stage, which runs on the leader,
+//! takes no fallbacks.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
@@ -94,6 +103,8 @@ pub struct StageSpec {
     pub end: u32,
     /// Where the stage runs.
     pub location: StageLocation,
+    /// Other locations serving the same range, tried in order when `location` fails.
+    pub fallbacks: Vec<StageLocation>,
 }
 
 /// Where a stage runs. Open for more roles (for example a ring next-hop in M-27), so match it
@@ -135,6 +146,18 @@ struct RawStageSpec {
     remote: Option<RawRemote>,
     #[serde(default)]
     local: Option<RawLocal>,
+    #[serde(default)]
+    fallbacks: Vec<RawLocation>,
+}
+
+/// The JSON form of a fallback: exactly one location key.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLocation {
+    #[serde(default)]
+    remote: Option<RawRemote>,
+    #[serde(default)]
+    local: Option<RawLocal>,
 }
 
 #[derive(Deserialize)]
@@ -159,27 +182,46 @@ struct RawLocal {
 impl<'de> Deserialize<'de> for StageSpec {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = RawStageSpec::deserialize(deserializer)?;
-        let location = match (raw.remote, raw.local) {
-            (Some(RawRemote { worker }), None) => StageLocation::Remote { worker },
-            (None, Some(local)) => StageLocation::Local {
-                model: local.model,
-                gpu_layers: local.gpu_layers,
-                budget_bytes: local.budget_bytes,
-                artifact_sha256: local.artifact_sha256,
-                env: local.env,
-            },
-            _ => {
-                return Err(serde::de::Error::custom(format!(
-                    "stage {}..{} needs exactly one of \"remote\" or \"local\"",
-                    raw.begin, raw.end
-                )));
-            }
-        };
+        let (begin, end) = (raw.begin, raw.end);
+        let location = location_from(raw.remote, raw.local).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "stage {begin}..{end} needs exactly one of \"remote\" or \"local\""
+            ))
+        })?;
+        let fallbacks = raw
+            .fallbacks
+            .into_iter()
+            .enumerate()
+            .map(|(index, fallback)| {
+                location_from(fallback.remote, fallback.local).ok_or_else(|| {
+                    serde::de::Error::custom(format!(
+                        "fallback {index} of stage {begin}..{end} needs exactly one of \
+                         \"remote\" or \"local\""
+                    ))
+                })
+            })
+            .collect::<Result<_, _>>()?;
         Ok(Self {
-            begin: raw.begin,
-            end: raw.end,
+            begin,
+            end,
             location,
+            fallbacks,
         })
+    }
+}
+
+/// The location named by exactly one of `remote` or `local`; `None` for both or neither.
+fn location_from(remote: Option<RawRemote>, local: Option<RawLocal>) -> Option<StageLocation> {
+    match (remote, local) {
+        (Some(RawRemote { worker }), None) => Some(StageLocation::Remote { worker }),
+        (None, Some(local)) => Some(StageLocation::Local {
+            model: local.model,
+            gpu_layers: local.gpu_layers,
+            budget_bytes: local.budget_bytes,
+            artifact_sha256: local.artifact_sha256,
+            env: local.env,
+        }),
+        _ => None,
     }
 }
 
@@ -199,6 +241,11 @@ impl StageSpec {
             StageLocation::Remote { worker } => Some(worker),
             _ => None,
         }
+    }
+
+    /// Every location that can serve this stage: the primary, then each fallback in order.
+    pub fn candidates(&self) -> impl Iterator<Item = &StageLocation> {
+        std::iter::once(&self.location).chain(&self.fallbacks)
     }
 }
 
@@ -271,25 +318,27 @@ impl ShardManifest {
     fn validate_stages(&self) -> anyhow::Result<()> {
         let mut workers = HashSet::new();
         for stage in &self.stages {
-            match &stage.location {
-                StageLocation::Remote { worker } => ensure!(
-                    workers.insert(*worker),
-                    "worker {} serves more than one stage",
-                    worker.fmt_short()
-                ),
-                StageLocation::Local {
-                    budget_bytes,
-                    artifact_sha256,
-                    ..
-                } => {
-                    ensure!(
-                        *budget_bytes > 0,
-                        "local stage {}..{} needs a positive budget_bytes",
-                        stage.begin,
-                        stage.end
-                    );
-                    if let Some(hash) = artifact_sha256 {
-                        check_sha256(hash, "artifact_sha256")?;
+            for location in stage.candidates() {
+                match location {
+                    StageLocation::Remote { worker } => ensure!(
+                        workers.insert(*worker),
+                        "worker {} serves more than one stage or is listed twice",
+                        worker.fmt_short()
+                    ),
+                    StageLocation::Local {
+                        budget_bytes,
+                        artifact_sha256,
+                        ..
+                    } => {
+                        ensure!(
+                            *budget_bytes > 0,
+                            "local stage {}..{} needs a positive budget_bytes",
+                            stage.begin,
+                            stage.end
+                        );
+                        if let Some(hash) = artifact_sha256 {
+                            check_sha256(hash, "artifact_sha256")?;
+                        }
                     }
                 }
             }
@@ -316,6 +365,13 @@ impl ShardManifest {
             local <= 1,
             "v1 runs only the final stage locally, found {local} local stages; \
              other topologies need ring forwarding ({RING_FORWARDING_TICKET})"
+        );
+        ensure!(
+            self.stages
+                .last()
+                .is_some_and(|stage| stage.fallbacks.is_empty()),
+            "the final stage cannot have fallbacks: it runs on the leader, which tokenizes \
+             and samples"
         );
         Ok(())
     }
@@ -360,10 +416,12 @@ mod tests {
 
     const HASH: &str = "5ca1ab1e5ca1ab1e5ca1ab1e5ca1ab1e5ca1ab1e5ca1ab1e5ca1ab1e5ca1ab1e";
 
+    fn worker(seed: u8) -> EndpointId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
     fn worker_id(seed: u8) -> String {
-        iroh::SecretKey::from_bytes(&[seed; 32])
-            .public()
-            .to_string()
+        worker(seed).to_string()
     }
 
     fn local(begin: u32, end: u32) -> Value {
@@ -517,6 +575,61 @@ mod tests {
         // Duplicates are checked before the v1 topology rules, so this is reported first.
         let value = manifest_json(vec![remote(0, 1, 7), remote(1, 2, 7), local(2, 4)]);
         assert!(error_of(value).contains("more than one stage"));
+    }
+
+    #[test]
+    fn prefix_fallbacks_are_parsed_in_order() {
+        let mut prefix = remote(0, 2, 1);
+        prefix["fallbacks"] = json!([
+            {"remote": {"worker": worker_id(2)}},
+            {"local": {"model": "prefix.gguf", "budget_bytes": 1024}},
+        ]);
+        let manifest = validate(manifest_json(vec![prefix, local(2, 4)])).unwrap();
+        let candidates: Vec<_> = manifest.stages[0].candidates().collect();
+        assert_eq!(candidates.len(), 3);
+        assert_eq!(manifest.stages[0].remote_worker(), Some(worker(1)));
+        assert_eq!(candidates[1], &StageLocation::Remote { worker: worker(2) });
+        assert!(matches!(candidates[2], StageLocation::Local { .. }));
+        assert_eq!(manifest.stages[1].candidates().count(), 1);
+    }
+
+    #[test]
+    fn fallbacks_need_exactly_one_location_and_known_fields() {
+        let mut both = remote(0, 2, 1);
+        both["fallbacks"] = json!([{
+            "remote": {"worker": worker_id(2)},
+            "local": {"model": "prefix.gguf", "budget_bytes": 1024},
+        }]);
+        let error = parse(manifest_json(vec![both, local(2, 4)]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("fallback 0 of stage 0..2"), "{error}");
+        let mut unknown = remote(0, 2, 1);
+        unknown["fallbacks"] = json!([{"remote": {"worker": worker_id(2)}, "weight": 1}]);
+        assert!(parse(manifest_json(vec![unknown, local(2, 4)])).is_err());
+    }
+
+    #[test]
+    fn fallbacks_are_checked_like_primary_locations() {
+        let mut repeated = remote(0, 2, 1);
+        repeated["fallbacks"] = json!([{"remote": {"worker": worker_id(1)}}]);
+        let error = error_of(manifest_json(vec![repeated, local(2, 4)]));
+        assert!(error.contains("listed twice"), "{error}");
+        let mut no_budget = remote(0, 2, 1);
+        no_budget["fallbacks"] = json!([{"local": {"model": "prefix.gguf", "budget_bytes": 0}}]);
+        let error = error_of(manifest_json(vec![no_budget, local(2, 4)]));
+        assert!(error.contains("budget_bytes"), "{error}");
+    }
+
+    #[test]
+    fn the_final_stage_takes_no_fallbacks() {
+        let mut last = local(2, 4);
+        last["fallbacks"] = json!([{"local": {"model": "other.gguf", "budget_bytes": 1024}}]);
+        let error = error_of(manifest_json(vec![remote(0, 2, 1), last]));
+        assert!(
+            error.contains("final stage cannot have fallbacks"),
+            "{error}"
+        );
     }
 
     #[test]

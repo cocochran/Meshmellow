@@ -108,13 +108,47 @@ so it exists only on the llama backend.
 | `local.budget_bytes` | Runtime buffer budget passed to the runner; must be positive. |
 | `local.artifact_sha256` | Optional SHA-256 of `local.model`, checked once at startup. It establishes the stage's identity when the runner reports no `source_sha256` (a plain GGUF). |
 | `local.env` | Optional extra environment variables for the runner, such as `CUDA_VISIBLE_DEVICES`. |
+| `fallbacks` | Optional, on any stage but the final one: other locations that serve the same range, tried in order when the stage's node fails. Each is written like a stage's location, `{"remote": {...}}` or `{"local": {...}}`. See [Failover](#failover). |
 
 Unknown fields are refused everywhere, so a typo cannot silently drop a setting.
+
+## Failover
+
+A stage can list `fallbacks` that serve the same layer range:
+
+```json
+{"begin": 0, "end": 32, "remote": {"worker": "<M1 node id>"},
+ "fallbacks": [
+   {"remote": {"worker": "<standby node id>"}},
+   {"local": {"model": "/path/to/prefix-0-32.gguf", "gpu_layers": 99, "budget_bytes": 11811160064}}
+ ]}
+```
+
+- A remote fallback is another worker running `shard-serve` with the same `--range` and model
+  identity (and `--allow-peer` for the leader). Nothing is copied over the network, so the
+  standby needs the shard file on its own disk.
+- A local fallback runs the range on the leader too, next to its final stage, so the leader
+  needs memory for both.
+
+When a job starts, each stage opens on the first of its locations that answers, starting from
+the one that last worked. A worker that can't be reached within 20 s is skipped for the next
+location. If a stage's node fails partway through a reply, the front end sets that location
+aside for the rest of the job and restarts the prompt on the stage's next location. Decoding
+is greedy and deterministic, so the restart regenerates the same text: a streamed reply picks
+up where it stopped instead of repeating what was already sent. If the restarted text differs
+from what was sent, the job fails rather than splicing two answers together.
+
+The job fails as before when the failed stage has no location left, or when the failure isn't
+the stage's node going away (the leader's own final stage, a stage refusing the prompt, a
+model hash mismatch). The final stage takes no fallbacks: it runs on the leader, which
+tokenizes and samples. A restart pays prefill and model load again, and the generation is
+silent while it catches up to the text already sent.
 
 ## v1 limits
 
 - Topology: one remote prefix plus a local final stage, or a single local stage that runs the
-  whole model. Chained remote stages and a remote final stage need ring forwarding over
+  whole model. The prefix may fail over to fallbacks with the same range; layer ranges are never
+  re-split among the remaining nodes. Chained remote stages and a remote final stage need ring forwarding over
   david-codex's `meshthing/shard-ring/1` (M-27). Hidden states never take an extra hop through
   the leader ("hub forwarding"); that design was rejected.
 - Greedy decoding only. `temperature`, `top_p`, `seed` and similar fields are accepted and
