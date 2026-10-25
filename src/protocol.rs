@@ -150,11 +150,13 @@ pub enum ProtocolError {
     /// Received bytes are not a valid message.
     #[error("failed to decode message: {0}")]
     Decode(#[source] postcard::Error),
-    /// A frame exceeded [`MAX_FRAME_LEN`].
-    #[error("frame of {len} bytes exceeds the {MAX_FRAME_LEN}-byte limit")]
+    /// A frame exceeded the limit for its channel.
+    #[error("frame of {len} bytes exceeds the {limit}-byte limit")]
     FrameTooLarge {
         /// Length of the rejected frame payload in bytes.
         len: usize,
+        /// Maximum accepted frame payload in bytes.
+        limit: usize,
     },
 }
 
@@ -178,9 +180,15 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
     let payload = encode(message)?;
     let len = payload.len();
     if len > MAX_FRAME_LEN {
-        return Err(ProtocolError::FrameTooLarge { len });
+        return Err(ProtocolError::FrameTooLarge {
+            len,
+            limit: MAX_FRAME_LEN,
+        });
     }
-    let prefix = u32::try_from(len).map_err(|_| ProtocolError::FrameTooLarge { len })?;
+    let prefix = u32::try_from(len).map_err(|_| ProtocolError::FrameTooLarge {
+        len,
+        limit: MAX_FRAME_LEN,
+    })?;
     writer.write_all(&prefix.to_be_bytes()).await?;
     writer.write_all(&payload).await?;
     writer.flush().await?;
@@ -195,11 +203,25 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
 pub async fn read_frame<R: AsyncRead + Unpin>(
     reader: &mut R,
 ) -> Result<Option<Message>, ProtocolError> {
+    read_frame_with_limit(reader, MAX_FRAME_LEN).await
+}
+
+/// Reads one frame and decodes it, enforcing a caller-specific payload bound.
+///
+/// This is useful for protocol channels whose messages are smaller than the general frame limit.
+/// Like [`read_frame`], it rejects an oversized length prefix before allocating its payload.
+pub async fn read_frame_with_limit<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    max_len: usize,
+) -> Result<Option<Message>, ProtocolError> {
     let Some(len) = read_length_prefix(reader).await? else {
         return Ok(None);
     };
-    if len > MAX_FRAME_LEN {
-        return Err(ProtocolError::FrameTooLarge { len });
+    if len > max_len {
+        return Err(ProtocolError::FrameTooLarge {
+            len,
+            limit: max_len,
+        });
     }
     let mut payload = vec![0; len];
     reader.read_exact(&mut payload).await?;
@@ -223,7 +245,10 @@ async fn read_length_prefix<R: AsyncRead + Unpin>(
         filled += read;
     }
     let len = u32::from_be_bytes(prefix);
-    let len = usize::try_from(len).map_err(|_| ProtocolError::FrameTooLarge { len: usize::MAX })?;
+    let len = usize::try_from(len).map_err(|_| ProtocolError::FrameTooLarge {
+        len: usize::MAX,
+        limit: usize::MAX,
+    })?;
     Ok(Some(len))
 }
 
@@ -360,10 +385,24 @@ mod tests {
             let mut reader = prefix.as_slice();
             let error = read_frame(&mut reader).await.unwrap_err();
             assert!(
-                matches!(error, ProtocolError::FrameTooLarge { len: rejected } if rejected == len),
+                matches!(error, ProtocolError::FrameTooLarge { len: rejected, limit: MAX_FRAME_LEN } if rejected == len),
                 "unexpected error: {error}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn caller_frame_limit_is_checked_before_reading_payload() {
+        let prefix = 1025u32.to_be_bytes();
+        let mut reader = prefix.as_slice();
+        let error = read_frame_with_limit(&mut reader, 1024).await.unwrap_err();
+        assert!(matches!(
+            error,
+            ProtocolError::FrameTooLarge {
+                len: 1025,
+                limit: 1024
+            }
+        ));
     }
 
     #[tokio::test]
@@ -376,7 +415,7 @@ mod tests {
         let mut written = Vec::new();
         let error = write_frame(&mut written, &message).await.unwrap_err();
         assert!(
-            matches!(error, ProtocolError::FrameTooLarge { len } if len > MAX_FRAME_LEN),
+            matches!(error, ProtocolError::FrameTooLarge { len, limit: MAX_FRAME_LEN } if len > MAX_FRAME_LEN),
             "unexpected error: {error}"
         );
         assert!(written.is_empty());

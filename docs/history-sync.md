@@ -277,6 +277,8 @@ Controls:
 - **Writes** (`record`) are one write per call, epoch line first, flushed with `sync_data` before returning.
 - **Atomic replacement:** write a temporary file, flush it, rename it over the old one, then flush the directory (Unix).
 - **Compaction:** every 100 log entries, the log is folded into a new snapshot and truncated.
+  Compaction happens after the synced append; if it fails, the append still succeeds and a warning
+  is logged because the durable log remains the source of truth.
 - **Conversation IDs** become folder names, so only 1–128 letters, digits, `-`, `_`, `.` are allowed (not `.` or `..`).
 
 **Crash safety:** whatever moment a crash happens, loading gives back a prefix of the history:

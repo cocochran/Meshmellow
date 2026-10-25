@@ -72,6 +72,10 @@ const SECONDS_PER_MINUTE: u64 = 60;
     about = "Peer-to-peer mesh for splitting one LLM across devices"
 )]
 struct Cli {
+    /// Enable detailed MeshThing diagnostics on stderr (also works with RUST_LOG).
+    #[arg(long, global = true)]
+    debug: bool,
+
     /// File holding this node's secret key; created on first run.
     #[arg(long, global = true, default_value = "meshthing.key")]
     key: PathBuf,
@@ -86,6 +90,16 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Verify, serve, and stage exported model shards.
+    Artifacts(llm_cluster::artifact::cli::Options),
+    /// Run the mesh core, local OpenAI API, and browser UI in this process.
+    Ui(llm_cluster::ui::Options),
+    /// Run a persistent mesh node. Send create/invite/join/decide/snapshot JSON commands on stdin.
+    Mesh {
+        /// Private identity and signed membership directory, one per running device.
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
     /// Check caller-collected memory and compute evidence for an advisory plan.
     Verify {
         /// JSON produced by the plan command.
@@ -104,6 +118,35 @@ enum Command {
         /// Require at least this many contributors.
         #[arg(long, default_value_t = 2)]
         min_peers: usize,
+    },
+    /// Search exact measured shard ranges and directed links; advisory JSON only.
+    MeasuredPlan {
+        /// Versioned JSON with fresh range, link and memory observations.
+        profile: PathBuf,
+    },
+    /// Prepare an EXPERIMENTAL ring manifest and worker arguments from measured ranges.
+    /// Does not launch, reserve capacity, or qualify diagnostic measurements.
+    PrepareRing {
+        /// Current measured profile; timestamps are checked against current wall time.
+        profile: PathBuf,
+        /// Trusted device identities, native builds and exact range artifacts.
+        registry: PathBuf,
+        /// New output directory; existing paths are never overwritten.
+        #[arg(long)]
+        output_dir: PathBuf,
+    },
+    /// Verify a prepared ring bundle against original inputs and current expiration.
+    ValidateRing {
+        bundle: PathBuf,
+        profile: PathBuf,
+        registry: PathBuf,
+    },
+    /// Recheck a saved measured plan against refreshed observations; no runtime verification.
+    ValidateMeasured {
+        /// JSON produced by `measured-plan`.
+        plan: PathBuf,
+        /// Versioned measured profile with current capacity and time.
+        profile: PathBuf,
     },
     /// Print this node's ID and accept control connections from peers.
     Listen,
@@ -168,6 +211,49 @@ enum Command {
         /// Node ID allowed to use this shard (the leader's); repeatable, at least one required.
         #[arg(long = "allow-peer", required = true)]
         allow_peers: Vec<String>,
+        #[command(flatten)]
+        profiles: WorkerProfileArgs,
+    },
+    /// EXPERIMENTAL: serve one layer range as a `meshthing/shard-ring/1` worker that forwards
+    /// activations straight to the next worker. Without `--next` this worker is the terminal
+    /// and returns tokens directly to the origin.
+    ShardRingWorker {
+        /// The shard_runner binary.
+        #[arg(long)]
+        runner: PathBuf,
+        /// The exported shard file passed to the runner.
+        #[arg(long)]
+        model: PathBuf,
+        /// Half-open layer range served, as `BEGIN:END` (e.g. `28:32`).
+        #[arg(long, value_parser = parse_layer_range)]
+        range: LayerRange,
+        /// Context window passed to the runner.
+        #[arg(long)]
+        context: u32,
+        /// Layers the runner offloads to the GPU.
+        #[arg(long, default_value_t = 0)]
+        gpu_layers: u32,
+        /// Runtime buffer budget passed to the runner, in bytes.
+        #[arg(long)]
+        budget_bytes: u64,
+        /// SHA-256 the model file must have; checked at startup.
+        #[arg(long)]
+        expected_sha256: String,
+        /// Original model identity the runner must report.
+        #[arg(long)]
+        source_sha256: Option<String>,
+        /// Node ID of the only peer allowed to start sessions: the origin for the entry worker,
+        /// else the previous worker.
+        #[arg(long, value_parser = parse_node_id_arg)]
+        upstream: iroh::EndpointId,
+        /// Node ID of the origin (leader) the terminal returns results to.
+        #[arg(long, value_parser = parse_node_id_arg)]
+        origin: iroh::EndpointId,
+        /// Node ID of the next worker; omit on the terminal.
+        #[arg(long, value_parser = parse_node_id_arg)]
+        next: Option<iroh::EndpointId>,
+        #[command(flatten)]
+        profiles: WorkerProfileArgs,
     },
     /// Contribute this device to a cluster: supervise ggml-rpc-server and bridge it to the leader,
     /// keep a copy of the conversation, and optionally stand by to take over as leader.
@@ -242,6 +328,36 @@ const LLAMA_ONLY_ARGS: [&str; 8] = [
     "llama_args",
     "llama_ready_timeout",
 ];
+
+/// Optional worker-local controls share the worker's process admission owner.
+#[derive(Debug, Default, Args)]
+struct WorkerProfileArgs {
+    /// Trusted local registered-candidate configuration (POSIX helper only).
+    #[arg(long, requires = "profile_api")]
+    profile_config: Option<PathBuf>,
+    /// Loopback address for managed start/status/cancel routes; disabled by default.
+    #[arg(long, requires = "profile_config")]
+    profile_api: Option<SocketAddr>,
+}
+
+impl WorkerProfileArgs {
+    async fn bind(
+        self,
+    ) -> anyhow::Result<Option<llm_cluster::worker_profile::WorkerProfileControl>> {
+        match (self.profile_config, self.profile_api) {
+            (None, None) => Ok(None),
+            (Some(path), Some(address)) => {
+                llm_cluster::worker_profile::validate_address(address)?;
+                let manager = llm_cluster::profiling::ProfileManager::from_file(&path).await?;
+                Ok(Some(
+                    llm_cluster::worker_profile::WorkerProfileControl::bind(manager, address)
+                        .await?,
+                ))
+            }
+            _ => anyhow::bail!("worker profiling requires both --profile-config and --profile-api"),
+        }
+    }
+}
 
 /// `leader` flags.
 #[derive(Debug, Args)]
@@ -361,6 +477,7 @@ impl LeaderArgs {
                 manifest_path: self
                     .shard_manifest
                     .context("--shard-manifest is required with --backend shard")?,
+                ring: RingSettings::default(),
             }),
         };
         Ok(LeaderConfig {
@@ -414,9 +531,12 @@ enum HistoryCommand {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_logging();
     let cli = Cli::parse();
+    init_logging(cli.debug);
     match cli.command {
+        Command::Artifacts(options) => llm_cluster::artifact::cli::run(options).await,
+        Command::Ui(options) => llm_cluster::ui::run(options).await,
+        Command::Mesh { state_dir } => llm_cluster::mesh::cli::run(state_dir).await,
         Command::Verify {
             plan,
             profile,
@@ -424,21 +544,85 @@ async fn main() -> anyhow::Result<()> {
             min_peers,
         } => {
             let output: llm_cluster::planning::PlanningOutput =
-                serde_json::from_str(&std::fs::read_to_string(plan)?)?;
+                llm_cluster::config::read_json_file(&plan, "plan")?;
             let request: llm_cluster::planning::PlanningRequest =
-                serde_json::from_str(&std::fs::read_to_string(profile)?)?;
-            let evidence = serde_json::from_str(&std::fs::read_to_string(evidence)?)?;
+                llm_cluster::config::read_json_file(&profile, "profile")?;
+            let evidence = llm_cluster::config::read_json_file(&evidence, "evidence")?;
             llm_cluster::planning::verify_output(&request, &output, &evidence, min_peers)
                 .map_err(|error| anyhow::anyhow!("verification failed: {error:?}"))?;
             println!("{{\"verified\":true}}");
             Ok(())
         }
         Command::Plan { profile, min_peers } => {
-            let input = std::fs::read_to_string(profile)?;
-            let request = serde_json::from_str(&input)?;
+            let request: llm_cluster::planning::PlanningRequest =
+                llm_cluster::config::read_json_file(&profile, "profile")?;
+            tracing::debug!(
+                peers = request.peers.len(),
+                links = request.links.len(),
+                min_peers,
+                "building placement plan"
+            );
             let output = llm_cluster::planning::build_plan(&request, min_peers)
                 .map_err(|error| anyhow::anyhow!("planning failed: {error:?}"))?;
+            tracing::debug!(
+                assignments = output.placement.assignments.len(),
+                predicted_decode_us = output.placement.predicted_decode_us,
+                "placement plan ready"
+            );
             println!("{}", serde_json::to_string_pretty(&output)?);
+            Ok(())
+        }
+        Command::PrepareRing {
+            profile,
+            registry,
+            output_dir,
+        } => {
+            let request = read_ring_json(&profile)?;
+            let registry = read_ring_json(&registry)?;
+            let bundle =
+                llm_cluster::ring_deployment::prepare(&request, &registry, current_unix_ms()?)?;
+            llm_cluster::ring_deployment::write_bundle(&bundle, &output_dir)?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "preparation_id": bundle.preparation_id,
+                    "bundle": output_dir.join("bundle.json"),
+                    "expires_at_unix_ms": bundle.expires_at_unix_ms,
+                    "activation_ready": false,
+                })
+            );
+            Ok(())
+        }
+        Command::ValidateRing {
+            bundle,
+            profile,
+            registry,
+        } => {
+            llm_cluster::ring_deployment::validate(
+                &read_ring_json(&bundle)?,
+                &read_ring_json(&profile)?,
+                &read_ring_json(&registry)?,
+                current_unix_ms()?,
+            )?;
+            println!("{{\"configuration_valid\":true,\"activation_ready\":false}}");
+            Ok(())
+        }
+        Command::MeasuredPlan { profile } => {
+            let request: llm_cluster::measured_placement::MeasuredRequest =
+                llm_cluster::config::read_json_file(&profile, "measured profile")?;
+            let output = llm_cluster::measured_placement::plan(&request)
+                .map_err(|error| anyhow::anyhow!("measured planning failed: {error:?}"))?;
+            println!("{}", serde_json::to_string_pretty(&output)?);
+            Ok(())
+        }
+        Command::ValidateMeasured { plan, profile } => {
+            let request: llm_cluster::measured_placement::MeasuredRequest =
+                llm_cluster::config::read_json_file(&profile, "measured profile")?;
+            let output: llm_cluster::measured_placement::MeasuredPlacement =
+                llm_cluster::config::read_json_file(&plan, "measured plan")?;
+            llm_cluster::measured_placement::validate_output(&request, &output)
+                .map_err(|error| anyhow::anyhow!("measured plan validation failed: {error:?}"))?;
+            println!("{{\"validated\":true}}");
             Ok(())
         }
         Command::Listen => listen(&cli.key, &cli.cluster).await,
@@ -465,6 +649,7 @@ async fn main() -> anyhow::Result<()> {
             expected_sha256,
             source_sha256,
             ref allow_peers,
+            profiles,
         } => {
             let config = ShardServeConfig {
                 runner,
@@ -477,7 +662,37 @@ async fn main() -> anyhow::Result<()> {
                 expected_sha256,
                 source_sha256,
             };
-            shard_serve(&cli.key, config, &parse_node_ids(allow_peers)?).await
+            shard_serve(&cli.key, config, &parse_node_ids(allow_peers)?, profiles).await
+        }
+        Command::ShardRingWorker {
+            runner,
+            model,
+            range,
+            context,
+            gpu_layers,
+            budget_bytes,
+            expected_sha256,
+            source_sha256,
+            upstream,
+            origin,
+            next,
+            profiles,
+        } => {
+            let config = RingWorkerConfig {
+                runner,
+                model,
+                begin: range.begin,
+                end: range.end,
+                context,
+                gpu_layers,
+                budget_bytes,
+                expected_sha256,
+                source_sha256,
+                upstream,
+                origin,
+                next,
+            };
+            shard_ring_worker(&cli.key, config, profiles).await
         }
         Command::Worker {
             rpc_server,
@@ -558,12 +773,18 @@ fn history(command: HistoryCommand) -> anyhow::Result<()> {
 }
 
 /// Sends logs to stderr so stdout carries only intentional CLI output such as the node ID.
-fn init_logging() {
-    let filter =
+fn init_logging(debug: bool) {
+    let mut filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
+    if debug {
+        filter = filter.add_directive("llm_cluster=debug".parse().expect("constant log directive"));
+    }
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        .with_thread_ids(debug)
+        .with_file(debug)
+        .with_line_number(debug)
         .init();
 }
 
@@ -604,12 +825,60 @@ async fn shard_serve(
     key: &Path,
     config: ShardServeConfig,
     allow_peers: &[iroh::EndpointId],
+    profiles: WorkerProfileArgs,
 ) -> anyhow::Result<()> {
     let allowed = rpc_bridge::PeerAllowlist::new(allow_peers.iter().copied())?;
+    let control = profiles.bind().await?;
     let endpoint = network::bind_endpoint(key, vec![RPC_BRIDGE_ALPN.to_vec()]).await?;
     print_node_id(&endpoint);
     let serve = serve_shard(endpoint.clone(), config, allowed);
-    run_until_ctrl_c(&endpoint, serve).await
+    run_worker_until_ctrl_c(&endpoint, serve, control).await
+}
+
+async fn shard_ring_worker(
+    key: &Path,
+    config: RingWorkerConfig,
+    profiles: WorkerProfileArgs,
+) -> anyhow::Result<()> {
+    let control = profiles.bind().await?;
+    let endpoint = network::bind_endpoint(key, vec![RING_ALPN.to_vec()]).await?;
+    print_node_id(&endpoint);
+    let serve = serve_ring_worker(endpoint.clone(), config);
+    run_worker_until_ctrl_c(&endpoint, serve, control).await
+}
+
+async fn run_worker_until_ctrl_c(
+    endpoint: &Endpoint,
+    worker: impl Future<Output = anyhow::Result<()>>,
+    control: Option<llm_cluster::worker_profile::WorkerProfileControl>,
+) -> anyhow::Result<()> {
+    let result = match control {
+        Some(control) => {
+            control
+                .run(worker, async { Ok(tokio::signal::ctrl_c().await?) })
+                .await
+        }
+        None => until_ctrl_c(worker).await,
+    };
+    endpoint.close().await;
+    result
+}
+
+fn current_unix_ms() -> anyhow::Result<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis()
+        .try_into()?)
+}
+
+fn read_ring_json<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
+    use std::io::Read;
+    const MAX_BYTES: u64 = 8 * 1024 * 1024;
+    let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() as u64 <= MAX_BYTES, "ring input exceeds 8 MiB");
+    serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
 }
 
 /// A half-open layer range `[begin, end)` given as `BEGIN:END`.
@@ -636,6 +905,11 @@ fn parse_layer_range(text: &str) -> Result<LayerRange, String> {
 /// Parses every `--allow-peer` value, naming the first invalid one.
 fn parse_node_ids(ids: &[String]) -> anyhow::Result<Vec<iroh::EndpointId>> {
     ids.iter().map(|id| network::parse_node_id(id)).collect()
+}
+
+/// Parses a node ID flag such as `--upstream`, for clap.
+fn parse_node_id_arg(text: &str) -> Result<iroh::EndpointId, String> {
+    network::parse_node_id(text).map_err(|error| format!("{error:#}"))
 }
 
 /// Parses `--worker NODE_ID=ADDR`. The loopback check happens when the listener is bound.
@@ -753,6 +1027,69 @@ fn parse_duration(text: &str) -> Result<Duration, String> {
 
 #[cfg(test)]
 mod tests {
+    mod ring_fixture {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/common/ring_fixture.rs"
+        ));
+    }
+
+    #[test]
+    fn generated_ring_arguments_parse_as_actual_runtime_commands() {
+        use super::*;
+        let (request, registry) = ring_fixture::inputs(1000);
+        let bundle = llm_cluster::ring_deployment::prepare(&request, &registry, 1100).unwrap();
+        let cli = Cli::try_parse_from(
+            std::iter::once("llm-cluster".to_owned()).chain(bundle.leader_argv.clone()),
+        )
+        .unwrap();
+        assert_eq!(cli.key.to_str(), Some(bundle.leader.key_path.as_str()));
+        let Command::Leader(args) = cli.command else {
+            panic!("expected leader");
+        };
+        let config = args.into_config(cli.key, cli.cluster).unwrap();
+        assert!(matches!(config.backend, BackendConfig::Shard(_)));
+        assert_eq!(config.api_addr, registry.leader.api);
+        assert_eq!(config.upstream_port, registry.leader.upstream_port);
+        for worker in &bundle.workers {
+            let cli = Cli::try_parse_from(
+                std::iter::once("llm-cluster".to_owned()).chain(worker.argv.clone()),
+            )
+            .unwrap();
+            assert_eq!(cli.key.to_str(), Some(worker.stage.key_path.as_str()));
+            let Command::ShardRingWorker {
+                runner,
+                model,
+                range,
+                context,
+                gpu_layers,
+                budget_bytes,
+                expected_sha256,
+                source_sha256,
+                upstream,
+                origin,
+                next,
+                ..
+            } = cli.command
+            else {
+                panic!("expected ring worker");
+            };
+            let expected = worker.config().unwrap();
+            assert_eq!(runner, expected.runner);
+            assert_eq!(model, expected.model);
+            assert_eq!((range.begin, range.end), (expected.begin, expected.end));
+            assert_eq!(
+                (context, gpu_layers, budget_bytes),
+                (expected.context, expected.gpu_layers, expected.budget_bytes)
+            );
+            assert_eq!(expected_sha256, expected.expected_sha256);
+            assert_eq!(source_sha256, expected.source_sha256);
+            assert_eq!(
+                (upstream, origin, next),
+                (expected.upstream, expected.origin, expected.next)
+            );
+        }
+    }
     use clap::CommandFactory;
     use llm_cluster::evidence;
 
@@ -1184,6 +1521,184 @@ mod tests {
         }
         let flag = parse_shard_serve("8:4", &["--allow-peer", "a"]);
         assert!(flag.is_err(), "a reversed --range must be refused");
+    }
+
+    /// `shard-ring-worker` over `range` with its other required flags plus `extra`.
+    fn parse_shard_ring_worker(
+        range: &str,
+        upstream: &str,
+        origin: &str,
+        extra: &[&str],
+    ) -> Result<Command, clap::Error> {
+        let required = [
+            "meshthing",
+            "shard-ring-worker",
+            "--runner",
+            "shard_runner",
+            "--model",
+            "shard.gguf",
+            "--range",
+            range,
+            "--context",
+            "512",
+            "--budget-bytes",
+            "1048576",
+            "--expected-sha256",
+            "abc123",
+            "--upstream",
+            upstream,
+            "--origin",
+            origin,
+        ];
+        Cli::try_parse_from(required.iter().chain(extra)).map(|cli| cli.command)
+    }
+
+    #[test]
+    fn shard_ring_worker_without_next_is_the_terminal() {
+        let upstream = iroh::SecretKey::generate().public();
+        let origin = iroh::SecretKey::generate().public();
+        let command =
+            parse_shard_ring_worker("28:32", &upstream.to_string(), &origin.to_string(), &[])
+                .expect("shard-ring-worker");
+        let Command::ShardRingWorker {
+            runner,
+            model,
+            range,
+            context,
+            gpu_layers,
+            budget_bytes,
+            expected_sha256,
+            source_sha256,
+            upstream: parsed_upstream,
+            origin: parsed_origin,
+            next,
+            profiles,
+        } = command
+        else {
+            panic!("expected shard-ring-worker, got {command:?}");
+        };
+        assert_eq!(runner, PathBuf::from("shard_runner"));
+        assert_eq!(model, PathBuf::from("shard.gguf"));
+        assert_eq!(range, LayerRange { begin: 28, end: 32 });
+        assert_eq!((context, gpu_layers, budget_bytes), (512, 0, 1_048_576));
+        assert_eq!(expected_sha256, "abc123");
+        assert_eq!(source_sha256, None);
+        assert_eq!((parsed_upstream, parsed_origin), (upstream, origin));
+        assert_eq!(next, None);
+        assert!(profiles.profile_config.is_none());
+        assert!(profiles.profile_api.is_none());
+    }
+
+    #[test]
+    fn both_native_workers_accept_paired_profile_controls() {
+        let peer = iroh::SecretKey::generate().public().to_string();
+        let extra = [
+            "--profile-config",
+            "profiles.json",
+            "--profile-api",
+            "127.0.0.1:8091",
+        ];
+        let ring = parse_shard_ring_worker("4:8", &peer, &peer, &extra).unwrap();
+        let shard_extra: Vec<_> = ["--allow-peer", peer.as_str()]
+            .into_iter()
+            .chain(extra)
+            .collect();
+        let shard = parse_shard_serve("4:8", &shard_extra).unwrap();
+        for command in [ring, shard] {
+            let profiles = match command {
+                Command::ShardRingWorker { profiles, .. }
+                | Command::ShardServe { profiles, .. } => profiles,
+                _ => panic!("expected native worker"),
+            };
+            assert_eq!(
+                profiles.profile_config,
+                Some(PathBuf::from("profiles.json"))
+            );
+            assert_eq!(
+                profiles.profile_api,
+                Some("127.0.0.1:8091".parse().unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn native_workers_require_both_profile_flags() {
+        let peer = iroh::SecretKey::generate().public().to_string();
+        for extra in [
+            ["--profile-config", "profiles.json"],
+            ["--profile-api", "127.0.0.1:8091"],
+        ] {
+            assert!(parse_shard_ring_worker("4:8", &peer, &peer, &extra).is_err());
+            let shard_extra: Vec<_> = ["--allow-peer", peer.as_str()]
+                .into_iter()
+                .chain(extra)
+                .collect();
+            assert!(parse_shard_serve("4:8", &shard_extra).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_profile_options_reject_public_listener_before_reading_config() {
+        let options = WorkerProfileArgs {
+            profile_config: Some(PathBuf::from("missing-profile-config.json")),
+            profile_api: Some("0.0.0.0:8091".parse().unwrap()),
+        };
+        let error = options.bind().await.err().expect("public bind must fail");
+        assert!(error.to_string().contains("loopback"));
+        assert!(WorkerProfileArgs::default().bind().await.unwrap().is_none());
+    }
+
+    #[test]
+    fn shard_ring_worker_parses_optional_flags() {
+        let peer = iroh::SecretKey::generate().public().to_string();
+        let next = iroh::SecretKey::generate().public();
+        let next_text = next.to_string();
+        let extra = [
+            "--next",
+            next_text.as_str(),
+            "--gpu-layers",
+            "99",
+            "--source-sha256",
+            "def456",
+        ];
+        let command =
+            parse_shard_ring_worker("0:28", &peer, &peer, &extra).expect("shard-ring-worker");
+        let Command::ShardRingWorker {
+            gpu_layers,
+            source_sha256,
+            next: parsed_next,
+            ..
+        } = command
+        else {
+            panic!("expected shard-ring-worker, got {command:?}");
+        };
+        assert_eq!(gpu_layers, 99);
+        assert_eq!(source_sha256.as_deref(), Some("def456"));
+        assert_eq!(parsed_next, Some(next));
+    }
+
+    #[test]
+    fn shard_ring_worker_refuses_bad_peers_and_ranges() {
+        let peer = iroh::SecretKey::generate().public().to_string();
+        let cases = [
+            ("28:32", "not-a-node-id", peer.as_str(), &[][..]),
+            ("28:32", peer.as_str(), "not-a-node-id", &[][..]),
+            (
+                "28:32",
+                peer.as_str(),
+                peer.as_str(),
+                &["--next", "nope"][..],
+            ),
+            ("32:28", peer.as_str(), peer.as_str(), &[][..]),
+        ];
+        for (range, upstream, origin, extra) in cases {
+            assert!(
+                parse_shard_ring_worker(range, upstream, origin, extra).is_err(),
+                "{range} {upstream} {origin} {extra:?} should be refused"
+            );
+        }
+        let missing = Cli::try_parse_from(["meshthing", "shard-ring-worker", "--upstream", &peer]);
+        assert!(missing.is_err(), "missing required flags must be refused");
     }
 
     #[test]

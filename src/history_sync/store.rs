@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::history_sync::history::{Entry, Epoch, History, Seq};
 
@@ -77,6 +78,14 @@ struct Snapshot {
     generation: u64,
     epoch: Epoch,
     entries: Vec<Entry>,
+}
+
+/// Borrowed snapshot used for serialization so compaction doesn't clone the full history.
+#[derive(Serialize)]
+struct SnapshotRef<'a> {
+    generation: u64,
+    epoch: Epoch,
+    entries: &'a [Entry],
 }
 
 /// One line of `log.jsonl`, as read.
@@ -358,8 +367,12 @@ impl HistoryStore {
         self.log.sync_data().map_err(io_at(&log_path))?;
         self.epoch = self.epoch.max(epoch);
         self.history.extend(entries.iter().cloned());
-        if self.history.len() - self.snapshot_len >= SNAPSHOT_EVERY {
-            self.compact()?;
+        if self.history.len() - self.snapshot_len >= SNAPSHOT_EVERY
+            && let Err(error) = self.compact()
+        {
+            // The log append was already synced above. Returning an error here would tell the
+            // caller the append failed even though replay after restart includes these entries.
+            warn!(%error, "history append is durable, but snapshot compaction failed");
         }
         Ok(())
     }
@@ -396,8 +409,7 @@ impl HistoryStore {
 
     /// Folds the log into the snapshot so loading stays fast and the log stays short.
     fn compact(&mut self) -> Result<(), StoreError> {
-        let history = self.history.clone();
-        self.write_snapshot(self.generation, self.epoch, &history)?;
+        self.write_snapshot(self.generation, self.epoch, &self.history)?;
         self.truncate_log()?;
         self.snapshot_len = self.history.len();
         Ok(())
@@ -409,10 +421,10 @@ impl HistoryStore {
         epoch: Epoch,
         history: &History,
     ) -> Result<(), StoreError> {
-        let snapshot = Snapshot {
+        let snapshot = SnapshotRef {
             generation,
             epoch,
-            entries: history.entries().to_vec(),
+            entries: history.entries(),
         };
         write_json_atomic(&self.dir.join(SNAPSHOT_FILE), &snapshot)
     }

@@ -8,5 +8,9 @@
 pub mod frontend;
 pub mod manifest;
 pub mod pipeline;
+pub mod ring;
+pub mod ring_origin;
 pub mod serve;
+pub mod telemetry;
+pub mod template;
 pub mod wire;

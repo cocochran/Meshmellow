@@ -11,8 +11,9 @@ use std::time::Duration;
 use axum::Router;
 use axum::routing::post;
 use llm_cluster::api::{self, ApiConfig, REQUEST_ID_HEADER};
-use llm_cluster::history::{CompletedTurn, HistorySink};
-use llm_cluster::jobs::{JobQueue, JobStatus};
+use llm_cluster::history::{CompletedTurn, HistorySink, StartedTurn, TurnOutcome};
+use llm_cluster::jobs::{JobQueue, JobStatus, MAX_OUTSTANDING_JOBS};
+use llm_cluster::node::PeerTable;
 use serde_json::{Value, json};
 use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
@@ -26,6 +27,8 @@ const WAIT_LIMIT: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// How long the fake server sleeps before answering in the FIFO test.
 const SLOW_REPLY_MS: u64 = 300;
+/// A reply delay no test waits out: requests are abandoned while the fake server sleeps.
+const STALLED_REPLY_MS: u64 = 60_000;
 
 fn free_loopback_addr() -> SocketAddr {
     TcpListener::bind("127.0.0.1:0")
@@ -94,26 +97,77 @@ impl FakeLlama {
     }
 }
 
+/// One history hook call, without the request ID it was for.
+#[derive(Clone, Debug, PartialEq)]
+enum Hook {
+    Started,
+    Recorded,
+    Ended(TurnOutcome),
+}
+
 #[derive(Default)]
 struct RecordingSink {
+    started: Mutex<Vec<StartedTurn>>,
     turns: Mutex<Vec<CompletedTurn>>,
+    /// Every hook call in order, with its request ID.
+    calls: Mutex<Vec<(String, Hook)>>,
 }
 
 impl RecordingSink {
     fn turns(&self) -> Vec<CompletedTurn> {
         self.turns.lock().unwrap().clone()
     }
+
+    fn started_turns(&self) -> Vec<StartedTurn> {
+        self.started.lock().unwrap().clone()
+    }
+
+    /// The hook calls made for one job, in order.
+    fn calls_for(&self, request_id: &str) -> Vec<Hook> {
+        let calls = self.calls.lock().unwrap();
+        calls
+            .iter()
+            .filter(|(id, _)| id == request_id)
+            .map(|(_, hook)| hook.clone())
+            .collect()
+    }
+
+    /// Asserts the job was started and then failed, and returns the failure reason.
+    fn failure_reason(&self, request_id: &str) -> String {
+        match &self.calls_for(request_id)[..] {
+            [Hook::Started, Hook::Ended(TurnOutcome::Failed { reason })] => reason.clone(),
+            calls => panic!("expected started then failed for {request_id}, got {calls:?}"),
+        }
+    }
+
+    fn log(&self, request_id: &str, hook: Hook) {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((request_id.to_owned(), hook));
+    }
 }
 
 impl HistorySink for RecordingSink {
+    fn started(&self, turn: &StartedTurn) {
+        self.started.lock().unwrap().push(turn.clone());
+        self.log(&turn.request_id, Hook::Started);
+    }
+
     fn record(&self, turn: CompletedTurn) {
+        self.log(&turn.request_id, Hook::Recorded);
         self.turns.lock().unwrap().push(turn);
+    }
+
+    fn ended(&self, request_id: &str, outcome: TurnOutcome) {
+        self.log(request_id, Hook::Ended(outcome));
     }
 }
 
 struct TestApi {
     addr: SocketAddr,
     sink: Arc<RecordingSink>,
+    queue: Arc<JobQueue>,
     client: reqwest::Client,
     shutdown: Option<oneshot::Sender<()>>,
     server: JoinHandle<anyhow::Result<()>>,
@@ -123,14 +177,16 @@ impl TestApi {
     async fn start(upstream: SocketAddr) -> Self {
         let addr = free_loopback_addr();
         let sink = Arc::new(RecordingSink::default());
+        let queue = Arc::new(JobQueue::new());
         let (shutdown, shutdown_rx) = oneshot::channel::<()>();
         let config = ApiConfig {
             listen: addr,
             upstream,
+            peers: Arc::new(Mutex::new(PeerTable::new())),
         };
         let server = tokio::spawn(api::serve_api(
             config,
-            Arc::new(JobQueue::new()),
+            Arc::clone(&queue),
             Arc::clone(&sink) as Arc<dyn HistorySink>,
             async move {
                 // A dropped sender also means "shut down".
@@ -142,6 +198,7 @@ impl TestApi {
         Self {
             addr,
             sink,
+            queue,
             client: reqwest::Client::new(),
             shutdown: Some(shutdown),
             server,
@@ -159,6 +216,14 @@ impl TestApi {
             .send()
             .await
             .expect("chat request")
+    }
+
+    /// Like `post_chat`, but returns a `'static` future that can be spawned and aborted.
+    fn post_chat_owned(
+        &self,
+        body: Value,
+    ) -> impl Future<Output = reqwest::Result<reqwest::Response>> + Send + 'static {
+        self.client.post(self.chat_url()).json(&body).send()
     }
 
     async fn jobs(&self) -> Vec<Value> {
@@ -242,6 +307,7 @@ async fn truncated_upstream_sse_fails_client_body_and_does_not_commit_history() 
         api.sink.turns().is_empty(),
         "partial response must not become completed history"
     );
+    api.sink.failure_reason(&request_id);
     api.stop().await;
     upstream.abort();
     let _ = upstream.await;
@@ -277,6 +343,18 @@ async fn non_streaming_requests_are_proxied_and_strip_conversation_id() {
     assert_eq!(turns[1].conversation_id.as_deref(), Some("conv-1"));
     assert_eq!(turns[1].response_text, "which conversation?");
     assert!(turns[1].request.get("conversation_id").is_none());
+
+    let started = api.sink.started_turns();
+    assert_eq!(started.len(), 2);
+    for (started, completed) in started.iter().zip(&turns) {
+        assert_eq!(started.request_id, completed.request_id);
+        assert_eq!(started.conversation_id, completed.conversation_id);
+        assert_eq!(started.request, completed.request);
+        assert_eq!(
+            api.sink.calls_for(&completed.request_id),
+            [Hook::Started, Hook::Recorded]
+        );
+    }
 
     let jobs = api.jobs().await;
     assert_eq!(jobs.len(), 2);
@@ -320,6 +398,11 @@ async fn streamed_replies_are_relayed_chunk_by_chunk() {
     assert_eq!(turns.len(), 1);
     assert_eq!(turns[0].response_text, text);
     assert_eq!(turns[0].conversation_id.as_deref(), Some("conv-stream"));
+    assert_eq!(
+        api.sink.calls_for(&request_id),
+        [Hook::Started, Hook::Recorded]
+    );
+    assert_eq!(api.sink.started_turns()[0].request, turns[0].request);
     assert_eq!(api.job_status(&request_id).await, "completed");
     api.stop().await;
 }
@@ -341,7 +424,54 @@ async fn client_disconnect_mid_stream_cancels_the_job() {
     })
     .await;
     assert!(api.sink.turns().is_empty());
+    assert_eq!(
+        api.sink.calls_for(&request_id),
+        [Hook::Started, Hook::Ended(TurnOutcome::Canceled)]
+    );
     assert_eq!(api::prompt(api.addr, "next").await.unwrap(), "next");
+    api.stop().await;
+}
+
+/// Request ID of the first job listed with `status`, once one exists.
+async fn wait_for_job_with_status(api: &TestApi, status: &str) -> String {
+    wait_for(status, || async {
+        api.jobs()
+            .await
+            .iter()
+            .find(|job| job["status"] == status)
+            .map(|job| job["request_id"].as_str().unwrap().to_owned())
+    })
+    .await
+}
+
+async fn wait_for_status(api: &TestApi, request_id: &str, status: &str) {
+    wait_for(status, || async {
+        (api.job_status(request_id).await == status).then_some(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn queued_cancels_make_no_history_calls_and_running_cancels_end_canceled() {
+    // Slow enough that both requests are abandoned long before the fake server answers.
+    let fake = FakeLlama::start(&["--delay-ms", &STALLED_REPLY_MS.to_string()]).await;
+    let api = TestApi::start(fake.addr).await;
+    let running = tokio::spawn(api.post_chat_owned(chat_body("running")));
+    let running_id = wait_for_job_with_status(&api, "running").await;
+    let queued = tokio::spawn(api.post_chat_owned(chat_body("queued")));
+    let queued_id = wait_for_job_with_status(&api, "queued").await;
+
+    queued.abort();
+    wait_for_status(&api, &queued_id, "canceled").await;
+    assert!(api.sink.calls_for(&queued_id).is_empty());
+
+    running.abort();
+    wait_for_status(&api, &running_id, "canceled").await;
+    assert_eq!(
+        api.sink.calls_for(&running_id),
+        [Hook::Started, Hook::Ended(TurnOutcome::Canceled)]
+    );
+    assert!(api.sink.turns().is_empty());
     api.stop().await;
 }
 
@@ -381,6 +511,30 @@ async fn concurrent_requests_run_strictly_one_after_another() {
 }
 
 #[tokio::test]
+async fn full_inference_queue_returns_429_without_registering_overflow() {
+    let fake = FakeLlama::start(&[]).await;
+    let api = TestApi::start(fake.addr).await;
+    let first = api.queue.acquire(None).await;
+    let waiters: Vec<_> = (0..MAX_OUTSTANDING_JOBS - 1)
+        .map(|index| {
+            let queue = Arc::clone(&api.queue);
+            tokio::spawn(async move { queue.acquire(Some(format!("queued-{index}"))).await })
+        })
+        .collect();
+    tokio::time::sleep(POLL_INTERVAL * 3).await;
+
+    let response = api.post_chat(&chat_body("overflow")).await;
+    assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(api.queue.jobs().len(), MAX_OUTSTANDING_JOBS);
+
+    first.complete();
+    for waiter in waiters {
+        waiter.await.unwrap().complete();
+    }
+    api.stop().await;
+}
+
+#[tokio::test]
 async fn upstream_failures_mark_jobs_failed() {
     let fake = FakeLlama::start(&["--fail-completions"]).await;
     let api = TestApi::start(fake.addr).await;
@@ -397,14 +551,25 @@ async fn upstream_failures_mark_jobs_failed() {
     assert_eq!(jobs[0]["request_id"], request_id.as_str());
     assert!(jobs[0]["error"].as_str().unwrap().contains("500"));
     assert!(api.sink.turns().is_empty());
+    for job in &jobs {
+        let reason = api.sink.failure_reason(job["request_id"].as_str().unwrap());
+        assert_eq!(job["error"], reason.as_str());
+    }
     api.stop().await;
 
     let unreachable = TestApi::start(free_loopback_addr()).await;
     let response = unreachable.post_chat(&chat_body("hi")).await;
     assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+    let request_id = request_id_of(&response);
     let jobs = unreachable.jobs().await;
     assert_eq!(jobs[0]["status"], "failed");
     assert!(jobs[0]["error"].as_str().unwrap().contains("upstream"));
+    assert!(
+        unreachable
+            .sink
+            .failure_reason(&request_id)
+            .contains("upstream")
+    );
     unreachable.stop().await;
 }
 
@@ -446,6 +611,7 @@ async fn invalid_success_replies_fail_job_and_are_not_saved_to_history() {
         assert_eq!(jobs[0]["status"], "failed");
         assert!(jobs[0]["error"].as_str().is_some());
         assert!(api.sink.turns().is_empty());
+        api.sink.failure_reason(&request_id);
 
         api.stop().await;
         server.abort();
@@ -472,6 +638,7 @@ async fn non_loopback_listen_address_is_refused() {
     let config = ApiConfig {
         listen: "0.0.0.0:0".parse().unwrap(),
         upstream: free_loopback_addr(),
+        peers: Arc::new(Mutex::new(PeerTable::new())),
     };
     let result = tokio::time::timeout(
         WAIT_LIMIT,

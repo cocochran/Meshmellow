@@ -14,7 +14,12 @@
 //!    ([`ShardManifest::load`]), including the v1 topology rules.
 //! 2. Accept control connections, heartbeating to each connected worker every
 //!    `heartbeat_interval` so it can tell when the leader is gone. llama: wait until every remote worker has said hello. shard:
-//!    `shard-serve` workers open no control link, so there is nothing to wait for.
+//!    `shard-serve` workers open no control link, so there is nothing to wait for. With an
+//!    EXPERIMENTAL ring manifest (`"execution": "ring"`) the endpoint also accepts the shard-ring
+//!    ALPN, and one accept loop dispatches by ALPN: control connections get the same
+//!    heartbeat-capable sessions as always, ring connections go to the result-channel registry
+//!    ([`ResultChannels`]) through which the ring's terminal worker returns tokens, and anything
+//!    else is closed.
 //! 3. Start the upstream. llama: one RPC bridge per remote worker, all sharing the leader's
 //!    endpoint, then `llama-server` with the plan's `server_args`, waiting for `/health`. shard:
 //!    the shard front end ([`serve_frontend`]) in-process, dialling remote stages by node ID
@@ -51,6 +56,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail, ensure};
+use iroh::endpoint::{Connection, Incoming};
 use iroh::{Endpoint, EndpointId};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
@@ -72,6 +78,8 @@ use crate::replication::{LeaderReplication, ReplicatingSink, ReplicationConfig};
 use crate::rpc_bridge::{BridgeMapping, LeaderBridges};
 use crate::shard::frontend::{FrontendConfig, serve_frontend};
 use crate::shard::manifest::ShardManifest;
+use crate::shard::ring::RING_ALPN;
+use crate::shard::ring_origin::{ResultChannels, RingSettings};
 
 /// Internal loopback port the backend (`llama-server` or the shard front end) listens on unless
 /// configured otherwise.
@@ -127,6 +135,9 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Longest error body from the upstream quoted in a probe failure.
 const PROBE_ERROR_BODY_CHARS: usize = 512;
 
+/// Maximum bytes read while constructing a probe error message; UTF-8 needs at most four per char.
+const PROBE_ERROR_BODY_BYTES: usize = PROBE_ERROR_BODY_CHARS * 4;
+
 /// Delay before the shard backend's first probe retry; it doubles after every failed attempt.
 const PROBE_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 
@@ -136,6 +147,10 @@ const PROBE_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(2);
 /// How long the shard front end may take to start listening. It hashes every local stage file
 /// that has an `artifact_sha256` first, which takes a while for a multi-gigabyte shard.
 const SHARD_FRONTEND_READY_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Close reason for a connection on an ALPN the leader does not serve; sent with
+/// [`PEER_NOT_APPROVED`], as for any peer the leader will not talk to.
+const UNSUPPORTED_PROTOCOL_REASON: &[u8] = b"unsupported protocol";
 
 /// How often the worker wait re-checks the peer table.
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -247,6 +262,9 @@ pub struct LlamaBackendConfig {
 pub struct ShardBackendConfig {
     /// Shard manifest JSON ([`ShardManifest`]): the runner, the model identity and the stages.
     pub manifest_path: PathBuf,
+    /// Used only by an EXPERIMENTAL ring manifest: the result-channel registry the leader's
+    /// accept loop feeds, and how long a ring may take to become ready.
+    pub ring: RingSettings,
 }
 
 /// Runs the leader on a freshly bound endpoint until Ctrl-C, then shuts everything down in order.
@@ -542,7 +560,7 @@ async fn start(
 ) -> anyhow::Result<Running> {
     let backend = match prepared {
         Prepared::Llama(llama) => start_llama(endpoint, config, llama, peers).await?,
-        Prepared::Shard(manifest) => start_shard(endpoint, config, manifest.clone()).await?,
+        Prepared::Shard(manifest) => start_shard(endpoint, config, manifest.clone(), ring).await?,
     };
     let (api_stop, api) = start_api(config, sink);
     Ok(Running {
@@ -580,9 +598,10 @@ async fn start_shard(
     endpoint: &Endpoint,
     config: &LeaderConfig,
     manifest: ShardManifest,
+    ring: Option<RingSettings>,
 ) -> anyhow::Result<Backend> {
     let upstream = upstream_addr(config.upstream_port);
-    let (stop, mut frontend) = spawn_frontend(endpoint, upstream, manifest);
+    let (stop, mut frontend) = spawn_frontend(endpoint, upstream, manifest, ring);
     if let Err(error) = shard_ready(&mut frontend, upstream, config.worker_wait).await {
         stop_server(SHARD_FRONTEND_NAME, stop, frontend).await;
         return Err(error);
@@ -591,17 +610,20 @@ async fn start_shard(
 }
 
 /// Starts the shard front end on `listen` in the background, dialling remote stages from
-/// `endpoint`; sending on (or dropping) the returned sender stops it.
+/// `endpoint` (with `ring` for a ring manifest); sending on (or dropping) the returned sender
+/// stops it.
 fn spawn_frontend(
     endpoint: &Endpoint,
     listen: SocketAddr,
     manifest: ShardManifest,
+    ring: Option<RingSettings>,
 ) -> (oneshot::Sender<()>, JoinSet<anyhow::Result<()>>) {
     let (stop, stopped) = oneshot::channel::<()>();
     let config = FrontendConfig {
         listen,
         manifest,
         endpoint: endpoint.clone(),
+        ring,
     };
     let mut frontend = JoinSet::new();
     frontend.spawn(serve_frontend(config, async move {
@@ -941,8 +963,32 @@ async fn probe_generation(upstream: SocketAddr, server: &str) -> anyhow::Result<
         .with_context(|| format!("readiness probe: request to {server} failed"))?;
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        let body: String = body.chars().take(PROBE_ERROR_BODY_CHARS).collect();
+        let mut response = response;
+        let mut bytes = Vec::with_capacity(PROBE_ERROR_BODY_BYTES);
+        let mut truncated = response
+            .content_length()
+            .is_some_and(|length| length > PROBE_ERROR_BODY_BYTES as u64);
+        while bytes.len() < PROBE_ERROR_BODY_BYTES {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    let remaining = PROBE_ERROR_BODY_BYTES - bytes.len();
+                    let copied = remaining.min(chunk.len());
+                    bytes.extend_from_slice(&chunk[..copied]);
+                    if copied < chunk.len() || bytes.len() == PROBE_ERROR_BODY_BYTES {
+                        truncated = true;
+                        break;
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        let mut body: String = String::from_utf8_lossy(&bytes)
+            .chars()
+            .take(PROBE_ERROR_BODY_CHARS)
+            .collect();
+        if truncated {
+            body.push('…');
+        }
         bail!("readiness probe: {server} answered {status}: {body}");
     }
     let reply: Value = response
@@ -975,6 +1021,7 @@ fn start_api(
     let api_config = ApiConfig {
         listen: config.api_addr,
         upstream: upstream_addr(config.upstream_port),
+        peers: Arc::clone(peers),
     };
     let mut api = JoinSet::new();
     api.spawn(api::serve_api(

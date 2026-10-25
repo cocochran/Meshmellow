@@ -43,6 +43,7 @@ use tokio::task::JoinSet;
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
+use crate::config::read_file_limited;
 use crate::node::{NodeId, PeerTable};
 use crate::protocol::{self, CONTROL_ALPN, Heartbeat, Hello, Message, PROTOCOL_VERSION};
 
@@ -51,6 +52,18 @@ pub type SharedPeerTable = Arc<Mutex<PeerTable>>;
 
 /// Longest a peer may take to complete the hello exchange before the connection is dropped.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum control sessions served by one endpoint.
+const MAX_CONTROL_SESSIONS: usize = 128;
+
+/// Maximum concurrent unidirectional streams accepted within one control session.
+const MAX_CONTROL_STREAM_READERS: usize = 16;
+
+/// Control handshakes contain only identity fields; keep them far below the general wire limit.
+const MAX_HELLO_FRAME_LEN: usize = 64 * 1024;
+
+/// Heartbeat streams carry only a node ID, epoch, and sequence number.
+const MAX_HEARTBEAT_FRAME_LEN: usize = 1024;
 
 /// QUIC application close code for a connection dropped because its hello exchange failed.
 const HELLO_REJECTED_CODE: u32 = 1;
@@ -161,11 +174,28 @@ const SECRET_KEY_LEN: usize = 32;
 #[cfg(unix)]
 const OWNER_ONLY_MODE: u32 = 0o600;
 
+/// Encoded secret keys are 64 hex characters; allow a small amount of surrounding whitespace.
+const MAX_SECRET_KEY_FILE_BYTES: usize = 128;
+
 /// Loads the secret key at `key_path` (creating and saving it if absent) and binds an endpoint accepting `alpns`.
 ///
 /// Uses the n0 defaults: public relays plus DNS address lookup, so peers can dial by node ID alone.
 pub async fn bind_endpoint(key_path: &Path, alpns: Vec<Vec<u8>>) -> anyhow::Result<Endpoint> {
-    bind_with_preset(key_path, alpns, presets::N0).await
+    bind_endpoint_with_key(load_or_create_secret_key(key_path)?, alpns).await
+}
+
+/// Shares the core's Internet-capable endpoint configuration with embedded apps
+/// that already own a persisted identity. Does not replace or migrate that key.
+pub async fn bind_endpoint_with_key(
+    key: SecretKey,
+    alpns: Vec<Vec<u8>>,
+) -> anyhow::Result<Endpoint> {
+    Ok(endpoint_builder_with_key(key, alpns).bind().await?)
+}
+
+/// The core transport defaults, also used by mobile embeddings and relay tests.
+pub fn endpoint_builder_with_key(key: SecretKey, alpns: Vec<Vec<u8>>) -> iroh::endpoint::Builder {
+    Endpoint::builder(presets::N0).secret_key(key).alpns(alpns)
 }
 
 /// Like [`bind_endpoint`] but with no relays and no address lookup, for tests and isolated LANs.
@@ -301,6 +331,16 @@ pub async fn accept_peer(
     peers: &SharedPeerTable,
 ) -> anyhow::Result<PeerSession> {
     let connection = incoming.await.context("incoming connection failed")?;
+    accept_peer_connection(connection, local, peers).await
+}
+
+/// Completes the core hello after a protocol router has authenticated and admitted
+/// a connection. The caller must enforce its membership policy before calling.
+pub async fn accept_peer_connection(
+    connection: Connection,
+    local: &Hello,
+    peers: &SharedPeerTable,
+) -> anyhow::Result<PeerSession> {
     let (hello, token) =
         finish_handshake(&connection, acceptor_handshake(&connection, local, peers)).await?;
     Ok(PeerSession::start(connection, hello, token, peers))
@@ -343,6 +383,7 @@ pub async fn serve_control_routed(
         heartbeat_timeout: nonzero(options.heartbeat_timeout),
         heartbeat_interval: nonzero(options.heartbeat_interval),
     };
+    let session_slots = Arc::new(Semaphore::new(MAX_CONTROL_SESSIONS));
     let mut sessions = JoinSet::new();
     while let Some(incoming) = endpoint.accept().await {
         let local = Arc::clone(&local);
@@ -377,7 +418,35 @@ async fn run_control_session(
     options: ControlOptions,
     mailbox: Option<&Mailbox>,
 ) {
-    match accept_peer(incoming, local, peers).await {
+    let accepted = accept_peer(incoming, local, peers).await;
+    run_accepted_session(accepted, local, peers, options).await;
+}
+
+/// Like the sessions [`serve_control_with`] runs, for a connection that an accept loop serving
+/// several ALPNs has already accepted on [`CONTROL_ALPN`]: hello, heartbeats both ways and the
+/// heartbeat timeout as `options` set them, until the peer disconnects.
+pub async fn serve_control_connection(
+    connection: Connection,
+    local: &Hello,
+    peers: &SharedPeerTable,
+    options: ControlOptions,
+) {
+    let options = ControlOptions {
+        heartbeat_timeout: nonzero(options.heartbeat_timeout),
+        heartbeat_interval: nonzero(options.heartbeat_interval),
+    };
+    let accepted = accept_peer_connection(connection, local, peers).await;
+    run_accepted_session(accepted, local, peers, options).await;
+}
+
+/// Runs a handshaken control session until the peer disconnects, or logs why the hello failed.
+async fn run_accepted_session(
+    accepted: anyhow::Result<PeerSession>,
+    local: &Hello,
+    peers: &SharedPeerTable,
+    options: ControlOptions,
+) {
+    match accepted {
         Ok(session) => {
             let watchdog = HeartbeatWatchdog::new(options.heartbeat_timeout, Arming::AtStart);
             let sender = send_heartbeats(
@@ -594,11 +663,21 @@ async fn receive_control_streams(
     inbox: Option<&Inbox>,
 ) -> ConnectionError {
     let accepted_heartbeat = Arc::new(Notify::new());
+    let stream_slots = Arc::new(Semaphore::new(MAX_CONTROL_STREAM_READERS));
     let mut streams = JoinSet::new();
+    let mut stream_limit_logged = false;
     loop {
         tokio::select! {
             accepted = session.connection().accept_uni() => match accepted {
-                Ok(recv) => {
+                Ok(mut recv) => {
+                    let Ok(permit) = stream_slots.clone().try_acquire_owned() else {
+                        let _ = recv.stop(0u32.into());
+                        if !stream_limit_logged {
+                            warn!(peer = %session.node_id(), limit = MAX_CONTROL_STREAM_READERS, "control stream reader limit reached; refusing extra streams");
+                            stream_limit_logged = true;
+                        }
+                        continue;
+                    };
                     let reader = StreamReader {
                         peer: session.node_id(),
                         connection_token: session.connection_token(),
@@ -606,11 +685,18 @@ async fn receive_control_streams(
                         accepted_heartbeat: Arc::clone(&accepted_heartbeat),
                         inbox: inbox.cloned(),
                     };
-                    streams.spawn(reader.run(recv));
+                    streams.spawn(async move {
+                        let _permit = permit;
+                        reader.run(recv).await;
+                    });
                 }
                 Err(reason) => return reason,
             },
-            Some(_) = streams.join_next(), if !streams.is_empty() => {}
+            Some(result) = streams.join_next(), if !streams.is_empty() => {
+                if let Err(error) = result {
+                    warn!(peer = %session.node_id(), %error, "control stream reader task failed");
+                }
+            }
             () = accepted_heartbeat.notified() => watchdog.reset(),
             () = watchdog.expired() => {
                 return close_for_heartbeat_timeout(session, watchdog.timeout).await;
@@ -649,7 +735,7 @@ impl StreamReader {
     async fn run(self, mut recv: RecvStream) {
         let peer = self.peer;
         loop {
-            match protocol::read_frame(&mut recv).await {
+            match protocol::read_frame_with_limit(&mut recv, MAX_HEARTBEAT_FRAME_LEN).await {
                 Ok(Some(Message::Heartbeat(heartbeat))) => self.on_heartbeat(&heartbeat),
                 Ok(Some(other)) => self.on_other(other),
                 Ok(None) => return,
@@ -802,7 +888,7 @@ impl Drop for PendingPeerRegistration<'_> {
 }
 
 async fn read_hello(recv: &mut RecvStream) -> anyhow::Result<Hello> {
-    match protocol::read_frame(recv).await? {
+    match protocol::read_frame_with_limit(recv, MAX_HELLO_FRAME_LEN).await? {
         Some(Message::Hello(hello)) => Ok(hello),
         Some(other) => bail!("expected Hello, got {other:?}"),
         None => bail!("peer closed the stream before sending Hello"),
@@ -869,8 +955,9 @@ async fn bind_with_preset(
 
 /// Reads the hex-encoded secret key at `path`, or generates one and writes it there.
 fn load_or_create_secret_key(path: &Path) -> anyhow::Result<SecretKey> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => text
+    match read_file_limited(path, MAX_SECRET_KEY_FILE_BYTES) {
+        Ok(bytes) => String::from_utf8(bytes)
+            .context("secret key file is not valid UTF-8")?
             .trim()
             .parse()
             .with_context(|| format!("invalid secret key in {}", path.display())),
@@ -983,6 +1070,18 @@ mod tests {
     fn corrupt_key_file_is_an_error() {
         let path = temp_key_path("corrupt");
         std::fs::write(&path, "not a key").expect("write key");
+
+        let result = load_or_create_secret_key(&path);
+        std::fs::remove_file(&path).expect("remove key");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn oversized_secret_key_file_is_rejected() {
+        let path = temp_key_path("oversized");
+        std::fs::write(&path, vec![b'0'; MAX_SECRET_KEY_FILE_BYTES + 1])
+            .expect("write oversized key");
 
         let result = load_or_create_secret_key(&path);
         std::fs::remove_file(&path).expect("remove key");

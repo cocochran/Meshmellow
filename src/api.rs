@@ -6,13 +6,15 @@
 //! are relayed chunk by chunk as they arrive; the assistant text is assembled on the side for
 //! the [`HistorySink`]. A streamed reply completes only after a valid `[DONE]` terminator;
 //! truncated, malformed or error-bearing SSE fails the job without committing history.
-//! `GET /jobs` lists job states.
+//! The sink sees each running job's lifecycle: `started` when it gets the permit, then either
+//! `record` with the completed turn or `ended` with a [`TurnOutcome`].
+//! `GET /jobs` lists job states and `GET /peers` lists peers with authenticated control links.
 
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use axum::body::{Body, Bytes};
@@ -23,18 +25,23 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::{Stream, StreamExt, stream};
+use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-use crate::history::{CompletedTurn, HistorySink};
-use crate::jobs::{JobInfo, JobPermit, JobQueue};
+use crate::history::{CompletedTurn, HistorySink, StartedTurn, TurnOutcome};
+use crate::jobs::{JobInfo, JobPermit, JobQueue, MAX_OUTSTANDING_JOBS};
+use crate::network::SharedPeerTable;
 
 /// OpenAI-compatible chat endpoint, served here and by llama-server.
 pub const CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
 
 /// Lists every tracked job as JSON.
 pub const JOBS_PATH: &str = "/jobs";
+
+/// Lists peers with an authenticated control connection to this leader.
+pub const PEERS_PATH: &str = "/peers";
 
 /// Browser client served by the leader at the root path.
 pub const WEB_CLIENT_PATH: &str = "/";
@@ -58,6 +65,15 @@ const SSE_DATA_PREFIX: &str = "data:";
 /// Payload that ends an OpenAI-style event stream.
 const SSE_DONE: &str = "[DONE]";
 
+/// Largest buffered SSE event line before the upstream stream is rejected as invalid.
+const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
+
+/// Largest non-streaming upstream response retained in memory.
+const MAX_BUFFERED_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Largest assistant response retained for conversation history; streaming to the client can continue.
+const MAX_HISTORY_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
 /// JSON pointer to the assistant text in a non-streamed chat completion.
 const MESSAGE_CONTENT_POINTER: &str = "/choices/0/message/content";
 
@@ -65,12 +81,14 @@ const MESSAGE_CONTENT_POINTER: &str = "/choices/0/message/content";
 const DELTA_CONTENT_POINTER: &str = "/choices/0/delta/content";
 
 /// Where the API listens and where llama-server is.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ApiConfig {
     /// Address to serve on; must be loopback, anything else is refused.
     pub listen: SocketAddr,
     /// llama-server's HTTP address.
     pub upstream: SocketAddr,
+    /// Authenticated peers currently connected to the leader.
+    pub peers: SharedPeerTable,
 }
 
 /// State shared by every request handler.
@@ -81,13 +99,13 @@ struct ApiState {
     upstream_url: String,
 }
 
-/// Serves `POST /v1/chat/completions` and `GET /jobs` on `config.listen` until `shutdown`
-/// resolves, then finishes in-flight requests and returns.
+/// Serves chat completions, job status, and connected-peer status on `config.listen` until
+/// `shutdown` resolves, then finishes in-flight requests and returns.
 ///
 /// Each chat request acquires a permit from `queue`, has its optional `conversation_id`
 /// stripped, and is forwarded to llama-server (streaming or not). The permit is completed on
 /// success, failed on an upstream error or non-2xx reply, and canceled if the client
-/// disconnects. Completed turns go to `sink`.
+/// disconnects. `sink` is told when each job starts and how it ends (see [`HistorySink`]).
 pub async fn serve_api(
     config: ApiConfig,
     queue: Arc<JobQueue>,
@@ -95,6 +113,53 @@ pub async fn serve_api(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     ensure_loopback(config.listen)?;
+    let profiles = match std::env::var_os("LAYERCAKE_PROFILE_CONFIG") {
+        Some(path) => {
+            Some(crate::profiling::ProfileManager::from_file(std::path::Path::new(&path)).await?)
+        }
+        None => None,
+    };
+    serve_api_with_profiles(config, queue, sink, profiles, shutdown).await
+}
+
+/// Existing API with optional managed profiling; native execution must share admission.
+pub async fn serve_api_with_profiles(
+    config: ApiConfig,
+    queue: Arc<JobQueue>,
+    sink: Arc<dyn HistorySink>,
+    profiles: Option<crate::profiling::ProfileManager>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
+    ensure_loopback(config.listen)?;
+    let mut router = queued_router(config.upstream, queue, sink)?
+        .merge(peer_router(config.peers))
+        .route(WEB_CLIENT_PATH, get(web_client));
+    if let Some(profiles) = &profiles {
+        router = router.merge(profiles.router());
+    }
+    let listener = TcpListener::bind(config.listen)
+        .await
+        .with_context(|| format!("failed to bind api listener on {}", config.listen))?;
+    let local = listener
+        .local_addr()
+        .context("failed to read api listener address")?;
+    info!(listen = %local, upstream = %config.upstream, "api listening");
+    let result = axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown)
+        .await
+        .context("api server failed");
+    if let Some(profiles) = profiles {
+        profiles.shutdown().await?;
+    }
+    result
+}
+
+/// Reusable queued inference routes for the integrated desktop runtime.
+pub fn queued_router(
+    upstream: SocketAddr,
+    queue: Arc<JobQueue>,
+    sink: Arc<dyn HistorySink>,
+) -> anyhow::Result<Router> {
     let client = reqwest::Client::builder()
         .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
         .build()
@@ -103,25 +168,14 @@ pub async fn serve_api(
         queue,
         sink,
         client,
-        upstream_url: format!("http://{}{CHAT_COMPLETIONS_PATH}", config.upstream),
+        upstream_url: format!("http://{}{CHAT_COMPLETIONS_PATH}", upstream),
     });
     let router = Router::new()
-        .route(WEB_CLIENT_PATH, get(web_client))
         .route(CHAT_COMPLETIONS_PATH, post(chat_completions))
         .route(JOBS_PATH, get(list_jobs))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state);
-    let listener = TcpListener::bind(config.listen)
-        .await
-        .with_context(|| format!("failed to bind api listener on {}", config.listen))?;
-    let local = listener
-        .local_addr()
-        .context("failed to read api listener address")?;
-    info!(listen = %local, upstream = %config.upstream, "api listening");
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown)
-        .await
-        .context("api server failed")
+    Ok(router)
 }
 
 async fn web_client() -> Html<&'static str> {
@@ -142,10 +196,12 @@ pub async fn prompt(api: SocketAddr, text: &str) -> anyhow::Result<String> {
         .await
         .with_context(|| format!("failed to reach the api at {api}"))?;
     let status = response.status();
-    let body = response
-        .bytes()
+    let chunks = response
+        .bytes_stream()
+        .map(|chunk| chunk.context("failed to read the api reply body"));
+    let body = collect_upstream_chunks(Box::pin(chunks), MAX_BUFFERED_RESPONSE_BYTES)
         .await
-        .context("failed to read the api reply")?;
+        .context("failed to read bounded api reply")?;
     if !status.is_success() {
         bail!("api returned {status}: {}", String::from_utf8_lossy(&body));
     }
@@ -166,37 +222,88 @@ async fn list_jobs(State(state): State<Arc<ApiState>>) -> Json<Vec<JobInfo>> {
     Json(state.queue.jobs())
 }
 
+#[derive(Serialize)]
+pub struct PeerSummary {
+    /// Authenticated Iroh endpoint ID in its canonical display form.
+    pub node_id: String,
+    /// Unix milliseconds when this peer's current control connection was recorded.
+    pub connected_at_unix_ms: u64,
+    /// Unix milliseconds of the last accepted heartbeat, if one has arrived.
+    pub last_heartbeat_unix_ms: Option<u64>,
+}
+
+/// Read-only authenticated control peers, independently of inference readiness.
+pub fn peer_router(peers: SharedPeerTable) -> Router {
+    Router::new()
+        .route(PEERS_PATH, get(list_peers))
+        .with_state(peers)
+}
+
+async fn list_peers(
+    State(peers): State<SharedPeerTable>,
+) -> Result<Json<Vec<PeerSummary>>, StatusCode> {
+    peer_snapshot(&peers).map(Json)
+}
+
+/// Shared projection for the API and the embedded dashboard.
+pub fn peer_snapshot(table: &SharedPeerTable) -> Result<Vec<PeerSummary>, StatusCode> {
+    let peers = table.lock().map_err(|error| {
+        warn!(%error, "peer table lock poisoned; refusing to report peer status");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let mut summaries = peers
+        .peers()
+        .map(|peer| PeerSummary {
+            node_id: peer.node_id.to_string(),
+            connected_at_unix_ms: peer.connected_at_unix_ms,
+            last_heartbeat_unix_ms: peer.last_heartbeat_unix_ms,
+        })
+        .collect::<Vec<_>>();
+    summaries.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    Ok(summaries)
+}
+
 async fn chat_completions(State(state): State<Arc<ApiState>>, body: Bytes) -> Response {
     let (request, conversation_id) = match parse_chat_request(&body) {
         Ok(parsed) => parsed,
         Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
     };
-    let permit = state.queue.acquire(conversation_id.clone()).await;
+    let queued_at = Instant::now();
+    let Some(permit) = state.queue.try_acquire(conversation_id.clone()).await else {
+        debug!(
+            limit = MAX_OUTSTANDING_JOBS,
+            "inference queue is full; rejecting request"
+        );
+        return error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "inference queue is full; retry after a running job finishes",
+        );
+    };
+    let queue_wait_ms = queued_at.elapsed().as_millis();
     let is_streaming = request.get("stream").and_then(Value::as_bool) == Some(true);
     info!(
         request_id = permit.request_id(),
-        is_streaming, "job running"
+        queue_wait_ms, is_streaming, "job running"
     );
-    let turn = PendingTurn {
+    let turn = StartedTurn {
         request_id: permit.request_id().to_owned(),
         conversation_id,
         request,
     };
-    let send = state.client.post(&state.upstream_url).json(&turn.request);
+    let finish = JobFinish::start(permit, turn, Arc::clone(&state.sink));
+    let send = state
+        .client
+        .post(&state.upstream_url)
+        .json(&finish.turn.request);
     let upstream = match send.send().await {
         Ok(upstream) => upstream,
         Err(err) => {
             let reason = format!("upstream request failed: {err}");
-            return fail_job(permit, StatusCode::BAD_GATEWAY, reason);
+            return fail_job(finish, StatusCode::BAD_GATEWAY, reason);
         }
     };
-    let finish = JobFinish {
-        permit,
-        turn,
-        sink: Arc::clone(&state.sink),
-    };
     if !upstream.status().is_success() {
-        relay_upstream_error(upstream, finish.permit).await
+        relay_upstream_error(upstream, finish).await
     } else if is_streaming {
         relay_stream(upstream, finish)
     } else {
@@ -235,13 +342,12 @@ fn buffered_response_text(body: &[u8]) -> Result<String, String> {
 }
 
 /// Marks the job failed and answers with an OpenAI-style error body.
-fn fail_job(permit: JobPermit, status: StatusCode, reason: String) -> Response {
-    warn!(request_id = permit.request_id(), %reason, "job failed");
+fn fail_job(finish: JobFinish, status: StatusCode, reason: String) -> Response {
     let mut response = error_response(status, &reason);
-    if let Ok(request_id) = HeaderValue::from_str(permit.request_id()) {
+    if let Ok(request_id) = HeaderValue::from_str(finish.request_id()) {
         response.headers_mut().insert(REQUEST_ID_HEADER, request_id);
     }
-    permit.fail(reason);
+    finish.fail(reason);
     response
 }
 
@@ -279,15 +385,20 @@ fn upstream_content_type(upstream: &reqwest::Response) -> Option<HeaderValue> {
 }
 
 /// Passes a non-2xx llama-server reply through unchanged and fails the job.
-async fn relay_upstream_error(upstream: reqwest::Response, permit: JobPermit) -> Response {
+async fn relay_upstream_error(upstream: reqwest::Response, finish: JobFinish) -> Response {
     let status = upstream.status();
     let content_type = upstream_content_type(&upstream);
-    // The status alone explains the failure; an unreadable error body is relayed as empty.
-    let body = upstream.bytes().await.unwrap_or_default();
-    let response = relay_response(status, content_type, permit.request_id(), Body::from(body));
+    // The status alone explains the failure; an unreadable or oversized error body is relayed empty.
+    let body = match buffer_upstream(upstream, MAX_BUFFERED_RESPONSE_BYTES).await {
+        Ok(body) => body,
+        Err(error) => {
+            warn!(request_id = finish.request_id(), %error, "could not buffer upstream error body");
+            Bytes::new()
+        }
+    };
+    let response = relay_response(status, content_type, finish.request_id(), Body::from(body));
     let reason = format!("upstream returned {status}");
-    warn!(request_id = permit.request_id(), %reason, "job failed");
-    permit.fail(reason);
+    finish.fail(reason);
     response
 }
 
@@ -295,28 +406,56 @@ async fn relay_upstream_error(upstream: reqwest::Response, permit: JobPermit) ->
 async fn relay_buffered(upstream: reqwest::Response, finish: JobFinish) -> Response {
     let status = upstream.status();
     let content_type = upstream_content_type(&upstream);
-    let body = match upstream.bytes().await {
+    let body = match buffer_upstream(upstream, MAX_BUFFERED_RESPONSE_BYTES).await {
         Ok(body) => body,
         Err(err) => {
             let reason = format!("failed to read upstream reply: {err}");
-            return fail_job(finish.permit, StatusCode::BAD_GATEWAY, reason);
+            return fail_job(finish, StatusCode::BAD_GATEWAY, reason);
         }
     };
     let response_text = match buffered_response_text(&body) {
         Ok(text) => text,
-        Err(reason) => return fail_job(finish.permit, StatusCode::BAD_GATEWAY, reason),
+        Err(reason) => return fail_job(finish, StatusCode::BAD_GATEWAY, reason),
     };
-    let request_id = &finish.turn.request_id;
-    let response = relay_response(status, content_type, request_id, Body::from(body));
+    let response = relay_response(status, content_type, finish.request_id(), Body::from(body));
     finish.complete(response_text);
     response
+}
+
+/// Collects a non-streaming upstream reply without allowing its body to grow without bound.
+async fn buffer_upstream(upstream: reqwest::Response, limit: usize) -> anyhow::Result<Bytes> {
+    if upstream
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        bail!("upstream response exceeds the {limit}-byte buffering limit");
+    }
+    let chunks = upstream
+        .bytes_stream()
+        .map(|chunk| chunk.context("failed to read upstream response body"));
+    collect_upstream_chunks(Box::pin(chunks), limit).await
+}
+
+async fn collect_upstream_chunks(
+    mut chunks: impl Stream<Item = anyhow::Result<Bytes>> + Unpin,
+    limit: usize,
+) -> anyhow::Result<Bytes> {
+    let mut body = Vec::new();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk?;
+        if body.len().saturating_add(chunk.len()) > limit {
+            bail!("response exceeds the {limit}-byte buffering limit");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(body))
 }
 
 /// Relays a streamed reply chunk by chunk; the job finishes when the stream does.
 fn relay_stream(upstream: reqwest::Response, finish: JobFinish) -> Response {
     let status = upstream.status();
     let content_type = upstream_content_type(&upstream);
-    let request_id = finish.turn.request_id.clone();
+    let request_id = finish.request_id().to_owned();
     let relay = StreamRelay {
         chunks: Box::pin(upstream.bytes_stream()),
         assembler: SseTextAssembler::default(),
@@ -326,38 +465,101 @@ fn relay_stream(upstream: reqwest::Response, finish: JobFinish) -> Response {
     relay_response(status, content_type, &request_id, body)
 }
 
-/// The parts of a running request needed to record its outcome.
-struct PendingTurn {
-    request_id: String,
-    conversation_id: Option<String>,
-    request: Value,
-}
-
-/// Owns a running job's permit until its reply is fully delivered.
+/// Owns a running job's permit until its reply is fully delivered, and reports the job's
+/// lifecycle to the history sink: `started` on creation, then exactly one of `record`
+/// ([`complete`](Self::complete)) or `ended` for failure, cancellation, or a successful response
+/// too large to retain ([`fail`](Self::fail), [`complete_without_history`](Self::complete_without_history),
+/// or drop).
+///
+/// The sink is told before the permit is released, so its calls for this job finish before the
+/// next queued job can start.
 struct JobFinish {
-    permit: JobPermit,
-    turn: PendingTurn,
+    turn: StartedTurn,
     sink: Arc<dyn HistorySink>,
+    /// `Some` until the job's outcome is reported.
+    permit: Option<JobPermit>,
 }
 
 impl JobFinish {
-    /// Completes the job and hands the turn to the history sink.
-    fn complete(self, response_text: String) {
-        info!(request_id = self.permit.request_id(), "job completed");
-        self.permit.complete();
+    /// Takes over a freshly acquired permit and reports the job as started.
+    fn start(permit: JobPermit, turn: StartedTurn, sink: Arc<dyn HistorySink>) -> Self {
+        sink.started(&turn);
+        Self {
+            turn,
+            sink,
+            permit: Some(permit),
+        }
+    }
+
+    fn request_id(&self) -> &str {
+        &self.turn.request_id
+    }
+
+    /// Hands the completed turn to the history sink, then completes the job.
+    fn complete(mut self, response_text: String) {
+        let Some(permit) = self.permit.take() else {
+            return;
+        };
+        info!(request_id = self.request_id(), "job completed");
         self.sink.record(CompletedTurn {
-            request_id: self.turn.request_id,
-            conversation_id: self.turn.conversation_id,
-            request: self.turn.request,
+            request_id: std::mem::take(&mut self.turn.request_id),
+            conversation_id: self.turn.conversation_id.take(),
+            request: self.turn.request.take(),
             response_text,
         });
+        permit.complete();
+    }
+
+    /// Completes the job but avoids retaining a response larger than the history limit.
+    fn complete_without_history(mut self) {
+        let Some(permit) = self.permit.take() else {
+            return;
+        };
+        warn!(
+            request_id = self.request_id(),
+            limit_bytes = MAX_HISTORY_RESPONSE_BYTES,
+            "job completed but response was too large to retain in history"
+        );
+        self.sink.ended(
+            self.request_id(),
+            TurnOutcome::CompletedWithoutHistory {
+                limit_bytes: MAX_HISTORY_RESPONSE_BYTES,
+            },
+        );
+        permit.complete();
+    }
+
+    /// Reports the failure to the history sink, then fails the job with the same reason.
+    fn fail(mut self, reason: String) {
+        let Some(permit) = self.permit.take() else {
+            return;
+        };
+        warn!(request_id = self.request_id(), %reason, "job failed");
+        let outcome = TurnOutcome::Failed {
+            reason: reason.clone(),
+        };
+        self.sink.ended(self.request_id(), outcome);
+        permit.fail(reason);
+    }
+}
+
+impl Drop for JobFinish {
+    /// Dropped without an outcome: the client went away, so the job is canceled.
+    fn drop(&mut self) {
+        let Some(permit) = self.permit.take() else {
+            return;
+        };
+        info!(request_id = self.request_id(), "job canceled");
+        self.sink.ended(self.request_id(), TurnOutcome::Canceled);
+        // Dropping the permit without an outcome marks the job canceled and frees the slot.
+        drop(permit);
     }
 }
 
 type UpstreamChunks = Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>;
 
 /// State of one streamed reply. Dropping it before the upstream stream ends (the client
-/// disconnected) drops the permit, which cancels the job.
+/// disconnected) drops the [`JobFinish`], which cancels the job.
 struct StreamRelay {
     chunks: UpstreamChunks,
     assembler: SseTextAssembler,
@@ -375,19 +577,20 @@ impl StreamRelay {
                 Some((Ok(chunk), self))
             }
             Some(Err(err)) => {
-                let reason = format!("upstream stream failed: {err}");
-                warn!(request_id = finish.permit.request_id(), %reason, "job failed");
-                finish.permit.fail(reason);
+                finish.fail(format!("upstream stream failed: {err}"));
                 Some((Err(std::io::Error::other(err)), self))
             }
             None => match std::mem::take(&mut self.assembler).finish() {
-                Ok(text) => {
+                Ok(Some(text)) => {
                     finish.complete(text);
                     None
                 }
+                Ok(None) => {
+                    finish.complete_without_history();
+                    None
+                }
                 Err(reason) => {
-                    warn!(request_id = finish.permit.request_id(), %reason, "job failed");
-                    finish.permit.fail(reason.to_owned());
+                    finish.fail(reason.to_owned());
                     Some((
                         Err(std::io::Error::new(
                             std::io::ErrorKind::UnexpectedEof,
@@ -410,14 +613,43 @@ struct SseTextAssembler {
     text: String,
     done: bool,
     invalid: bool,
+    history_limited: bool,
 }
 
 impl SseTextAssembler {
     fn push(&mut self, bytes: &[u8]) {
-        self.partial_line.extend_from_slice(bytes);
-        while let Some(newline) = self.partial_line.iter().position(|&byte| byte == b'\n') {
-            let line: Vec<u8> = self.partial_line.drain(..=newline).collect();
+        if self.invalid {
+            return;
+        }
+
+        let mut offset = 0;
+        while let Some(relative_newline) = bytes[offset..].iter().position(|&byte| byte == b'\n') {
+            let line_end = offset + relative_newline + 1;
+            let line_len = self.partial_line.len().saturating_add(line_end - offset);
+            if line_len > MAX_SSE_LINE_BYTES {
+                self.invalid = true;
+                self.partial_line.clear();
+                return;
+            }
+
+            let mut line = std::mem::take(&mut self.partial_line);
+            line.extend_from_slice(&bytes[offset..line_end]);
             self.absorb_line(&line);
+            line.clear();
+            self.partial_line = line;
+            if self.invalid {
+                self.partial_line.clear();
+                return;
+            }
+            offset = line_end;
+        }
+
+        let remaining = &bytes[offset..];
+        if self.partial_line.len().saturating_add(remaining.len()) > MAX_SSE_LINE_BYTES {
+            self.invalid = true;
+            self.partial_line.clear();
+        } else {
+            self.partial_line.extend_from_slice(remaining);
         }
     }
 
@@ -431,7 +663,11 @@ impl SseTextAssembler {
         };
         let data = data.trim_start();
         if data == SSE_DONE {
-            self.done = true;
+            if self.done {
+                self.invalid = true;
+            } else {
+                self.done = true;
+            }
             return;
         }
         if self.done {
@@ -447,12 +683,17 @@ impl SseTextAssembler {
             return;
         }
         if let Some(fragment) = chunk.pointer(DELTA_CONTENT_POINTER).and_then(Value::as_str) {
-            self.text.push_str(fragment);
+            if self.text.len().saturating_add(fragment.len()) > MAX_HISTORY_RESPONSE_BYTES {
+                self.text = String::new();
+                self.history_limited = true;
+            } else if !self.history_limited {
+                self.text.push_str(fragment);
+            }
         }
     }
 
     /// A complete response must end with [DONE], including without a final newline.
-    fn finish(mut self) -> Result<String, &'static str> {
+    fn finish(mut self) -> Result<Option<String>, &'static str> {
         let rest = std::mem::take(&mut self.partial_line);
         self.absorb_line(&rest);
         if self.invalid {
@@ -461,7 +702,7 @@ impl SseTextAssembler {
         if !self.done {
             return Err("upstream SSE ended before [DONE]");
         }
-        Ok(self.text)
+        Ok((!self.history_limited).then_some(self.text))
     }
 }
 
@@ -471,18 +712,50 @@ mod tests {
     use crate::jobs::JobStatus;
     use std::sync::Mutex;
 
-    #[derive(Default)]
-    struct RecordingSink(Mutex<Vec<CompletedTurn>>);
+    /// One history hook call, keyed by the job's request ID.
+    #[derive(Debug, PartialEq)]
+    enum Hook {
+        Started(String),
+        Recorded {
+            request_id: String,
+            response_text: String,
+        },
+        Ended(String, TurnOutcome),
+    }
 
-    impl HistorySink for RecordingSink {
-        fn record(&self, turn: CompletedTurn) {
-            self.0.lock().unwrap().push(turn);
+    #[derive(Default)]
+    struct RecordingSink(Mutex<Vec<Hook>>);
+
+    impl RecordingSink {
+        fn hooks(&self) -> std::sync::MutexGuard<'_, Vec<Hook>> {
+            self.0.lock().unwrap()
         }
     }
 
-    async fn check_stream(events: &str, succeeds: bool) {
-        let queue = Arc::new(JobQueue::new());
-        let sink = Arc::new(RecordingSink::default());
+    impl HistorySink for RecordingSink {
+        fn started(&self, turn: &StartedTurn) {
+            self.hooks().push(Hook::Started(turn.request_id.clone()));
+        }
+
+        fn record(&self, turn: CompletedTurn) {
+            self.hooks().push(Hook::Recorded {
+                request_id: turn.request_id,
+                response_text: turn.response_text,
+            });
+        }
+
+        fn ended(&self, request_id: &str, outcome: TurnOutcome) {
+            self.hooks()
+                .push(Hook::Ended(request_id.to_owned(), outcome));
+        }
+    }
+
+    /// Acquires a permit and wraps `events` (split into 3-byte chunks) in a stream relay.
+    async fn start_relay(
+        queue: &JobQueue,
+        sink: &Arc<RecordingSink>,
+        events: &str,
+    ) -> (StreamRelay, String) {
         let permit = queue.acquire(None).await;
         let request_id = permit.request_id().to_owned();
         let chunks = events
@@ -490,19 +763,23 @@ mod tests {
             .chunks(3)
             .map(|chunk| Ok::<_, reqwest::Error>(Bytes::copy_from_slice(chunk)))
             .collect::<Vec<_>>();
+        let turn = StartedTurn {
+            request_id: request_id.clone(),
+            conversation_id: None,
+            request: json!({}),
+        };
         let relay = StreamRelay {
             chunks: Box::pin(stream::iter(chunks)),
             assembler: SseTextAssembler::default(),
-            finish: Some(JobFinish {
-                permit,
-                turn: PendingTurn {
-                    request_id,
-                    conversation_id: None,
-                    request: json!({}),
-                },
-                sink: sink.clone(),
-            }),
+            finish: Some(JobFinish::start(permit, turn, sink.clone())),
         };
+        (relay, request_id)
+    }
+
+    async fn check_stream(events: &str, succeeds: bool) {
+        let queue = Arc::new(JobQueue::new());
+        let sink = Arc::new(RecordingSink::default());
+        let (relay, request_id) = start_relay(&queue, &sink, events).await;
         let mut remaining = Some(relay);
         let mut failed = false;
         while let Some(relay) = remaining.take() {
@@ -521,16 +798,80 @@ mod tests {
             }
         );
         {
-            let turns = sink.0.lock().unwrap();
-            assert_eq!(turns.len(), usize::from(succeeds));
+            let hooks = sink.hooks();
+            assert_eq!(
+                hooks.len(),
+                2,
+                "started plus exactly one outcome: {hooks:?}"
+            );
+            assert_eq!(hooks[0], Hook::Started(request_id.clone()));
             if succeeds {
-                assert_eq!(turns[0].response_text, "Hello");
+                let recorded = Hook::Recorded {
+                    request_id,
+                    response_text: "Hello".to_owned(),
+                };
+                assert_eq!(hooks[1], recorded);
+            } else {
+                assert!(
+                    matches!(&hooks[1], Hook::Ended(id, TurnOutcome::Failed { .. }) if *id == request_id),
+                    "unexpected outcome: {:?}",
+                    hooks[1]
+                );
             }
         }
         let next = tokio::time::timeout(Duration::from_secs(1), queue.acquire(None))
             .await
             .expect("stream outcome must release the running slot");
         next.complete();
+    }
+
+    #[tokio::test]
+    async fn dropping_a_stream_mid_reply_reports_canceled_once() {
+        let queue = JobQueue::new();
+        let sink = Arc::new(RecordingSink::default());
+        let events = format!("{}data: [DONE]\n\n", delta_event("Hello"));
+        let (relay, request_id) = start_relay(&queue, &sink, &events).await;
+        let (chunk, relay) = relay.next_chunk().await.expect("first chunk");
+        chunk.unwrap();
+        drop(relay);
+        assert_eq!(
+            *sink.hooks(),
+            [
+                Hook::Started(request_id.clone()),
+                Hook::Ended(request_id, TurnOutcome::Canceled),
+            ]
+        );
+        assert_eq!(queue.jobs()[0].status, JobStatus::Canceled);
+    }
+
+    #[tokio::test]
+    async fn completed_response_without_history_reports_terminal_outcome() {
+        let queue = JobQueue::new();
+        let sink = Arc::new(RecordingSink::default());
+        let permit = queue.acquire(None).await;
+        let request_id = permit.request_id().to_owned();
+        let turn = StartedTurn {
+            request_id: request_id.clone(),
+            conversation_id: None,
+            request: json!({}),
+        };
+        let finish = JobFinish::start(permit, turn, sink.clone());
+
+        finish.complete_without_history();
+
+        assert_eq!(queue.jobs()[0].status, JobStatus::Completed);
+        assert_eq!(
+            *sink.hooks(),
+            [
+                Hook::Started(request_id.clone()),
+                Hook::Ended(
+                    request_id,
+                    TurnOutcome::CompletedWithoutHistory {
+                        limit_bytes: MAX_HISTORY_RESPONSE_BYTES,
+                    }
+                ),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -554,6 +895,12 @@ mod tests {
                 false,
             )
             .await;
+        }
+        for trailing in [
+            "data: [DONE]\n\ndata: [DONE]\n\n",
+            "data: [DONE]\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\n",
+        ] {
+            check_stream(&format!("{}{trailing}", delta_event("Hello")), false).await;
         }
     }
 
@@ -607,7 +954,7 @@ mod tests {
         for piece in events.as_bytes().chunks(7) {
             assembler.push(piece);
         }
-        assert_eq!(assembler.finish().unwrap(), "Hello, wörld");
+        assert_eq!(assembler.finish().unwrap(), Some("Hello, wörld".to_owned()));
     }
 
     #[test]
@@ -616,7 +963,33 @@ mod tests {
         assembler.push(delta_event("a").replace('\n', "\r\n").as_bytes());
         assembler.push(delta_event("b").as_bytes());
         assembler.push(b"data: [DONE]");
-        assert_eq!(assembler.finish().unwrap(), "ab");
+        assert_eq!(assembler.finish().unwrap(), Some("ab".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn upstream_buffer_stops_at_its_limit() {
+        let chunks = stream::iter([
+            Ok(Bytes::from_static(b"123")),
+            Ok(Bytes::from_static(b"456")),
+        ]);
+        let error = collect_upstream_chunks(chunks, 5)
+            .await
+            .expect_err("oversized reply must not be buffered");
+        assert!(error.to_string().contains("buffering limit"));
+    }
+
+    #[test]
+    fn oversized_stream_text_is_not_retained_for_history() {
+        let mut assembler = SseTextAssembler {
+            text: "x".repeat(MAX_HISTORY_RESPONSE_BYTES),
+            ..SseTextAssembler::default()
+        };
+        assembler.absorb_line(br#"data: {"choices":[{"delta":{"content":"y"}}]}"#);
+        assembler.done = true;
+
+        assert!(assembler.history_limited);
+        assert!(assembler.text.is_empty());
+        assert_eq!(assembler.finish().unwrap(), None);
     }
 
     #[test]

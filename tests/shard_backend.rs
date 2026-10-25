@@ -19,6 +19,7 @@ use llm_cluster::leader::{BackendConfig, LeaderConfig, ShardBackendConfig, run_l
 use llm_cluster::protocol::{CONTROL_ALPN, RPC_BRIDGE_ALPN};
 use llm_cluster::rpc_bridge::PeerAllowlist;
 use llm_cluster::shard::manifest::sha256_file;
+use llm_cluster::shard::ring_origin::RingSettings;
 use llm_cluster::shard::serve::{ShardServeConfig, serve_shard};
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
@@ -206,6 +207,7 @@ impl Leader {
             cluster_id: CLUSTER_ID.to_owned(),
             backend: BackendConfig::Shard(ShardBackendConfig {
                 manifest_path: dir.join("manifest.json"),
+                ring: RingSettings::default(),
             }),
             upstream_port: free_loopback_addr().await.port(),
             api_addr: free_loopback_addr().await,

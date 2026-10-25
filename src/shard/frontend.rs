@@ -10,6 +10,10 @@
 //!   `seed` are accepted and ignored; `max_tokens` / `max_completion_tokens` are honoured up to
 //!   the manifest's `max_tokens`.
 //!
+//! With an EXPERIMENTAL ring manifest each request instead starts the local stage 0 and a fresh
+//! shard-ring session ([`RingLink`]); [`FrontendConfig::ring`] must then carry the registry the
+//! leader's endpoint delivers result channels to.
+//!
 //! One generation runs at a time; later requests wait for the lock. A failure before any
 //! response bytes are sent is a JSON error with a 5xx status (400 for a prompt longer than
 //! the context). A failure mid-stream sends an SSE `error` event and ends without `[DONE]`,
@@ -51,12 +55,14 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::api::CHAT_COMPLETIONS_PATH;
-use crate::shard::manifest::{ChatTemplate, ShardManifest, StageLocation, StageSpec};
+use crate::shard::manifest::{ShardManifest, StageLocation, StageSpec};
 use crate::shard::manifest::{same_sha256, sha256_file};
 use crate::shard::pipeline::{
     FinishReason, Generation, GenerationLimits, LocalLaunch, METADATA_TIMEOUT, Pipeline,
     PromptTooLong, StageExpectation, StageFault, StageIdentity, StageLink,
 };
+use crate::shard::ring_origin::{RingLink, RingPlan, RingSettings};
+use crate::shard::template::{ChatMessage, ChatRenderer};
 
 /// Liveness probe, as llama-server serves it.
 pub const HEALTH_PATH: &str = "/health";
@@ -76,6 +82,9 @@ const EVENT_STREAM: &str = "text/event-stream";
 /// `Cache-Control` for a streamed reply: proxies must pass chunks through as they come.
 const NO_CACHE: &str = "no-cache";
 
+/// Bounds queued text chunks when a client reads more slowly than inference produces.
+const GENERATION_EVENT_BUFFER: usize = 16;
+
 /// Where the frontend listens, what it serves, and the endpoint remote stages are dialled from.
 pub struct FrontendConfig {
     /// Address to serve on; must be loopback, anything else is refused.
@@ -84,19 +93,74 @@ pub struct FrontendConfig {
     pub manifest: ShardManifest,
     /// Iroh endpoint used to dial remote stages.
     pub endpoint: iroh::Endpoint,
+    /// Required for a ring manifest (`"execution": "ring"`) and ignored otherwise: the registry
+    /// the endpoint's accept loop delivers terminals' result channels to, and the readiness wait.
+    pub ring: Option<RingSettings>,
+}
+
+/// What a ring manifest's generations need besides the manifest.
+struct RingRuntime {
+    plan: RingPlan,
+    settings: RingSettings,
+}
+
+struct ReconcileTask(Option<JoinHandle<()>>);
+impl Drop for ReconcileTask {
+    fn drop(&mut self) {
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
+    }
 }
 
 /// Serves `GET /health` and `POST /v1/chat/completions` on `config.listen` until `shutdown`
 /// resolves, then finishes in-flight requests and returns.
 ///
 /// Before binding it validates the manifest and hashes every local stage file that has a
-/// configured `artifact_sha256` (once, on a blocking thread), failing on any mismatch.
+/// configured `artifact_sha256` (once, on a blocking thread), failing on any mismatch. It also
+/// loads the chat template once ([`ChatRenderer::load`]), refusing a pinned template that is
+/// missing, does not match its `sha256` or does not compile.
 pub async fn serve_frontend(
     config: FrontendConfig,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     ensure_loopback(config.listen)?;
+    let listener = TcpListener::bind(config.listen)
+        .await
+        .with_context(|| format!("failed to bind shard frontend on {}", config.listen))?;
+    serve_frontend_on(config, listener, shutdown).await
+}
+
+/// Serve on a listener already reserved by the owning desktop client.
+pub async fn serve_frontend_on(
+    config: FrontendConfig,
+    listener: TcpListener,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
+    serve_frontend_inner(config, listener, shutdown, None).await
+}
+
+pub async fn serve_client_frontend(
+    config: FrontendConfig,
+    listener: TcpListener,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+    node: crate::mesh::Node,
+) -> anyhow::Result<()> {
+    let automatic = node.compute_enabled().await.then_some(node);
+    serve_frontend_inner(config, listener, shutdown, automatic).await
+}
+
+async fn serve_frontend_inner(
+    config: FrontendConfig,
+    listener: TcpListener,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+    automatic: Option<crate::mesh::Node>,
+) -> anyhow::Result<()> {
+    ensure_loopback(listener.local_addr()?)?;
+    ensure_loopback(config.listen)?;
     config.manifest.validate()?;
+    let ring = ring_runtime(&config.manifest, config.ring)?;
+    let renderer = ChatRenderer::load(&config.manifest.chat_template)?;
     verify_artifacts(&config.manifest).await?;
     let state = Arc::new(FrontendState {
         preferred: config
@@ -107,28 +171,49 @@ pub async fn serve_frontend(
             .collect(),
         manifest: config.manifest,
         endpoint: config.endpoint,
+        ring,
+        renderer,
         generation_lock: Arc::new(Mutex::new(())),
+        automatic,
     });
+    let reconcile = ReconcileTask(state.automatic.as_ref().map(|node| {
+        let node = node.clone();
+        let state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                {
+                    let _turn = state.generation_lock.lock().await;
+                    if let Err(error) = node.prepare_compute_ring(&state.manifest).await {
+                        warn!(%error, "automatic compute route waiting");
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        })
+    }));
     let router = Router::new()
         .route(HEALTH_PATH, get(health))
+        .route("/v1/models", get(|| async {
+            Json(serde_json::json!({"object":"list", "data":[{"id":"meshthing-shard", "object":"model", "owned_by":"layercake"}]}))
+        }))
         .route(CHAT_COMPLETIONS_PATH, post(chat_completions))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state);
-    let listener = TcpListener::bind(config.listen)
-        .await
-        .with_context(|| format!("failed to bind shard frontend on {}", config.listen))?;
     let local = listener
         .local_addr()
         .context("failed to read shard frontend address")?;
     info!(listen = %local, "shard frontend listening");
-    axum::serve(listener, router)
+    let result = axum::serve(listener, router)
         .with_graceful_shutdown(shutdown)
         .await
-        .context("shard frontend failed")
+        .context("shard frontend failed");
+    drop(reconcile);
+    result
 }
 
 /// State shared by every request handler.
 struct FrontendState {
+    automatic: Option<crate::mesh::Node>,
     manifest: ShardManifest,
     endpoint: iroh::Endpoint,
     /// Per stage, the location (an index into [`StageSpec::candidates`]) tried first: the last
@@ -269,7 +354,7 @@ impl MessageContent {
 /// Parses a chat request, renders its prompt, and caps `max_tokens` at `max_tokens_cap`.
 fn parse_chat_request(
     body: &[u8],
-    template: ChatTemplate,
+    renderer: &ChatRenderer,
     max_tokens_cap: u32,
 ) -> Result<ChatRequest, String> {
     let raw: RawChatRequest = serde_json::from_slice(body).map_err(|error| {
@@ -284,31 +369,22 @@ fn parse_chat_request(
     if requested == Some(0) {
         return Err("max_tokens must be at least 1".to_owned());
     }
-    let messages = raw
+    let messages: Vec<ChatMessage> = raw
         .messages
         .into_iter()
-        .map(|message| (message.role, message.content.into_text()));
+        .map(|message| ChatMessage {
+            role: message.role,
+            content: message.content.into_text(),
+        })
+        .collect();
+    let prompt = renderer
+        .render(&messages)
+        .map_err(|error| error.to_string())?;
     Ok(ChatRequest {
-        prompt: render_prompt(template, messages),
+        prompt,
         stream: raw.stream.unwrap_or(false),
         max_tokens: requested.map_or(max_tokens_cap, |asked| asked.min(max_tokens_cap)),
     })
-}
-
-/// Renders `(role, content)` pairs into the prompt string the final stage tokenizes.
-fn render_prompt(
-    template: ChatTemplate,
-    messages: impl Iterator<Item = (String, String)>,
-) -> String {
-    match template {
-        ChatTemplate::Chatml => {
-            let mut prompt: String = messages
-                .map(|(role, content)| format!("<|im_start|>{role}\n{content}<|im_end|>\n"))
-                .collect();
-            prompt.push_str("<|im_start|>assistant\n");
-            prompt
-        }
-    }
 }
 
 /// Progress of one generation, sent from its task to the request handler.
@@ -350,13 +426,17 @@ impl Failure {
     }
 }
 
-/// Aborts the generation task when dropped (the client went away), which drops its stage
-/// links: local runners are killed and remote streams closed.
-struct GenerationTask(JoinHandle<()>);
+/// Signals cancellation when the client goes away; the task remains alive for pipeline cleanup.
+struct GenerationTask {
+    cancel: Option<oneshot::Sender<()>>,
+    _join: JoinHandle<()>,
+}
 
 impl Drop for GenerationTask {
     fn drop(&mut self) {
-        self.0.abort();
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
     }
 }
 
@@ -414,7 +494,7 @@ impl Completion {
 
 async fn chat_completions(State(state): State<Arc<FrontendState>>, body: Bytes) -> Response {
     let manifest = &state.manifest;
-    let request = match parse_chat_request(&body, manifest.chat_template, manifest.max_tokens) {
+    let request = match parse_chat_request(&body, &state.renderer, manifest.max_tokens) {
         Ok(request) => request,
         Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
     };
@@ -456,6 +536,9 @@ async fn run_generation(
     let _turn = Arc::clone(&state.generation_lock).lock_owned().await;
     let event = match generate(&state, &prompt, max_tokens, delivered, &events).await {
         Ok(generation) => {
+            if let Some(ring) = &state.ring {
+                ring.settings.channels.execution.finish("done");
+            }
             info!(
                 finish = generation.finish.as_str(),
                 completion_tokens = generation.completion_tokens,
@@ -463,13 +546,23 @@ async fn run_generation(
             );
             Event::Finished(generation)
         }
+        Err(error) if error.downcast_ref::<GenerationCancelled>().is_some() => {
+            if let Some(ring) = &state.ring {
+                ring.settings.channels.execution.finish("cancelled");
+            }
+            info!("client disconnected; shard generation canceled after cleanup");
+            return;
+        }
         Err(error) => {
+            if let Some(ring) = &state.ring {
+                ring.settings.channels.execution.finish("error");
+            }
             warn!(error = %format!("{error:#}"), "shard generation failed");
             Event::Failed(Failure::from_error(&error))
         }
     };
     // The handler may be gone (client disconnected); then nobody needs the outcome.
-    let _ = events.send(event);
+    let _ = events.send(event).await;
 }
 
 /// Runs the generation, restarting it from the prompt whenever a stage with another location
@@ -639,6 +732,38 @@ async fn open_stage(
     })
 }
 
+/// Opens every stage of a pipeline manifest at once and validates them.
+async fn open_pipeline(state: &FrontendState, prompt: &str) -> anyhow::Result<Pipeline> {
+    let links = try_join_all(
+        state
+            .manifest
+            .stages
+            .iter()
+            .map(|stage| open_link(state, stage, prompt)),
+    )
+    .await?;
+    Pipeline::new(links, &state.expectations)
+}
+
+/// Starts the local stage 0 and the ring session at once and validates them together.
+async fn open_ring_pipeline(
+    state: &FrontendState,
+    ring: &RingRuntime,
+    prompt: &str,
+) -> anyhow::Result<Pipeline> {
+    let (stage, expected) = state
+        .manifest
+        .stages
+        .first()
+        .zip(state.expectations.first())
+        .context("the ring manifest has no local stage")?;
+    let (local, link) = tokio::try_join!(
+        open_link(state, stage, prompt),
+        RingLink::open(&state.endpoint, &ring.plan, &ring.settings),
+    )?;
+    Pipeline::with_ring(local, link, expected)
+}
+
 async fn open_link(
     state: &FrontendState,
     stage: &StageSpec,
@@ -729,10 +854,7 @@ impl Delivered {
 }
 
 /// Waits for the whole generation and answers with one completion object.
-async fn buffered_response(
-    mut events: UnboundedReceiver<Event>,
-    _task: GenerationTask,
-) -> Response {
+async fn buffered_response(mut events: Receiver<Event>, _task: GenerationTask) -> Response {
     let completion = Completion::new();
     loop {
         match events.recv().await {
@@ -748,7 +870,7 @@ async fn buffered_response(
 
 /// State of one streamed reply; dropping it (client disconnect) aborts the generation.
 struct SseStream {
-    events: UnboundedReceiver<Event>,
+    events: Receiver<Event>,
     completion: Completion,
     _task: GenerationTask,
     ended: bool,
@@ -786,7 +908,7 @@ impl SseStream {
 
 /// Streams the reply: a role chunk, content chunks, a final chunk with `finish_reason`, then
 /// `[DONE]`; or an `error` event and no `[DONE]` if the generation fails.
-fn stream_response(events: UnboundedReceiver<Event>, task: GenerationTask) -> Response {
+fn stream_response(events: Receiver<Event>, task: GenerationTask) -> Response {
     let completion = Completion::new();
     let role = completion.chunk(json!({"role": "assistant", "content": ""}), None);
     let state = SseStream {
@@ -832,11 +954,13 @@ fn error_response(status: StatusCode, message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shard::manifest::ChatTemplate;
 
     const CAP: u32 = 64;
 
     fn parse(body: Value) -> Result<ChatRequest, String> {
-        parse_chat_request(body.to_string().as_bytes(), ChatTemplate::Chatml, CAP)
+        let renderer = ChatRenderer::load(&ChatTemplate::Chatml).unwrap();
+        parse_chat_request(body.to_string().as_bytes(), &renderer, CAP)
     }
 
     #[test]
