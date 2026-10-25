@@ -88,7 +88,7 @@ pub struct LocalLaunch<'a> {
 /// What keeps a link's process or stream alive.
 enum LinkGuard {
     /// A local runner, killed when dropped.
-    Process(Child),
+    Process(Box<Child>),
     /// The Iroh connection carrying a remote stage's stream.
     Stream(Connection),
 }
@@ -136,7 +136,7 @@ impl StageLink {
             reader: Box::new(reader),
             writer: Box::new(stdin),
             metadata,
-            guard: LinkGuard::Process(child),
+            guard: LinkGuard::Process(Box::new(child)),
             label,
         })
     }
@@ -253,7 +253,7 @@ impl StageLink {
         let _ = writer.shutdown().await;
         drop(writer);
         match guard {
-            LinkGuard::Process(child) => stop_child(child, &label, kill).await,
+            LinkGuard::Process(child) => stop_child(*child, &label, kill).await,
             LinkGuard::Stream(connection) => {
                 connection.close(CONNECTION_DONE, CONNECTION_DONE_REASON);
             }
