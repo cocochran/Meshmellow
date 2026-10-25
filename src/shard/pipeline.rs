@@ -27,7 +27,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail, ensure};
 use iroh::endpoint::{Connection, VarInt};
 use iroh::{Endpoint, EndpointId};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 use tokio::process::Command;
 use tokio::sync::oneshot;
 use tokio::time::{timeout, timeout_at};
@@ -58,6 +60,9 @@ const CHILD_EXIT_GRACE: Duration = Duration::from_secs(5);
 
 /// `tracing` target for lines a local runner writes to stderr.
 const RUNNER_LOG_TARGET: &str = "shard_runner";
+
+/// Maximum runner stderr buffered for one tracing event; longer lines are split into chunks.
+const MAX_RUNNER_LOG_LINE_BYTES: u64 = 8 * 1024;
 
 /// Application close code for a remote stage connection the generation is done with.
 const CONNECTION_DONE: VarInt = VarInt::from_u32(0);
@@ -824,11 +829,17 @@ async fn forward_stderr(label: String, stderr: impl AsyncRead + Unpin) {
     let mut line = Vec::new();
     loop {
         line.clear();
-        match lines.read_until(b'\n', &mut line).await {
+        match (&mut lines)
+            .take(MAX_RUNNER_LOG_LINE_BYTES)
+            .read_until(b'\n', &mut line)
+            .await
+        {
             Ok(0) => return,
             Ok(_) => {
+                let truncated =
+                    line.last() != Some(&b'\n') && line.len() as u64 == MAX_RUNNER_LOG_LINE_BYTES;
                 let text = String::from_utf8_lossy(line.trim_ascii_end());
-                info!(target: RUNNER_LOG_TARGET, stage = %label, "{text}");
+                info!(target: RUNNER_LOG_TARGET, stage = %label, truncated, "{text}");
             }
             Err(error) => {
                 warn!(target: RUNNER_LOG_TARGET, stage = %label, %error, "failed to read runner stderr");

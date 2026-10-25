@@ -10,7 +10,7 @@ use membership::{INVITE_SECONDS, Ledger, name, now};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -146,6 +146,7 @@ pub struct Node {
     record: Arc<Mutex<Record>>,
     peers: Arc<Mutex<BTreeMap<String, Peer>>>,
     remote_pending: Arc<Mutex<Vec<Pending>>>,
+    failed_sync_members: Arc<Mutex<HashSet<String>>>,
     local_api: Arc<Mutex<Option<ApiEndpoint>>>,
     peer_apis: Arc<Mutex<BTreeMap<String, ApiEndpoint>>>,
     internet: bool,
@@ -223,6 +224,7 @@ impl Node {
             record: Arc::new(Mutex::new(record)),
             peers: Default::default(),
             remote_pending: Default::default(),
+            failed_sync_members: Default::default(),
             internet,
             local_api: Default::default(),
             peer_apis: Default::default(),
@@ -327,6 +329,7 @@ impl Node {
             .map_err(|_| anyhow::anyhow!("Peer state unavailable."))? = Default::default();
         self.peers.lock().await.clear();
         self.remote_pending.lock().await.clear();
+        self.failed_sync_members.lock().await.clear();
         Ok(())
     }
 
@@ -560,6 +563,11 @@ impl Node {
             return Ok(());
         };
         let members = ledger.members()?;
+        let active_members: HashSet<_> = members.keys().cloned().collect();
+        self.failed_sync_members
+            .lock()
+            .await
+            .retain(|member| active_members.contains(member));
         let peers = self.peers.lock().await.clone();
         let mut jobs = tokio::task::JoinSet::new();
         for id in members.keys().filter(|id| **id != self.id()) {
@@ -592,6 +600,9 @@ impl Node {
         while let Some(result) = jobs.join_next().await {
             match result {
                 Ok(Ok((issuer, response))) => {
+                    if self.failed_sync_members.lock().await.remove(&issuer) {
+                        info!(member = %issuer, "mesh member sync recovered");
+                    }
                     if let Some(api) = response.api {
                         apis.insert(issuer.clone(), api);
                     }
@@ -602,7 +613,15 @@ impl Node {
                         p.issuer == issuer && p.status == "pending" && p.expires > now()
                     }));
                 }
-                Ok(Err((member, error))) => warn!(%member, %error, "mesh member sync failed"),
+                Ok(Err((member, error))) => {
+                    let first_failure =
+                        self.failed_sync_members.lock().await.insert(member.clone());
+                    if first_failure {
+                        warn!(%member, %error, "mesh member sync failed");
+                    } else {
+                        debug!(%member, %error, "mesh member sync still failing");
+                    }
+                }
                 Err(error) => warn!(%error, "mesh member sync task failed"),
             }
         }
