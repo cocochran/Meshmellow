@@ -72,16 +72,43 @@ against refreshed inputs and rejects changed or expired profiles.
 
 ## Runtime acceptance still required
 
-The v1 shard backend currently accepts one remote prefix followed by a local
-final stage. M-27 must supply the production ring manifest and validation for
-arbitrary stage order and remote finals before this plan can drive that backend.
-The published Qwen3.8 ring summaries have fixed routes and scoped buffer and
-per-stage compute observations. They do not include fresh per-device usable
-capacity, total contribution peaks, or matching directed transfer costs for
-each candidate edge, so they cannot populate an eligible live profile yet.
-The run must then use the same model source, artifacts, runtime, context,
-batch, ranges, path and workload as the observations. Reserve capacity on each
-destination before starting, and collect trustworthy total contribution peaks
-and fresh compute events for the exact run. Compare repeated measured decode
-times with predictions and record failures and exclusions. Until those gates
-pass, M-5 remains in progress.
+### Available Qwen3.8 ring evidence (partial)
+
+The two fixed-route runs in
+[`QWEN38_RING.md`](../experiments/model-validation/QWEN38_RING.md) provide
+actual contiguous-range compute samples for source model
+`2de73110cb254cbf09b54b717578dadff12ef1194e7271527e68202f39ba4bfd`, context
+512 and the same 0–28 / 28–32 / 32–64 route. Each run contains 44 decode
+samples per range (`phase: decode`); the values below summarize each range's
+reported native `compute_ms`, not end-to-end transfer or request latency.
+
+| Range and device | Run 01 median / p95 (ms) | Run 02 median / p95 (ms) | Decode-sample max buffer (bytes) | Decode-sample max RSS (bytes) |
+|---|---:|---:|---:|---:|
+| `[0,28)` M2 Pro Metal | 52.756 / 59.271 | 53.830 / 58.838 | 8,253,922,752 | 7,788,724,224 |
+| `[28,32)` M4 iPad Metal | 20.126 / 22.509 | 19.835 / 22.268 | 1,175,917,248 | 1,424,426,496 |
+| `[32,64)` RTX 5060 Ti CUDA | 25.909 / 26.043 | 25.928 / 26.015 | 10,391,506,464 | 727,334,912 |
+
+These numbers are measured compute evidence for those exact ranges and that
+fixed workload. They do not make an eligible M-5 input: the runs do not
+provide matching directed per-payload transfer measurements, current usable
+capacity or reservations, a complete contribution peak on every host, or
+per-artifact hashes for each exported stage. Buffer, RSS and physical-footprint
+metrics have different accounting scopes and must not be added together. Keep
+these observations provisional until those missing inputs are collected.
+
+The main-branch v1 shard backend currently accepts one remote prefix followed
+by a local final stage. Yash's separate M-27 ring contract instead requires
+stage 0 to be leader-local beginning at layer 0, followed by one or more
+contiguous remote stages. The current measured search is backend-agnostic and
+can choose a remote first stage; an M-27 adapter must reject or re-plan such an
+output, require at least two stages, and map the remaining ordered ranges to
+the static ring manifest. M-27's branch must land before this integration can
+be implemented against its production manifest type.
+
+To make this evidence eligible, collect exact exported-artifact hashes, fresh
+usable capacity and reservations, complete contribution peaks across load and
+inference, and directed costs for every exact transfer size and path. Re-run
+the planner-selected route through the leader/job API with the same artifacts,
+runtime and workload; verify exact-run evidence and compare repeated measured
+decode times with predictions. Record failures and exclusions. M-5 remains in
+progress until those gates pass.
