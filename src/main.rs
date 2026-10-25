@@ -18,6 +18,7 @@ use llm_cluster::leader::{
 use llm_cluster::network::{self, SharedPeerTable};
 use llm_cluster::node::PeerTable;
 use llm_cluster::protocol::{CONTROL_ALPN, RPC_BRIDGE_ALPN};
+use llm_cluster::shard::ring::{RING_ALPN, RingWorkerConfig, serve_ring_worker};
 use llm_cluster::shard::serve::{ShardServeConfig, serve_shard};
 use llm_cluster::worker::{self, WorkerConfig};
 use llm_cluster::{api, rpc_bridge};
@@ -152,6 +153,45 @@ enum Command {
         /// Node ID allowed to use this shard (the leader's); repeatable, at least one required.
         #[arg(long = "allow-peer", required = true)]
         allow_peers: Vec<String>,
+    },
+    /// EXPERIMENTAL: serve one layer range as a `meshthing/shard-ring/1` worker that forwards
+    /// activations straight to the next worker. Without `--next` this worker is the terminal
+    /// and returns tokens directly to the origin.
+    ShardRingWorker {
+        /// The shard_runner binary.
+        #[arg(long)]
+        runner: PathBuf,
+        /// The exported shard file passed to the runner.
+        #[arg(long)]
+        model: PathBuf,
+        /// Half-open layer range served, as `BEGIN:END` (e.g. `28:32`).
+        #[arg(long, value_parser = parse_layer_range)]
+        range: LayerRange,
+        /// Context window passed to the runner.
+        #[arg(long)]
+        context: u32,
+        /// Layers the runner offloads to the GPU.
+        #[arg(long, default_value_t = 0)]
+        gpu_layers: u32,
+        /// Runtime buffer budget passed to the runner, in bytes.
+        #[arg(long)]
+        budget_bytes: u64,
+        /// SHA-256 the model file must have; checked at startup.
+        #[arg(long)]
+        expected_sha256: String,
+        /// Original model identity the runner must report.
+        #[arg(long)]
+        source_sha256: Option<String>,
+        /// Node ID of the only peer allowed to start sessions: the origin for the entry worker,
+        /// else the previous worker.
+        #[arg(long, value_parser = parse_node_id_arg)]
+        upstream: iroh::EndpointId,
+        /// Node ID of the origin (leader) the terminal returns results to.
+        #[arg(long, value_parser = parse_node_id_arg)]
+        origin: iroh::EndpointId,
+        /// Node ID of the next worker; omit on the terminal.
+        #[arg(long, value_parser = parse_node_id_arg)]
+        next: Option<iroh::EndpointId>,
     },
     /// Contribute this device to a cluster: supervise ggml-rpc-server and bridge it to the leader.
     Worker {
@@ -414,6 +454,35 @@ async fn main() -> anyhow::Result<()> {
             };
             shard_serve(&cli.key, config, &parse_node_ids(allow_peers)?).await
         }
+        Command::ShardRingWorker {
+            runner,
+            model,
+            range,
+            context,
+            gpu_layers,
+            budget_bytes,
+            expected_sha256,
+            source_sha256,
+            upstream,
+            origin,
+            next,
+        } => {
+            let config = RingWorkerConfig {
+                runner,
+                model,
+                begin: range.begin,
+                end: range.end,
+                context,
+                gpu_layers,
+                budget_bytes,
+                expected_sha256,
+                source_sha256,
+                upstream,
+                origin,
+                next,
+            };
+            shard_ring_worker(&cli.key, config).await
+        }
         Command::Worker {
             rpc_server,
             rpc_port,
@@ -537,6 +606,13 @@ async fn shard_serve(
     run_until_ctrl_c(&endpoint, serve).await
 }
 
+async fn shard_ring_worker(key: &Path, config: RingWorkerConfig) -> anyhow::Result<()> {
+    let endpoint = network::bind_endpoint(key, vec![RING_ALPN.to_vec()]).await?;
+    print_node_id(&endpoint);
+    let serve = serve_ring_worker(endpoint.clone(), config);
+    run_until_ctrl_c(&endpoint, serve).await
+}
+
 /// A half-open layer range `[begin, end)` given as `BEGIN:END`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LayerRange {
@@ -561,6 +637,11 @@ fn parse_layer_range(text: &str) -> Result<LayerRange, String> {
 /// Parses every `--allow-peer` value, naming the first invalid one.
 fn parse_node_ids(ids: &[String]) -> anyhow::Result<Vec<iroh::EndpointId>> {
     ids.iter().map(|id| network::parse_node_id(id)).collect()
+}
+
+/// Parses a node ID flag such as `--upstream`, for clap.
+fn parse_node_id_arg(text: &str) -> Result<iroh::EndpointId, String> {
+    network::parse_node_id(text).map_err(|error| format!("{error:#}"))
 }
 
 /// Parses `--worker NODE_ID=ADDR`. The loopback check happens when the listener is bound.
@@ -985,6 +1066,122 @@ mod tests {
         }
         let flag = parse_shard_serve("8:4", &["--allow-peer", "a"]);
         assert!(flag.is_err(), "a reversed --range must be refused");
+    }
+
+    /// `shard-ring-worker` over `range` with its other required flags plus `extra`.
+    fn parse_shard_ring_worker(
+        range: &str,
+        upstream: &str,
+        origin: &str,
+        extra: &[&str],
+    ) -> Result<Command, clap::Error> {
+        let required = [
+            "meshthing",
+            "shard-ring-worker",
+            "--runner",
+            "shard_runner",
+            "--model",
+            "shard.gguf",
+            "--range",
+            range,
+            "--context",
+            "512",
+            "--budget-bytes",
+            "1048576",
+            "--expected-sha256",
+            "abc123",
+            "--upstream",
+            upstream,
+            "--origin",
+            origin,
+        ];
+        Cli::try_parse_from(required.iter().chain(extra)).map(|cli| cli.command)
+    }
+
+    #[test]
+    fn shard_ring_worker_without_next_is_the_terminal() {
+        let upstream = iroh::SecretKey::generate().public();
+        let origin = iroh::SecretKey::generate().public();
+        let command =
+            parse_shard_ring_worker("28:32", &upstream.to_string(), &origin.to_string(), &[])
+                .expect("shard-ring-worker");
+        let Command::ShardRingWorker {
+            runner,
+            model,
+            range,
+            context,
+            gpu_layers,
+            budget_bytes,
+            expected_sha256,
+            source_sha256,
+            upstream: parsed_upstream,
+            origin: parsed_origin,
+            next,
+        } = command
+        else {
+            panic!("expected shard-ring-worker, got {command:?}");
+        };
+        assert_eq!(runner, PathBuf::from("shard_runner"));
+        assert_eq!(model, PathBuf::from("shard.gguf"));
+        assert_eq!(range, LayerRange { begin: 28, end: 32 });
+        assert_eq!((context, gpu_layers, budget_bytes), (512, 0, 1_048_576));
+        assert_eq!(expected_sha256, "abc123");
+        assert_eq!(source_sha256, None);
+        assert_eq!((parsed_upstream, parsed_origin), (upstream, origin));
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn shard_ring_worker_parses_optional_flags() {
+        let peer = iroh::SecretKey::generate().public().to_string();
+        let next = iroh::SecretKey::generate().public();
+        let next_text = next.to_string();
+        let extra = [
+            "--next",
+            next_text.as_str(),
+            "--gpu-layers",
+            "99",
+            "--source-sha256",
+            "def456",
+        ];
+        let command =
+            parse_shard_ring_worker("0:28", &peer, &peer, &extra).expect("shard-ring-worker");
+        let Command::ShardRingWorker {
+            gpu_layers,
+            source_sha256,
+            next: parsed_next,
+            ..
+        } = command
+        else {
+            panic!("expected shard-ring-worker, got {command:?}");
+        };
+        assert_eq!(gpu_layers, 99);
+        assert_eq!(source_sha256.as_deref(), Some("def456"));
+        assert_eq!(parsed_next, Some(next));
+    }
+
+    #[test]
+    fn shard_ring_worker_refuses_bad_peers_and_ranges() {
+        let peer = iroh::SecretKey::generate().public().to_string();
+        let cases = [
+            ("28:32", "not-a-node-id", peer.as_str(), &[][..]),
+            ("28:32", peer.as_str(), "not-a-node-id", &[][..]),
+            (
+                "28:32",
+                peer.as_str(),
+                peer.as_str(),
+                &["--next", "nope"][..],
+            ),
+            ("32:28", peer.as_str(), peer.as_str(), &[][..]),
+        ];
+        for (range, upstream, origin, extra) in cases {
+            assert!(
+                parse_shard_ring_worker(range, upstream, origin, extra).is_err(),
+                "{range} {upstream} {origin} {extra:?} should be refused"
+            );
+        }
+        let missing = Cli::try_parse_from(["meshthing", "shard-ring-worker", "--upstream", &peer]);
+        assert!(missing.is_err(), "missing required flags must be refused");
     }
 
     #[test]
