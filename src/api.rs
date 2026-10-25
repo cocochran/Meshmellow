@@ -26,10 +26,10 @@ use futures_util::{Stream, StreamExt, stream};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::history::{CompletedTurn, HistorySink};
-use crate::jobs::{JobInfo, JobPermit, JobQueue};
+use crate::jobs::{JobInfo, JobPermit, JobQueue, MAX_OUTSTANDING_JOBS};
 use crate::network::SharedPeerTable;
 
 /// OpenAI-compatible chat endpoint, served here and by llama-server.
@@ -265,7 +265,16 @@ async fn chat_completions(State(state): State<Arc<ApiState>>, body: Bytes) -> Re
         Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
     };
     let queued_at = Instant::now();
-    let permit = state.queue.acquire(conversation_id.clone()).await;
+    let Some(permit) = state.queue.try_acquire(conversation_id.clone()).await else {
+        debug!(
+            limit = MAX_OUTSTANDING_JOBS,
+            "inference queue is full; rejecting request"
+        );
+        return error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "inference queue is full; retry after a running job finishes",
+        );
+    };
     let queue_wait_ms = queued_at.elapsed().as_millis();
     let is_streaming = request.get("stream").and_then(Value::as_bool) == Some(true);
     info!(

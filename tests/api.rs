@@ -12,7 +12,7 @@ use axum::Router;
 use axum::routing::post;
 use llm_cluster::api::{self, ApiConfig, REQUEST_ID_HEADER};
 use llm_cluster::history::{CompletedTurn, HistorySink};
-use llm_cluster::jobs::{JobQueue, JobStatus};
+use llm_cluster::jobs::{JobQueue, JobStatus, MAX_OUTSTANDING_JOBS};
 use llm_cluster::node::PeerTable;
 use serde_json::{Value, json};
 use tokio::process::{Child, Command};
@@ -115,6 +115,7 @@ impl HistorySink for RecordingSink {
 struct TestApi {
     addr: SocketAddr,
     sink: Arc<RecordingSink>,
+    queue: Arc<JobQueue>,
     client: reqwest::Client,
     shutdown: Option<oneshot::Sender<()>>,
     server: JoinHandle<anyhow::Result<()>>,
@@ -124,6 +125,7 @@ impl TestApi {
     async fn start(upstream: SocketAddr) -> Self {
         let addr = free_loopback_addr();
         let sink = Arc::new(RecordingSink::default());
+        let queue = Arc::new(JobQueue::new());
         let (shutdown, shutdown_rx) = oneshot::channel::<()>();
         let config = ApiConfig {
             listen: addr,
@@ -132,7 +134,7 @@ impl TestApi {
         };
         let server = tokio::spawn(api::serve_api(
             config,
-            Arc::new(JobQueue::new()),
+            Arc::clone(&queue),
             Arc::clone(&sink) as Arc<dyn HistorySink>,
             async move {
                 // A dropped sender also means "shut down".
@@ -144,6 +146,7 @@ impl TestApi {
         Self {
             addr,
             sink,
+            queue,
             client: reqwest::Client::new(),
             shutdown: Some(shutdown),
             server,
@@ -379,6 +382,30 @@ async fn concurrent_requests_run_strictly_one_after_another() {
         later_started >= earlier_finished,
         "second job started at {later_started} before the first finished at {earlier_finished}"
     );
+    api.stop().await;
+}
+
+#[tokio::test]
+async fn full_inference_queue_returns_429_without_registering_overflow() {
+    let fake = FakeLlama::start(&[]).await;
+    let api = TestApi::start(fake.addr).await;
+    let first = api.queue.acquire(None).await;
+    let waiters: Vec<_> = (0..MAX_OUTSTANDING_JOBS - 1)
+        .map(|index| {
+            let queue = Arc::clone(&api.queue);
+            tokio::spawn(async move { queue.acquire(Some(format!("queued-{index}"))).await })
+        })
+        .collect();
+    tokio::time::sleep(POLL_INTERVAL * 3).await;
+
+    let response = api.post_chat(&chat_body("overflow")).await;
+    assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(api.queue.jobs().len(), MAX_OUTSTANDING_JOBS);
+
+    first.complete();
+    for waiter in waiters {
+        waiter.await.unwrap().complete();
+    }
     api.stop().await;
 }
 

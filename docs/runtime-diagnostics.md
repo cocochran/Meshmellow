@@ -36,6 +36,8 @@ cannot force the logger to buffer the entire line at once.
 Non-streaming upstream responses are capped at 16 MiB while buffering. Streaming responses
 continue to the client, but responses over 16 MiB are omitted from conversation history to keep
 history capture bounded; this is logged when the stream completes.
+The inference queue admits at most 16 active or waiting jobs; additional requests receive HTTP
+429 so retained queued request bodies and job records remain bounded.
 Mesh membership refreshes warn on the first sync failure for a member, use debug logs for
 retries, and log when sync recovers. Mesh control connections follow the same pattern for
 hello, address, dial and timeout failures; the member ID is included in each event. The
