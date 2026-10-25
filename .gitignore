@@ -12,3 +12,9 @@
 
 # Claude Code agent worktrees
 .claude/worktrees/
+
+# Local secrets / per-person MCP config
+.mcp.json
+.claude/settings.local.json
+.env
+.env.*
