@@ -88,6 +88,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Verify, serve, and stage exported model shards.
+    Artifacts(llm_cluster::artifact::cli::Options),
     /// Run the mesh core, local OpenAI API, and browser UI in this process.
     Ui(llm_cluster::ui::Options),
     /// Run a persistent mesh node. Send create/invite/join/decide/snapshot JSON commands on stdin.
@@ -486,6 +488,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_logging(cli.debug);
     match cli.command {
+        Command::Artifacts(options) => llm_cluster::artifact::cli::run(options).await,
         Command::Ui(options) => llm_cluster::ui::run(options).await,
         Command::Mesh { state_dir } => llm_cluster::mesh::cli::run(state_dir).await,
         Command::Verify {
