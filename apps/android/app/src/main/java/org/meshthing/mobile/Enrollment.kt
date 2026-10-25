@@ -22,9 +22,9 @@ data class TrustedMember(val id: String, val name: String, val online: Boolean =
 data class JoinRequest(val id: String, val issuer: String, val applicant: String, val name: String)
 data class EnrollmentState(
     val id: String, val port: Int, val meshName: String?, val joiningName: String?,
-    val inviteID: String, val code: String, val expires: Long,
+    val inviteID: String, val expires: Long,
     val members: List<TrustedMember>, val pending: List<JoinRequest>, val notice: String,
-    val ticket: String = "", val codeAvailable: Boolean = false
+    val ticket: String = ""
 ) {
     companion object {
         fun parse(json: JSONObject): EnrollmentState {
@@ -32,9 +32,9 @@ data class EnrollmentState(
             val pending = json.getJSONArray("pending")
             val invite = json.optJSONObject("invite")
             return EnrollmentState(json.getString("id"), json.getInt("port"), json.optJSONObject("mesh")?.getString("name"), json.optJSONObject("joining")?.getString("name"),
-                invite?.getString("id") ?: "", invite?.getString("code") ?: "", invite?.getLong("expires") ?: 0,
+                invite?.getString("id") ?: "", invite?.getLong("expires") ?: 0,
                 (0 until members.length()).map { members.getJSONObject(it).let { m -> TrustedMember(m.getString("id"), m.getString("name"), m.optBoolean("online")) } },
-                (0 until pending.length()).map { pending.getJSONObject(it).let { p -> JoinRequest(p.getString("id"), p.getString("issuer"), p.getString("applicant"), p.getString("name")) } }, json.getString("notice"), invite?.optString("ticket") ?: "", invite?.optBoolean("code_available") ?: false)
+                (0 until pending.length()).map { pending.getJSONObject(it).let { p -> JoinRequest(p.getString("id"), p.getString("issuer"), p.getString("applicant"), p.getString("name")) } }, json.getString("notice"), invite?.optString("ticket") ?: "")
         }
     }
 }

@@ -6,14 +6,6 @@ use std::collections::BTreeMap;
 
 pub const MAX_MEMBERS: usize = 64;
 pub const INVITE_SECONDS: u64 = 600;
-// Single Unicode scalars, no skin tones, variation selectors or joined sequences.
-pub const EMOJI: [&str; 64] = [
-    "😀", "😎", "🥳", "🤖", "👻", "👽", "🐶", "🐱", "🐭", "🐹", "🐰", "🦊", "🐻", "🐼", "🐨", "🐯",
-    "🦁", "🐮", "🐷", "🐸", "🐵", "🐔", "🐧", "🐦", "🦄", "🐝", "🐛", "🦋", "🐌", "🐞", "🐢", "🐙",
-    "🦀", "🐬", "🐳", "🦈", "🌵", "🌲", "🌴", "🌻", "🌼", "🍀", "🍁", "🍄", "🌈", "🔥", "🌙", "⭐",
-    "🍎", "🍊", "🍋", "🍉", "🍇", "🍓", "🍒", "🍑", "🥝", "🍍", "🥥", "🥑", "🍕", "🍔", "🚀", "🎈",
-];
-
 pub fn name(value: &str) -> Result<String> {
     let value = value.trim();
     ensure!(
@@ -28,40 +20,6 @@ pub fn now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-/// The code binds an invitation to the authenticated Iroh issuer. It is a locator,
-/// not a membership credential. Bonjour invitations are locally discoverable;
-/// human approval is always required, even with the correct code.
-pub fn emoji_code(issuer: &str, invite: &str) -> String {
-    let digest = Sha256::digest(format!("meshthing/emoji/1:{issuer}:{invite}"));
-    let mut bits = 0u64;
-    for byte in &digest[..6] {
-        bits = (bits << 8) | u64::from(*byte);
-    }
-    (0..8)
-        .map(|i| EMOJI[((bits >> (42 - i * 6)) & 63) as usize])
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-pub fn normalize_code(value: &str) -> Result<String> {
-    let chars: Vec<_> = value
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != '\u{fe0f}')
-        .collect();
-    ensure!(
-        chars.len() == 8
-            && chars
-                .iter()
-                .all(|c| EMOJI.contains(&c.to_string().as_str())),
-        "Enter the eight emojis from the inviting device."
-    );
-    Ok(chars
-        .iter()
-        .map(char::to_string)
-        .collect::<Vec<_>>()
-        .join(" "))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

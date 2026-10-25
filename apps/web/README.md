@@ -37,17 +37,15 @@ To inspect the production core's queue instead:
   do not prove membership or liveness. Buffers do not claim total-memory coverage.
 - Saved local display name and polling interval. Refreshes do not overlap;
   background-tab polling pauses. Connection errors remain visible.
-- Emoji pairing preview explains entry and approval by any trusted member.
-  The illustrative emojis are not an invite, and join/create buttons stay disabled.
+- Core-owned mesh creation, signed invitations, cake QR scanning and trust approval.
+  New profiles start without membership; runtime stages do not populate the mesh.
 
 ## Core integration still required
 
-The current core does not expose management APIs for emoji invitations, trusted
-membership, benchmarking, model import/download or shared mesh settings. This UI
-does not simulate successful operations or write local records that pretend to
-enroll devices. Those capabilities need authenticated, identity-bound core
-commands/events before enabling the controls. iOS/Android native embedding is
-separate work; a responsive browser UI does not supply mobile compute lifecycle.
+The web server controls a local core mesh process for membership. Benchmarking,
+automatic setup of the tested Qwen3.8-27B model and contribution settings still
+require managed compute integration. Native mobile execution remains separate
+from trusted membership.
 
 The selected runtime origin is operator-controlled at launch and limited to
 loopback HTTP. Redirects are refused, fetches time out after three seconds and
@@ -81,3 +79,28 @@ and [Tailwind's SvelteKit integration](https://tailwindcss.com/docs/installation
 ## Visual identity
 
 The cake logo uses the [Cake JE4 render from Minecraft Wiki](https://minecraft.wiki/images/Cake_JE4.png?7c59e), supplied for this project’s Layercake branding.
+
+## Mesh membership and cake QR
+
+Build the core with `cargo build --bin llm-cluster` before launching the web UI.
+The server owns one local `llm-cluster mesh` process and saves its private identity
+and membership under `~/.local/state/layercake/mesh`. Override the directory with
+`LAYERCAKE_MESH_STATE_DIR` or the executable with `LAYERCAKE_CORE_BIN` at launch.
+Browser requests cannot choose either. Use one server per state directory.
+
+A fresh identity shows Create a mesh / Join a mesh. Runtime route observations and
+workspace preferences never establish membership. The local `/api/enrollment`
+endpoint permits only create, invite, join, cancel and trust decisions, with
+same-origin checks. Existing runtime telemetry remains read-only.
+
+The cake QR encodes the full signed invitation locally. Frosting, strawberries and
+cake layers surround the QR's untouched quiet zone. Scan cake QR requests camera
+access on demand; images stay in the browser and the camera stops when closed,
+scanned, hidden or unmounted. Use localhost or HTTPS for browser camera access.
+Pasting remains available. A scan fills the invitation; Request to join and trusted
+approval are still required. No Layercake lookup service is involved.
+
+`npm run test:mesh` explicitly tests real Internet/Iroh enrollment between the web
+and another core process, including approval and persistence. It uses temporary
+state and may retry a cold relay connection. `npm run test:integration` remains
+offline. Do not use test-created membership for the normal app profile.

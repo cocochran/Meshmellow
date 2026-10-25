@@ -1,63 +1,41 @@
-"""Companion for the iPad XCTest: resolve its invitation, request admission,
-and verify the UI's approval over a real Iroh connection. No private keys read.
-Run with the simulator UUID as the only argument before test-without-building. Both clients must use the same configured lookup node.
+"""Companion for iPad XCTest, using a full invitation copied by the test UI.
+Run with the dedicated simulator UUID before test-without-building. No keys read.
 """
-import hashlib
 import json
 import pathlib
-import re
 import subprocess
 import sys
 import tempfile
 import time
 
-root = pathlib.Path(__file__).resolve().parents[1]
-alphabet_source = (root / "src/membership.rs").read_text().split("pub const EMOJI")[1].split("];", 1)[0]
-alphabet = re.findall(r'"([^"\n]+)"', alphabet_source)
-assert len(alphabet) == 64
-
+repo = pathlib.Path(__file__).resolve().parents[3]
 with tempfile.TemporaryDirectory(prefix="mesh-ui-peer-") as directory:
-    peer = subprocess.Popen([str(root / "target/debug/meshthing-enrollment"), directory], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    peer = subprocess.Popen([str(repo / "target/debug/llm-cluster"), "mesh", "--state-dir", directory], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
     def command(op, **fields):
         peer.stdin.write(json.dumps(dict(op=op, **fields)) + "\n")
         peer.stdin.flush()
         response = json.loads(peer.stdout.readline())
-        if not response["ok"]:
-            raise RuntimeError(response["error"])
+        if not response["ok"]: raise RuntimeError(response["error"])
         return response["state"]
     try:
         deadline = time.monotonic() + 180
-        joined = False
         while time.monotonic() < deadline:
-            container = subprocess.run(["xcrun", "simctl", "get_app_container", sys.argv[1], "org.meshthing.mobile", "data"], capture_output=True, text=True)
-            state_file = pathlib.Path(container.stdout.strip()) / "Library/Application Support/Enrollment/membership.json"
-            if container.returncode == 0 and state_file.exists():
-                state = json.loads(state_file.read_text())
-                if state.get("ledger") and state.get("invite"):
-                    issuer = state["ledger"]["genesis"]["root"]
-                    invitation = state["invite"]["id"]
-                    bits = int.from_bytes(hashlib.sha256(f"meshthing/emoji/1:{issuer}:{invitation}".encode()).digest()[:6], "big")
-                    code = " ".join(alphabet[(bits >> (42 - i * 6)) & 63] for i in range(8))
-                    try:
-                        command("join", code=code, device_name="Validation peer")
-                    except RuntimeError:
-                        # The issuer persists before publishing its signed locator.
-                        time.sleep(1)
-                        continue
-                    print("Join submitted through Internet invitation lookup + Iroh", flush=True)
-                    joined = True
-                    break
+            clipboard = subprocess.run(["xcrun", "simctl", "pbpaste", sys.argv[1]], capture_output=True, text=True)
+            ticket = clipboard.stdout.strip()
+            if ticket.startswith("layercake://join/"):
+                command("join", invitation=ticket, device_name="Validation peer")
+                print("Join submitted from a shared invitation through the core + Iroh", flush=True)
+                break
             time.sleep(1)
-        assert joined, "No invitation discovered"
+        else: raise AssertionError("The test UI did not copy an invitation")
         while time.monotonic() < deadline:
             state = command("refresh")
             if state["mesh"]:
                 assert len(state["members"]) == 2
-                print("PASS: iPad UI approved the discovered peer; membership persisted", flush=True)
+                print("PASS: iPad UI approved the core peer; membership persisted", flush=True)
                 break
             time.sleep(1)
-        else:
-            raise AssertionError("UI did not approve the request")
+        else: raise AssertionError("UI did not approve the request")
     finally:
         peer.stdin.close()
-        peer.wait(timeout=15)
+        peer.wait(timeout=35)

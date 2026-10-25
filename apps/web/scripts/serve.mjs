@@ -25,6 +25,7 @@ const runtime = values.runtime || process.env.MESHTHING_RUNTIME_URL;
 if (runtime) process.env.MESHTHING_RUNTIME_URL = loopbackOrigin(runtime);
 process.env.MESHTHING_SOURCE = values.source;
 if (values.model) process.env.MESHTHING_MODEL_LABEL = values.model;
+process.env.LAYERCAKE_CORE_BIN ||= fileURLToPath(new URL('../../../target/debug/llm-cluster', import.meta.url));
 const build = new URL('../build/handler.js', import.meta.url);
 if (!existsSync(fileURLToPath(build))) {
   console.error('Build the UI first: npm --prefix apps/web ci && npm --prefix apps/web run build');

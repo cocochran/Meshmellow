@@ -17,9 +17,11 @@ async fn three_real_peers_create_join_any_trusted_approval_and_restart() {
     let b = Node::open_local(dirs[1].path()).await.unwrap();
     let c = Node::open_local(dirs[2].path()).await.unwrap();
     a.create("Our mesh", "iPad").await.unwrap();
-    let code = a.invite().await.unwrap();
+    let ticket = a.invite().await.unwrap();
     b.discover(vec![peer(&a).await]).await.unwrap();
-    b.join_code(&code, "Android").await.unwrap();
+    b.command(json!({"op": "join", "invitation": ticket, "device_name": "Android"}))
+        .await
+        .unwrap();
     assert!(b.snapshot().await.unwrap()["mesh"].is_null());
     let request = a.snapshot().await.unwrap()["pending"][0]["id"]
         .as_str()
@@ -34,9 +36,9 @@ async fn three_real_peers_create_join_any_trusted_approval_and_restart() {
             .len(),
         2
     );
-    let next_code = a.invite().await.unwrap();
+    let next_ticket = a.invite().await.unwrap();
     c.discover(vec![peer(&a).await]).await.unwrap();
-    c.join_code(&next_code, "Phone").await.unwrap();
+    c.join_invitation(&next_ticket, "Phone").await.unwrap();
     b.discover(vec![peer(&a).await]).await.unwrap();
     b.refresh().await.unwrap();
     let request = b.snapshot().await.unwrap()["pending"][0]["id"]
@@ -239,62 +241,30 @@ fn membership_rejects_forgery_cycles_tampering_and_cross_mesh_grants() {
     );
 }
 
-#[test]
-fn emoji_codes_bind_issuer_and_invitation_and_accept_pasted_spacing() {
-    let a = SecretKey::generate().public().to_string();
-    let b = SecretKey::generate().public().to_string();
-    let invite = uuid::Uuid::new_v4().to_string();
-    let code = emoji_code(&a, &invite);
-    assert_eq!(code.split_whitespace().count(), 8);
-    assert_eq!(normalize_code(&code.replace(' ', "\n")).unwrap(), code);
-    assert_ne!(emoji_code(&b, &invite), code);
-    assert_ne!(emoji_code(&a, &uuid::Uuid::new_v4().to_string()), code);
-    assert!(normalize_code("😀").is_err());
-    assert!(normalize_code("a a a a a a a a").is_err());
-}
-
 /// Requires public Iroh relay/DNS access; run explicitly, never in offline CI.
 #[tokio::test]
 #[ignore = "uses public Iroh relays and DNS"]
-async fn internet_emoji_pairing_without_ip_transport_and_remote_trust() {
+async fn internet_invitations_without_ip_transport_and_remote_trust() {
     tokio::time::timeout(Duration::from_secs(150), async {
-        let registry = crate::network::endpoint_builder_with_key(
-            SecretKey::generate(),
-            vec![rendezvous::ALPN.to_vec()],
-        )
-        .clear_ip_transports()
-        .bind()
-        .await
-        .unwrap();
-        registry.online().await;
-        let address = registry.addr();
-        assert!(address.ip_addrs().next().is_none());
-        let server = tokio::spawn(rendezvous::serve(registry.clone()));
         let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
-        let a = Node::open_with(dirs[0].path(), true, Some(address.clone()))
-            .await
-            .unwrap();
-        let b = Node::open_with(dirs[1].path(), true, Some(address.clone()))
-            .await
-            .unwrap();
-        let c = Node::open_with(dirs[2].path(), true, Some(address.clone()))
-            .await
-            .unwrap();
+        let a = Node::open_with(dirs[0].path(), true).await.unwrap();
+        let b = Node::open_with(dirs[1].path(), true).await.unwrap();
+        let c = Node::open_with(dirs[2].path(), true).await.unwrap();
         for node in [&a, &b, &c] {
             node.endpoint.online().await;
             assert!(node.endpoint.bound_sockets().is_empty());
         }
         a.create("Internet mesh", "Founder").await.unwrap();
-        let code = a.invite().await.unwrap();
-        b.join_code(&code, "Remote member").await.unwrap();
+        let ticket = a.invite().await.unwrap();
+        b.join_invitation(&ticket, "Remote member").await.unwrap();
         let request = a.snapshot().await.unwrap()["pending"][0]["id"]
             .as_str()
             .unwrap()
             .to_owned();
         a.decide(&a.id(), &request, true).await.unwrap();
         b.refresh().await.unwrap();
-        let code = a.invite().await.unwrap();
-        c.join_code(&code, "Third device").await.unwrap();
+        let ticket = a.invite().await.unwrap();
+        c.join_invitation(&ticket, "Third device").await.unwrap();
         // B knows A only from its persisted membership; no discovery records.
         for _ in 0..12 {
             b.refresh().await.unwrap();
@@ -322,9 +292,7 @@ async fn internet_emoji_pairing_without_ip_transport_and_remote_trust() {
         );
         let original = c.id();
         c.close().await;
-        let c = Node::open_with(dirs[2].path(), true, Some(address))
-            .await
-            .unwrap();
+        let c = Node::open_with(dirs[2].path(), true).await.unwrap();
         assert_eq!(c.id(), original);
         assert_eq!(
             c.snapshot().await.unwrap()["members"]
@@ -336,8 +304,6 @@ async fn internet_emoji_pairing_without_ip_transport_and_remote_trust() {
         a.close().await;
         b.close().await;
         c.close().await;
-        registry.close().await;
-        server.abort();
     })
     .await
     .expect("relay pairing completed within 150 seconds");
@@ -349,16 +315,16 @@ async fn core_ticket_join_establishes_trusted_heartbeats_without_lookup() {
     tokio::time::timeout(Duration::from_secs(120), async {
         let ad = tempfile::tempdir().unwrap();
         let bd = tempfile::tempdir().unwrap();
-        let a = Node::open_with(ad.path(), true, None).await.unwrap();
-        let b = Node::open_with(bd.path(), true, None).await.unwrap();
+        let a = Node::open_with(ad.path(), true).await.unwrap();
+        let b = Node::open_with(bd.path(), true).await.unwrap();
         a.endpoint.online().await;
         b.endpoint.online().await;
         a.create("Core mesh", "Founder").await.unwrap();
         a.invite().await.unwrap();
         let state = a.snapshot().await.unwrap();
-        assert_eq!(state["invite"]["code_available"], false);
+        assert!(state["invite"].get("code").is_none());
         let ticket = state["invite"]["ticket"].as_str().unwrap();
-        let locator = rendezvous::Locator::from_ticket(ticket).unwrap();
+        let locator = invitation::Invitation::from_ticket(ticket).unwrap();
         // Knowing the cluster ID is not admission to the core control plane.
         let hello =
             crate::network::local_hello(&b.endpoint, state["mesh"]["id"].as_str().unwrap(), 0);
@@ -372,7 +338,7 @@ async fn core_ticket_join_establishes_trusted_heartbeats_without_lookup() {
             .await
             .is_err()
         );
-        b.join_code(ticket, "Joining device").await.unwrap();
+        b.join_invitation(ticket, "Joining device").await.unwrap();
         assert!(
             b.snapshot().await.unwrap()["connected_peers"]
                 .as_array()
@@ -425,7 +391,7 @@ async fn core_ticket_join_establishes_trusted_heartbeats_without_lookup() {
         })
         .await
         .expect("closed member leaves live peer table");
-        let b = Node::open_with(bd.path(), true, None).await.unwrap();
+        let b = Node::open_with(bd.path(), true).await.unwrap();
         assert_eq!(b.id(), id);
         b.endpoint.online().await;
         wait_for_heartbeats(&a, &b).await;
@@ -447,13 +413,94 @@ async fn core_ticket_join_establishes_trusted_heartbeats_without_lookup() {
 fn self_contained_invitation_rejects_tampering_and_oversize_input() {
     let key = SecretKey::generate();
     let mut locator =
-        rendezvous::Locator::signed(&key, uuid::Uuid::new_v4().to_string(), now() + 300, None);
+        invitation::Invitation::signed(&key, uuid::Uuid::new_v4().to_string(), now() + 300, None);
     let ticket = locator.ticket();
     assert_eq!(
-        rendezvous::Locator::from_ticket(&ticket).unwrap().issuer,
+        invitation::Invitation::from_ticket(&ticket).unwrap().issuer,
         key.public().to_string()
     );
+    for expires in [now() - 1, now() + INVITE_SECONDS + 60] {
+        let invalid =
+            invitation::Invitation::signed(&key, uuid::Uuid::new_v4().to_string(), expires, None);
+        assert!(invitation::Invitation::from_ticket(&invalid.ticket()).is_err());
+    }
+    assert!(invitation::Invitation::from_ticket("😀 😎 🥳 🤖 👻 👽 🐶 🐱").is_err());
+    assert!(
+        invitation::Invitation::from_ticket(&ticket.replace("layercake://", "https://")).is_err()
+    );
     locator.invite = uuid::Uuid::new_v4().to_string();
-    assert!(rendezvous::Locator::from_ticket(&locator.ticket()).is_err());
-    assert!(rendezvous::Locator::from_ticket(&"x".repeat(4097)).is_err());
+    assert!(invitation::Invitation::from_ticket(&locator.ticket()).is_err());
+    assert!(invitation::Invitation::from_ticket(&"x".repeat(4097)).is_err());
+}
+
+#[tokio::test]
+async fn leaving_disconnects_persists_and_rejoining_requires_approval() {
+    let ad = tempfile::tempdir().unwrap();
+    let bd = tempfile::tempdir().unwrap();
+    let a = Node::open_local(ad.path()).await.unwrap();
+    let b = Node::open_local(bd.path()).await.unwrap();
+    a.create("Original mesh", "A").await.unwrap();
+    a.discover(vec![peer(&b).await]).await.unwrap();
+    a.invite().await.unwrap();
+    b.join(peer(&a).await, "B").await.unwrap();
+    b.discover(vec![peer(&a).await]).await.unwrap();
+    let request = a.snapshot().await.unwrap()["pending"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    a.decide(&a.id(), &request, true).await.unwrap();
+    b.refresh().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while a.snapshot().await.unwrap()["connected_peers"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let original_id = b.id();
+    let left = b.command(json!({"op":"leave"})).await.unwrap();
+    assert!(left["mesh"].is_null());
+    assert!(left["invite"].is_null());
+    assert!(left["members"].as_array().unwrap().is_empty());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !a.snapshot().await.unwrap()["connected_peers"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    b.close().await;
+    let b = Node::open_local(bd.path()).await.unwrap();
+    assert_eq!(b.id(), original_id);
+    assert!(b.snapshot().await.unwrap()["mesh"].is_null());
+    a.invite().await.unwrap();
+    b.join(peer(&a).await, "B").await.unwrap();
+    b.refresh().await.unwrap();
+    assert!(b.snapshot().await.unwrap()["mesh"].is_null());
+    let request = a.snapshot().await.unwrap()["pending"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    a.decide(&a.id(), &request, true).await.unwrap();
+    b.refresh().await.unwrap();
+    assert_eq!(
+        b.snapshot().await.unwrap()["members"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    b.leave().await.unwrap();
+    b.create("New mesh", "B").await.unwrap();
+    assert_eq!(b.snapshot().await.unwrap()["mesh"]["name"], "New mesh");
+    a.close().await;
+    b.close().await;
 }
