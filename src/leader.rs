@@ -14,7 +14,12 @@
 //!    ([`ShardManifest::load`]), including the v1 topology rules.
 //! 2. Accept control connections, heartbeating to each connected worker every
 //!    `heartbeat_interval` so it can tell when the leader is gone. llama: wait until every remote worker has said hello. shard:
-//!    `shard-serve` workers open no control link, so there is nothing to wait for.
+//!    `shard-serve` workers open no control link, so there is nothing to wait for. With an
+//!    EXPERIMENTAL ring manifest (`"execution": "ring"`) the endpoint also accepts the shard-ring
+//!    ALPN, and one accept loop dispatches by ALPN: control connections get the same
+//!    heartbeat-capable sessions as always, ring connections go to the result-channel registry
+//!    ([`ResultChannels`]) through which the ring's terminal worker returns tokens, and anything
+//!    else is closed.
 //! 3. Start the upstream. llama: one RPC bridge per remote worker, all sharing the leader's
 //!    endpoint, then `llama-server` with the plan's `server_args`, waiting for `/health`. shard:
 //!    the shard front end ([`serve_frontend`]) in-process, dialling remote stages by node ID
@@ -38,6 +43,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail, ensure};
+use iroh::endpoint::{Connection, Incoming};
 use iroh::{Endpoint, EndpointId};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
@@ -54,10 +60,12 @@ use crate::launch::{LaunchPlan, RemoteWorker};
 use crate::network::{self, ControlOptions, SharedPeerTable};
 use crate::node::PeerTable;
 use crate::process::{self, ChildSpec, Readiness, RestartPolicy, Supervised};
-use crate::protocol::CONTROL_ALPN;
-use crate::rpc_bridge::{BridgeMapping, LeaderBridges};
+use crate::protocol::{CONTROL_ALPN, Hello};
+use crate::rpc_bridge::{BridgeMapping, LeaderBridges, PEER_NOT_APPROVED};
 use crate::shard::frontend::{FrontendConfig, serve_frontend};
 use crate::shard::manifest::ShardManifest;
+use crate::shard::ring::RING_ALPN;
+use crate::shard::ring_origin::{ResultChannels, RingSettings};
 
 /// Internal loopback port the backend (`llama-server` or the shard front end) listens on unless
 /// configured otherwise.
@@ -125,6 +133,10 @@ const PROBE_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(2);
 /// How long the shard front end may take to start listening. It hashes every local stage file
 /// that has an `artifact_sha256` first, which takes a while for a multi-gigabyte shard.
 const SHARD_FRONTEND_READY_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Close reason for a connection on an ALPN the leader does not serve; sent with
+/// [`PEER_NOT_APPROVED`], as for any peer the leader will not talk to.
+const UNSUPPORTED_PROTOCOL_REASON: &[u8] = b"unsupported protocol";
 
 /// How often the worker wait re-checks the peer table.
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -207,6 +219,9 @@ pub struct LlamaBackendConfig {
 pub struct ShardBackendConfig {
     /// Shard manifest JSON ([`ShardManifest`]): the runner, the model identity and the stages.
     pub manifest_path: PathBuf,
+    /// Used only by an EXPERIMENTAL ring manifest: the result-channel registry the leader's
+    /// accept loop feeds, and how long a ring may take to become ready.
+    pub ring: RingSettings,
 }
 
 /// Runs the leader on a freshly bound endpoint until Ctrl-C, then shuts everything down in order.
@@ -286,6 +301,7 @@ async fn lead(
 ) -> anyhow::Result<()> {
     let peers: SharedPeerTable = Arc::new(Mutex::new(PeerTable::new()));
     let local = network::local_hello(endpoint, &config.cluster_id, EMPTY_LOG_INDEX);
+    let ring = ring_settings(config, prepared);
     // Dropping the set aborts the accept loop and the worker watch, so neither outlives this
     // function.
     let mut control = JoinSet::new();
@@ -293,16 +309,33 @@ async fn lead(
         heartbeat_timeout: config.heartbeat_timeout,
         heartbeat_interval: config.heartbeat_interval,
     };
-    control.spawn(network::serve_control_with(
-        endpoint.clone(),
-        local,
-        Arc::clone(&peers),
-        options,
-    ));
+    match &ring {
+        None => control.spawn(network::serve_control_with(
+            endpoint.clone(),
+            local,
+            Arc::clone(&peers),
+            options,
+        )),
+        Some(ring) => {
+            endpoint.set_alpns(vec![CONTROL_ALPN.to_vec(), RING_ALPN.to_vec()]);
+            info!(
+                "ring manifest: the leader also accepts shard-ring result channels (experimental)"
+            );
+            control.spawn(serve_control_and_ring(
+                endpoint.clone(),
+                ControlSessions {
+                    local,
+                    peers: Arc::clone(&peers),
+                    options,
+                },
+                Arc::clone(&ring.channels),
+            ))
+        }
+    };
 
     tokio::pin!(shutdown);
     let running = tokio::select! {
-        started = start(endpoint, config, prepared, &peers) => started?,
+        started = start(endpoint, config, prepared, &peers, ring) => started?,
         () = &mut shutdown => {
             info!("shutdown requested during startup");
             return Ok(());
@@ -316,6 +349,82 @@ async fn lead(
     }
     let failed_verification = verify_backend_while_serving(prepared);
     running.serve_until(shutdown, failed_verification).await
+}
+
+/// The ring settings when the backend is shard with a ring manifest; `None` otherwise.
+fn ring_settings(config: &LeaderConfig, prepared: &Prepared<'_>) -> Option<RingSettings> {
+    match (prepared, &config.backend) {
+        (Prepared::Shard(manifest), BackendConfig::Shard(shard)) if manifest.is_ring() => {
+            Some(shard.ring.clone())
+        }
+        _ => None,
+    }
+}
+
+/// What every control session of the dispatching accept loop shares: the leader's hello, the
+/// peer table and the heartbeat options, exactly as [`network::serve_control_with`] gets them.
+struct ControlSessions {
+    local: Hello,
+    peers: SharedPeerTable,
+    options: ControlOptions,
+}
+
+/// The accept loop for a ring manifest: like [`network::serve_control_with`], but dispatching
+/// each connection by ALPN. Control connections get the same heartbeat-capable control session,
+/// shard-ring connections go to `channels`, and anything else is closed. Runs until the endpoint
+/// closes.
+async fn serve_control_and_ring(
+    endpoint: Endpoint,
+    control: ControlSessions,
+    channels: Arc<ResultChannels>,
+) -> anyhow::Result<()> {
+    let control = Arc::new(control);
+    let mut sessions = JoinSet::new();
+    while let Some(incoming) = endpoint.accept().await {
+        sessions.spawn(dispatch_connection(
+            incoming,
+            Arc::clone(&control),
+            Arc::clone(&channels),
+        ));
+        // Reap finished sessions so a long-running listener does not accumulate them.
+        while sessions.try_join_next().is_some() {}
+    }
+    sessions.shutdown().await;
+    Ok(())
+}
+
+/// Accepts one connection and hands it to the handler for its ALPN.
+async fn dispatch_connection(
+    incoming: Incoming,
+    control: Arc<ControlSessions>,
+    channels: Arc<ResultChannels>,
+) {
+    let connection: Connection = match incoming.await {
+        Ok(connection) => connection,
+        Err(error) => {
+            warn!(%error, "incoming connection failed");
+            return;
+        }
+    };
+    match connection.alpn() {
+        alpn if alpn == CONTROL_ALPN => {
+            let ControlSessions {
+                local,
+                peers,
+                options,
+            } = &*control;
+            network::serve_control_connection(connection, local, peers, *options).await;
+        }
+        alpn if alpn == RING_ALPN => channels.handle_connection(connection).await,
+        alpn => {
+            warn!(
+                peer = %connection.remote_id(),
+                alpn = %String::from_utf8_lossy(alpn),
+                "closing a connection on an unsupported protocol"
+            );
+            connection.close(PEER_NOT_APPROVED, UNSUPPORTED_PROTOCOL_REASON);
+        }
+    }
 }
 
 /// Runs the backend's post-run verification, if it has any, and resolves only if it fails.
@@ -378,10 +487,11 @@ async fn start(
     config: &LeaderConfig,
     prepared: &Prepared<'_>,
     peers: &SharedPeerTable,
+    ring: Option<RingSettings>,
 ) -> anyhow::Result<Running> {
     let backend = match prepared {
         Prepared::Llama(llama) => start_llama(endpoint, config, llama, peers).await?,
-        Prepared::Shard(manifest) => start_shard(endpoint, config, manifest.clone()).await?,
+        Prepared::Shard(manifest) => start_shard(endpoint, config, manifest.clone(), ring).await?,
     };
     let (api_stop, api) = start_api(config, peers);
     Ok(Running {
@@ -419,9 +529,10 @@ async fn start_shard(
     endpoint: &Endpoint,
     config: &LeaderConfig,
     manifest: ShardManifest,
+    ring: Option<RingSettings>,
 ) -> anyhow::Result<Backend> {
     let upstream = upstream_addr(config.upstream_port);
-    let (stop, mut frontend) = spawn_frontend(endpoint, upstream, manifest);
+    let (stop, mut frontend) = spawn_frontend(endpoint, upstream, manifest, ring);
     if let Err(error) = shard_ready(&mut frontend, upstream, config.worker_wait).await {
         stop_server(SHARD_FRONTEND_NAME, stop, frontend).await;
         return Err(error);
@@ -430,17 +541,20 @@ async fn start_shard(
 }
 
 /// Starts the shard front end on `listen` in the background, dialling remote stages from
-/// `endpoint`; sending on (or dropping) the returned sender stops it.
+/// `endpoint` (with `ring` for a ring manifest); sending on (or dropping) the returned sender
+/// stops it.
 fn spawn_frontend(
     endpoint: &Endpoint,
     listen: SocketAddr,
     manifest: ShardManifest,
+    ring: Option<RingSettings>,
 ) -> (oneshot::Sender<()>, JoinSet<anyhow::Result<()>>) {
     let (stop, stopped) = oneshot::channel::<()>();
     let config = FrontendConfig {
         listen,
         manifest,
         endpoint: endpoint.clone(),
+        ring,
     };
     let mut frontend = JoinSet::new();
     frontend.spawn(serve_frontend(config, async move {

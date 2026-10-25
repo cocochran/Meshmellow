@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct MembershipSummary: View {
+    @State private var confirmingLeave = false
     @EnvironmentObject private var enrollment: EnrollmentStore
     var body: some View {
         if let joining = enrollment.state?.joining { waiting(joining) }
@@ -22,6 +23,11 @@ struct MembershipSummary: View {
                     if member.id != enrollment.state?.members.last?.id { Divider().overlay(MeshPalette.line) }
                 }
                 StatusNote(symbol: "checkmark.shield", text: "Trusted members can invite and approve other devices.")
+                Button("Leave mesh", role: .destructive) { confirmingLeave = true }
+                    .disabled(enrollment.busy)
+                    .confirmationDialog("Leave this mesh?", isPresented: $confirmingLeave, titleVisibility: .visible) {
+                        Button("Leave mesh", role: .destructive) { Task { await enrollment.perform(["op": "leave"]) } }
+                    } message: { Text("This device will disconnect and return to Create / Join. Other devices keep their mesh and trust history.") }
             }
         }
     }
@@ -29,6 +35,17 @@ struct MembershipSummary: View {
         let isSelf = member.id == enrollment.state?.id
         return DisclosureGroup {
             VStack(alignment: .leading, spacing: 8) {
+                Eyebrow(text: "OpenAI-compatible API")
+                if let api = member.api {
+                    Text(api.inference_ready ? "Ready" : "Listening · inference unavailable").font(.subheadline)
+                    Text(api.base_url).font(.caption.monospaced()).textSelection(.enabled)
+                    Text(isSelf ? "On this device only" : "On that device only").font(.caption).foregroundStyle(MeshPalette.muted)
+                    Button("Copy API URL") { UIPasteboard.general.string = api.base_url }
+                    Text(api.message).font(.caption).foregroundStyle(MeshPalette.muted)
+                } else {
+                    Text(isSelf ? "API not running" : "API not reported").font(.subheadline)
+                    Text(isSelf ? "This device has not started an HTTP inference API." : "No current endpoint has been reported by this peer.").font(.caption).foregroundStyle(MeshPalette.muted)
+                }
                 Eyebrow(text: "Device identity")
                 Text(member.id).font(.caption.monospaced()).textSelection(.enabled)
                 Text("Trust is saved. Connected means the core is exchanging heartbeats; compute readiness is separate.").font(.caption).foregroundStyle(MeshPalette.muted)
@@ -103,6 +120,7 @@ struct PairingView: View {
     @State private var name = "My mesh"
     @State private var code = ""
     @State private var copied = false
+    @State private var scanning = false
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -121,7 +139,8 @@ struct PairingView: View {
                     ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() }.font(.subheadline.weight(.semibold)) }
                 }
                 .overlay { if enrollment.busy { ProgressView().padding(20).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16)) } }
-        }.presentationDetents([.large]).presentationDragIndicator(.visible).presentationCornerRadius(28)
+        }.fullScreenCover(isPresented: $scanning) { InvitationCamera { code = $0 } }
+        .presentationDetents([.large]).presentationDragIndicator(.visible).presentationCornerRadius(28)
             .task {
                 if enrollment.state?.mesh != nil && enrollment.state?.invite == nil && enrollment.state?.pending.isEmpty == true {
                     await enrollment.perform(["op": "invite"])
@@ -147,8 +166,9 @@ struct PairingView: View {
                 } label: { HStack { Text("Create mesh"); Spacer(); Image(systemName: "arrow.right") } }.buttonStyle(MeshButtonStyle())
                     .disabled(enrollment.busy || enrollment.state == nil || name.trimmingCharacters(in: .whitespaces).isEmpty || deviceName.trimmingCharacters(in: .whitespaces).isEmpty)
             } else {
+                Button { scanning = true } label: { Label("Scan cake QR", systemImage: "qrcode.viewfinder") }.buttonStyle(MeshButtonStyle(primary: false))
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("Invitation").font(.subheadline.weight(.medium))
+                    Text("Or paste an invitation").font(.subheadline.weight(.medium))
                     TextField("Paste your invitation", text: $code, axis: .vertical)
                         .font(.system(size: 14, design: .monospaced)).lineLimit(3...5).padding(18)
                         .background(MeshPalette.surface, in: RoundedRectangle(cornerRadius: 14))
@@ -170,10 +190,11 @@ struct PairingView: View {
                 CakeSprinkles()
                 Eyebrow(text: mesh.name)
                 Text("A familiar way in.").font(MeshType.display(35))
-                Text("Share this invitation, then paste it into Join a mesh on the other device.")
+                Text("On your other device, choose Join a mesh, then Scan cake QR.")
                     .font(.subheadline).foregroundStyle(MeshPalette.muted).lineSpacing(4)
             }
             if let invite = enrollment.state?.invite {
+                CakeInvitationQR(ticket: invite.ticket)
                 VStack(alignment: .leading, spacing: 14) {
                     Label("Private invitation", systemImage: "link").font(.headline)
                     Text(invite.ticket).font(.caption.monospaced()).lineLimit(3)

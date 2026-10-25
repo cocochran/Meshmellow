@@ -92,7 +92,6 @@ pub struct ApiConfig {
 /// State shared by every request handler.
 struct ApiState {
     queue: Arc<JobQueue>,
-    peers: SharedPeerTable,
     sink: Arc<dyn HistorySink>,
     client: reqwest::Client,
     upstream_url: String,
@@ -112,24 +111,30 @@ pub async fn serve_api(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     ensure_loopback(config.listen)?;
-    let client = reqwest::Client::builder()
-        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
-        .build()
-        .context("failed to build upstream http client")?;
-    let state = Arc::new(ApiState {
-        queue,
-        peers: config.peers,
-        sink,
-        client,
-        upstream_url: format!("http://{}{CHAT_COMPLETIONS_PATH}", config.upstream),
-    });
-    let router = Router::new()
-        .route(WEB_CLIENT_PATH, get(web_client))
-        .route(CHAT_COMPLETIONS_PATH, post(chat_completions))
-        .route(JOBS_PATH, get(list_jobs))
-        .route(PEERS_PATH, get(list_peers))
-        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
-        .with_state(state);
+    let profiles = match std::env::var_os("LAYERCAKE_PROFILE_CONFIG") {
+        Some(path) => {
+            Some(crate::profiling::ProfileManager::from_file(std::path::Path::new(&path)).await?)
+        }
+        None => None,
+    };
+    serve_api_with_profiles(config, queue, sink, profiles, shutdown).await
+}
+
+/// Existing API with optional managed profiling; native execution must share admission.
+pub async fn serve_api_with_profiles(
+    config: ApiConfig,
+    queue: Arc<JobQueue>,
+    sink: Arc<dyn HistorySink>,
+    profiles: Option<crate::profiling::ProfileManager>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
+    ensure_loopback(config.listen)?;
+    let mut router = queued_router(config.upstream, queue, sink)?
+        .merge(peer_router(config.peers))
+        .route(WEB_CLIENT_PATH, get(web_client));
+    if let Some(profiles) = &profiles {
+        router = router.merge(profiles.router());
+    }
     let listener = TcpListener::bind(config.listen)
         .await
         .with_context(|| format!("failed to bind api listener on {}", config.listen))?;
@@ -137,10 +142,38 @@ pub async fn serve_api(
         .local_addr()
         .context("failed to read api listener address")?;
     info!(listen = %local, upstream = %config.upstream, "api listening");
-    axum::serve(listener, router)
+    let result = axum::serve(listener, router)
         .with_graceful_shutdown(shutdown)
         .await
-        .context("api server failed")
+        .context("api server failed");
+    if let Some(profiles) = profiles {
+        profiles.shutdown().await?;
+    }
+    result
+}
+
+/// Reusable queued inference routes for the integrated desktop runtime.
+pub fn queued_router(
+    upstream: SocketAddr,
+    queue: Arc<JobQueue>,
+    sink: Arc<dyn HistorySink>,
+) -> anyhow::Result<Router> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+        .build()
+        .context("failed to build upstream http client")?;
+    let state = Arc::new(ApiState {
+        queue,
+        sink,
+        client,
+        upstream_url: format!("http://{}{CHAT_COMPLETIONS_PATH}", upstream),
+    });
+    let router = Router::new()
+        .route(CHAT_COMPLETIONS_PATH, post(chat_completions))
+        .route(JOBS_PATH, get(list_jobs))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        .with_state(state);
+    Ok(router)
 }
 
 async fn web_client() -> Html<&'static str> {
@@ -186,19 +219,31 @@ async fn list_jobs(State(state): State<Arc<ApiState>>) -> Json<Vec<JobInfo>> {
 }
 
 #[derive(Serialize)]
-struct PeerSummary {
+pub struct PeerSummary {
     /// Authenticated Iroh endpoint ID in its canonical display form.
-    node_id: String,
+    pub node_id: String,
     /// Unix milliseconds when this peer's current control connection was recorded.
-    connected_at_unix_ms: u64,
+    pub connected_at_unix_ms: u64,
     /// Unix milliseconds of the last accepted heartbeat, if one has arrived.
-    last_heartbeat_unix_ms: Option<u64>,
+    pub last_heartbeat_unix_ms: Option<u64>,
+}
+
+/// Read-only authenticated control peers, independently of inference readiness.
+pub fn peer_router(peers: SharedPeerTable) -> Router {
+    Router::new()
+        .route(PEERS_PATH, get(list_peers))
+        .with_state(peers)
 }
 
 async fn list_peers(
-    State(state): State<Arc<ApiState>>,
+    State(peers): State<SharedPeerTable>,
 ) -> Result<Json<Vec<PeerSummary>>, StatusCode> {
-    let peers = state.peers.lock().map_err(|error| {
+    peer_snapshot(&peers).map(Json)
+}
+
+/// Shared projection for the API and the embedded dashboard.
+pub fn peer_snapshot(table: &SharedPeerTable) -> Result<Vec<PeerSummary>, StatusCode> {
+    let peers = table.lock().map_err(|error| {
         warn!(%error, "peer table lock poisoned; refusing to report peer status");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
@@ -211,7 +256,7 @@ async fn list_peers(
         })
         .collect::<Vec<_>>();
     summaries.sort_by(|a, b| a.node_id.cmp(&b.node_id));
-    Ok(Json(summaries))
+    Ok(summaries)
 }
 
 async fn chat_completions(State(state): State<Arc<ApiState>>, body: Bytes) -> Response {

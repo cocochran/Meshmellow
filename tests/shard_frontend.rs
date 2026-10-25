@@ -274,6 +274,7 @@ impl Frontend {
             listen: addr,
             manifest,
             endpoint: endpoint.clone(),
+            ring: None,
         };
         let task = tokio::spawn(serve_frontend(config, async {
             let _ = stopped.await;
@@ -588,6 +589,7 @@ async fn plain_model_identity_comes_from_a_verified_artifact_hash() {
         listen: free_loopback_addr(),
         manifest: manifest(FIXTURE_SHA, CONTEXT, vec![wrong]),
         endpoint: bind_endpoint(Vec::new(), None).await,
+        ring: None,
     };
     let error = serve_frontend(config, std::future::pending())
         .await
@@ -628,6 +630,7 @@ async fn non_loopback_listen_is_refused() {
             vec![local_stage(0, LAYERS, &model, &[])],
         ),
         endpoint: bind_endpoint(Vec::new(), None).await,
+        ring: None,
     };
     let error = serve_frontend(config, std::future::pending())
         .await

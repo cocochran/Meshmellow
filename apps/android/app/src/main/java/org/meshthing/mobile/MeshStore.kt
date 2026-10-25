@@ -14,7 +14,8 @@ import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 
 class MeshStore(app: Application) : AndroidViewModel(app) {
-    val enrollment = EnrollmentController(app)
+    val runtime = (app as LayercakeApplication).meshRuntime
+    val enrollment = runtime.enrollment
     private val preferences = app.getSharedPreferences("meshthing", 0)
     var endpoint by mutableStateOf(preferences.getString("dashboard", "")!!); private set
     var deviceName by mutableStateOf(preferences.getString("deviceName", "My device")!!); private set

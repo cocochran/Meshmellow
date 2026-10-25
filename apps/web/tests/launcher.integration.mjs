@@ -1,86 +1,81 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createServer } from 'node:http';
+import { createServer, request } from 'node:http';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { requireCoreBinary, runtimeReady, stopChild } from './runtime-process.mjs';
 
-async function freePort() {
-  const server = createServer();
-  server.listen(0, '127.0.0.1');
-  await once(server, 'listening');
-  const port = server.address().port;
-  await new Promise((resolve) => server.close(resolve));
-  return port;
-}
-
-test('production launcher serves live/core/disconnected states and persists only valid local preferences', { timeout: 30000 }, async () => {
-  const state = await mkdtemp(join(tmpdir(), 'meshthing-web-integration-'));
-  const requests = [];
-  let unavailable = false;
-  const fixture = createServer((req, res) => {
-    requests.push(`${req.method} ${req.url}`);
-    if (unavailable) { res.writeHead(503).end(); return; }
+test('one runtime owns static UI, enrollment, API queue, settings and shutdown', { timeout: 60000 }, async (t) => {
+  const binary = await requireCoreBinary();
+  const state = await mkdtemp(join(tmpdir(), 'layercake-runtime-'));
+  const requests = []; let active = 0; let maxActive = 0;
+  const fixture = createServer(async (req, res) => {
+    if (req.url === '/health') { res.end('{}'); return; }
     res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify(req.url === '/jobs'
-      ? [{ request_id: 'synthetic-request', status: 'queued', created_at_unix_ms: 1000 }]
-      : { event: 'done', active: false, prompt: 'PRIVATE_FIXTURE', text: 'PRIVATE_FIXTURE', topology: [{ device: 'Synthetic phone', range: [0, 4] }], devices: [{ status: 'returned', layers: 4, allocated_bytes: 1024 }] }));
+    if (req.url === '/v1/models') { res.end('{"object":"list","data":[{"id":"test-model"}]}'); return; }
+    if (req.url !== '/v1/chat/completions') { res.writeHead(404).end(); return; }
+    let body = ''; for await (const part of req) body += part;
+    const data = JSON.parse(body); requests.push(data); maxActive = Math.max(maxActive, ++active);
+    await new Promise(r => setTimeout(r, 80)); active--;
+    if (data.stall) { res.setHeader('Content-Type','text/event-stream'); res.write('data: {"choices":[{"delta":{"content":"waiting"}}]}\n\n'); return; }
+    if (data.stream) { res.setHeader('Content-Type','text/event-stream'); res.end('data: {"choices":[{"delta":{"content":"hello"}}]}\n\ndata: [DONE]\n\n'); }
+    else res.end('{"choices":[{"message":{"role":"assistant","content":"hello"}}]}');
   });
-  fixture.listen(0, '127.0.0.1');
-  await once(fixture, 'listening');
-  const runtime = `http://127.0.0.1:${fixture.address().port}`;
-  let child;
-  async function start(source, connected = true) {
-    const port = await freePort();
-    const origin = `http://127.0.0.1:${port}`;
-    child = spawn(process.execPath, ['scripts/serve.mjs', '--port', `${port}`, '--source', source, ...(connected ? ['--runtime', runtime] : [])], {
-      cwd: new URL('..', import.meta.url),
-      env: { ...process.env, MESHTHING_UI_STATE_DIR: state, MESHTHING_RUNTIME_URL: '' },
-      stdio: ['ignore', 'pipe', 'pipe']
-    });
-    await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('Launcher did not become ready')), 10000);
-      child.once('exit', (code) => { clearTimeout(timeout); reject(new Error(`Launcher exited ${code}`)); });
-      child.stdout.on('data', (data) => { if (data.toString().includes(origin)) { clearTimeout(timeout); resolve(); } });
-      child.stderr.on('data', (data) => { clearTimeout(timeout); reject(new Error(data.toString())); });
-    });
-    return origin;
+  fixture.listen(0, '127.0.0.1'); await once(fixture,'listening');
+  let child, origin;
+  async function start(upstream = true) {
+    child = spawn(binary, ['ui','--no-open','--port','0','--state-dir',state,'--assets',resolve('build'),...(upstream ? ['--upstream',`127.0.0.1:${fixture.address().port}`] : [])], { stdio: ['ignore','pipe','pipe'] });
+    origin = await runtimeReady(child, /Layercake: (http:\/\/127\.0\.0\.1:\d+)/);
   }
-  async function stop() {
-    if (child && child.exitCode === null) { const ended = once(child, 'exit'); child.kill('SIGTERM'); await ended; }
-  }
+  async function stop() { await stopChild(child); }
+  t.after(async () => {
+    try { await stop(); } finally {
+      fixture.closeAllConnections();
+      await new Promise(r => fixture.close(r));
+      await rm(state, { recursive: true, force: true });
+    }
+  });
+  const get = async path => (await fetch(origin+path)).json();
+  const send = (path, body, method = 'POST', extra = {}) => fetch(origin+path, {method,headers:{Origin:origin,'Content-Type':'application/json',...extra},body:JSON.stringify(body)});
   try {
-    let origin = await start('live-demo');
-    assert.equal((await fetch(origin)).status, 200);
-    const stateReply = await fetch(`${origin}/api/mesh`);
-    assert.equal(stateReply.headers.get('cache-control'), 'no-store');
-    const snapshot = await stateReply.json();
-    assert.equal(snapshot.connected, true);
-    assert.equal(snapshot.devices[0].name, 'Synthetic phone');
-    assert.doesNotMatch(JSON.stringify(snapshot), /PRIVATE_FIXTURE/);
-    const settings = { displayName: 'Integration mesh', refreshSeconds: 10 };
-    const put = (body, headers = {}) => fetch(`${origin}/api/preferences`, { method: 'PUT', headers: { 'Content-Type': 'application/json', Origin: origin, ...headers }, body: JSON.stringify(body) });
-    assert.equal((await put(settings, { Origin: 'https://example.com' })).status, 403);
-    assert.equal((await put({ displayName: '', refreshSeconds: 0 })).status, 400);
-    assert.deepEqual(await (await put(settings)).json(), settings);
-    unavailable = true;
-    assert.equal((await (await fetch(`${origin}/api/mesh`)).json()).connected, false);
-    unavailable = false;
-    await stop();
-    origin = await start('core');
-    assert.deepEqual(await (await fetch(`${origin}/api/preferences`)).json(), settings);
-    const core = await (await fetch(`${origin}/api/mesh`)).json();
-    assert.equal(core.jobs[0].id, 'synthetic-request');
-    assert.equal(core.devices.length, 0);
-    await stop();
-    origin = await start('live-demo', false);
-    assert.equal((await (await fetch(`${origin}/api/mesh`)).json()).endpoint, null);
-    assert.ok(requests.every((path) => ['GET /jobs', 'GET /state'].includes(path)), 'UI must never mutate the runtime');
-  } finally {
-    await stop();
-    await new Promise((resolve) => fixture.close(resolve));
-    await rm(state, { recursive: true, force: true });
-  }
+    await start();
+    const root = await fetch(origin); assert.equal(root.status,200); assert.match(await root.text(), /_app/);
+    const status = await get('/api/status'); assert.equal(status.pid,child.pid); assert.equal(status.api.base_url,origin+'/v1'); assert.equal(status.api.inference_ready,false);
+    assert.equal((await send('/v1/chat/completions',{messages:[]})).status,503);
+    assert.equal((await fetch(origin+'/v1/models')).status,503);
+    assert.deepEqual(await get('/peers'), []);
+    const telemetry = await get('/api/mesh');
+    assert.equal(telemetry.peerStatusAvailable, true);
+    assert.deepEqual(telemetry.peers, []);
+  } finally { await stop(); }
+  try {
+    await start();
+    assert.equal((await send('/api/enrollment',{op:'create'},'POST',{Origin:'https://example.com'})).status,403);
+    assert.equal((await send('/api/enrollment',{op:'discover',peers:[]})).status,400);
+    assert.equal(await new Promise((ok, fail) => { const req = request(origin+'/api/status', {headers:{Host:'evil.example'}}, res => { res.resume(); ok(res.statusCode); }); req.on('error',fail); req.end(); }),403);
+    assert.equal((await send('/api/enrollment',{op:'create',name:'Integration',device_name:'Desktop'})).status,200);
+    const enrolled = await get('/api/enrollment'); assert.equal(enrolled.members[0].api.base_url,origin+'/v1');
+    assert.equal((await get('/api/status')).api.inference_ready,true);
+    assert.equal((await get('/v1/models')).data[0].id,'test-model');
+    const chat = () => send('/v1/chat/completions',{messages:[{role:'user',content:'hello'}],conversation_id:'private'});
+    const replies = await Promise.all([chat(),chat(),chat()]); for(const r of replies) {assert.equal(r.status,200); await r.text();}
+    assert.equal(maxActive,1); assert.equal(requests.length,3); assert.ok(requests.every(r=>!('conversation_id' in r)));
+    const stream = await send('/v1/chat/completions',{messages:[],stream:true}); assert.match(await stream.text(), /\[DONE\]/);
+    const jobs = await get('/jobs'); assert.equal(jobs.length,4); assert.ok(jobs.every(j=>j.status==='completed'));
+    const settings = {displayName:'Kitchen mesh',refreshSeconds:10};
+    assert.equal((await send('/api/preferences',{displayName:'',refreshSeconds:0},'PUT')).status,400);
+    assert.deepEqual(await (await send('/api/preferences',settings,'PUT')).json(),settings);
+    const stalled = await send('/v1/chat/completions',{messages:[],stream:true,stall:true});
+    assert.equal(stalled.status,200);
+    const beforeStop = Date.now();
+    const oldOrigin = origin; await stop();
+    assert.ok(Date.now()-beforeStop < 10000,'stalled streams must not block runtime shutdown'); await assert.rejects(fetch(oldOrigin));
+    await start(false); assert.deepEqual(await get('/api/preferences'),settings); assert.equal((await get('/api/enrollment')).id,enrolled.id);
+    assert.equal((await get('/api/status')).api.inference_ready,false); assert.equal((await send('/v1/chat/completions',{})).status,503);
+    assert.equal((await send('/api/enrollment',{op:'leave'})).status,200);
+    await stop(); await start(false); assert.equal((await get('/api/enrollment')).mesh,null);
+  } finally { await stop(); }
 });

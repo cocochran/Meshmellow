@@ -10,17 +10,21 @@
 //!   `seed` are accepted and ignored; `max_tokens` / `max_completion_tokens` are honoured up to
 //!   the manifest's `max_tokens`.
 //!
+//! With an EXPERIMENTAL ring manifest each request instead starts the local stage 0 and a fresh
+//! shard-ring session ([`RingLink`]); [`FrontendConfig::ring`] must then carry the registry the
+//! leader's endpoint delivers result channels to.
+//!
 //! One generation runs at a time; later requests wait for the lock. A failure before any
 //! response bytes are sent is a JSON error with a 5xx status (400 for a prompt longer than
 //! the context). A failure mid-stream sends an SSE `error` event and ends without `[DONE]`,
-//! which makes the job API fail the job without committing history. A client disconnect signals
-//! cancellation, then the pipeline kills and reaps local runners before releasing its slot.
+//! which makes the job API fail the job without committing history. A client that disconnects
+//! drops its generation, which kills the local runners and closes the remote streams.
 
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
 use axum::body::{Body, Bytes};
@@ -30,24 +34,25 @@ use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use futures_util::future::join_all;
+use futures_util::future::try_join_all;
 use futures_util::{StreamExt, stream};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
-use tokio::sync::oneshot;
+use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::api::CHAT_COMPLETIONS_PATH;
-use crate::shard::manifest::{ChatTemplate, ShardManifest, StageLocation, StageSpec};
+use crate::shard::manifest::{ShardManifest, StageLocation, StageSpec};
 use crate::shard::manifest::{same_sha256, sha256_file};
 use crate::shard::pipeline::{
     FinishReason, Generation, GenerationCancelled, GenerationLimits, LocalLaunch, METADATA_TIMEOUT,
     Pipeline, PromptTooLong, StageExpectation, StageIdentity, StageLink,
 };
+use crate::shard::ring_origin::{RingLink, RingPlan, RingSettings};
+use crate::shard::template::{ChatMessage, ChatRenderer};
 
 /// Liveness probe, as llama-server serves it.
 pub const HEALTH_PATH: &str = "/health";
@@ -78,24 +83,39 @@ pub struct FrontendConfig {
     pub manifest: ShardManifest,
     /// Iroh endpoint used to dial remote stages.
     pub endpoint: iroh::Endpoint,
+    /// Required for a ring manifest (`"execution": "ring"`) and ignored otherwise: the registry
+    /// the endpoint's accept loop delivers terminals' result channels to, and the readiness wait.
+    pub ring: Option<RingSettings>,
+}
+
+/// What a ring manifest's generations need besides the manifest.
+struct RingRuntime {
+    plan: RingPlan,
+    settings: RingSettings,
 }
 
 /// Serves `GET /health` and `POST /v1/chat/completions` on `config.listen` until `shutdown`
 /// resolves, then finishes in-flight requests and returns.
 ///
 /// Before binding it validates the manifest and hashes every local stage file that has a
-/// configured `artifact_sha256` (once, on a blocking thread), failing on any mismatch.
+/// configured `artifact_sha256` (once, on a blocking thread), failing on any mismatch. It also
+/// loads the chat template once ([`ChatRenderer::load`]), refusing a pinned template that is
+/// missing, does not match its `sha256` or does not compile.
 pub async fn serve_frontend(
     config: FrontendConfig,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     ensure_loopback(config.listen)?;
     config.manifest.validate()?;
+    let ring = ring_runtime(&config.manifest, config.ring)?;
+    let renderer = ChatRenderer::load(&config.manifest.chat_template)?;
     verify_artifacts(&config.manifest).await?;
     let state = Arc::new(FrontendState {
         expectations: stage_expectations(&config.manifest),
         manifest: config.manifest,
         endpoint: config.endpoint,
+        ring,
+        renderer,
         generation_lock: Arc::new(Mutex::new(())),
     });
     let router = Router::new()
@@ -121,8 +141,30 @@ struct FrontendState {
     manifest: ShardManifest,
     endpoint: iroh::Endpoint,
     expectations: Vec<StageExpectation>,
+    /// Set for a ring manifest only.
+    ring: Option<RingRuntime>,
+    /// The manifest's chat template, verified and compiled at startup.
+    renderer: ChatRenderer,
     /// Held for the whole of a generation, so only one runs at a time.
     generation_lock: Arc<Mutex<()>>,
+}
+
+/// The ring runtime of a ring manifest, which needs `settings`; `None` for a pipeline manifest.
+fn ring_runtime(
+    manifest: &ShardManifest,
+    settings: Option<RingSettings>,
+) -> anyhow::Result<Option<RingRuntime>> {
+    if !manifest.is_ring() {
+        return Ok(None);
+    }
+    let settings = settings.context(
+        "a ring manifest (\"execution\": \"ring\") needs the leader's ring settings: \
+         FrontendConfig::ring must carry the result-channel registry its endpoint feeds",
+    )?;
+    Ok(Some(RingRuntime {
+        plan: RingPlan::from_manifest(manifest)?,
+        settings,
+    }))
 }
 
 fn ensure_loopback(listen: SocketAddr) -> anyhow::Result<()> {
@@ -241,7 +283,7 @@ impl MessageContent {
 /// Parses a chat request, renders its prompt, and caps `max_tokens` at `max_tokens_cap`.
 fn parse_chat_request(
     body: &[u8],
-    template: ChatTemplate,
+    renderer: &ChatRenderer,
     max_tokens_cap: u32,
 ) -> Result<ChatRequest, String> {
     let raw: RawChatRequest = serde_json::from_slice(body).map_err(|error| {
@@ -256,31 +298,22 @@ fn parse_chat_request(
     if requested == Some(0) {
         return Err("max_tokens must be at least 1".to_owned());
     }
-    let messages = raw
+    let messages: Vec<ChatMessage> = raw
         .messages
         .into_iter()
-        .map(|message| (message.role, message.content.into_text()));
+        .map(|message| ChatMessage {
+            role: message.role,
+            content: message.content.into_text(),
+        })
+        .collect();
+    let prompt = renderer
+        .render(&messages)
+        .map_err(|error| error.to_string())?;
     Ok(ChatRequest {
-        prompt: render_prompt(template, messages),
+        prompt,
         stream: raw.stream.unwrap_or(false),
         max_tokens: requested.map_or(max_tokens_cap, |asked| asked.min(max_tokens_cap)),
     })
-}
-
-/// Renders `(role, content)` pairs into the prompt string the final stage tokenizes.
-fn render_prompt(
-    template: ChatTemplate,
-    messages: impl Iterator<Item = (String, String)>,
-) -> String {
-    match template {
-        ChatTemplate::Chatml => {
-            let mut prompt: String = messages
-                .map(|(role, content)| format!("<|im_start|>{role}\n{content}<|im_end|>\n"))
-                .collect();
-            prompt.push_str("<|im_start|>assistant\n");
-            prompt
-        }
-    }
 }
 
 /// Progress of one generation, sent from its task to the request handler.
@@ -390,7 +423,7 @@ impl Completion {
 
 async fn chat_completions(State(state): State<Arc<FrontendState>>, body: Bytes) -> Response {
     let manifest = &state.manifest;
-    let request = match parse_chat_request(&body, manifest.chat_template, manifest.max_tokens) {
+    let request = match parse_chat_request(&body, &state.renderer, manifest.max_tokens) {
         Ok(request) => request,
         Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
     };
@@ -433,7 +466,7 @@ async fn run_generation(
     events: Sender<Event>,
     mut cancel: oneshot::Receiver<()>,
 ) {
-    let queued_at = Instant::now();
+    let queued_at = std::time::Instant::now();
     let _turn = tokio::select! {
         biased;
         _ = &mut cancel => return,
@@ -475,43 +508,20 @@ async fn generate(
     let opened = tokio::select! {
         biased;
         _ = &mut cancel => return Err(GenerationCancelled.into()),
-        opened = join_all(
-            state
-                .manifest
-                .stages
-                .iter()
-                .map(|stage| open_link(state, stage, prompt)),
-        ) => opened,
+        pipeline = async {
+            match &state.ring {
+                None => open_pipeline(state, prompt).await,
+                Some(ring) => open_ring_pipeline(state, ring, prompt).await,
+            }
+        } => pipeline,
     };
-    let mut links = Vec::with_capacity(opened.len());
-    let mut first_error = None;
-    for result in opened {
-        match result {
-            Ok(link) => links.push(link),
-            Err(error) if first_error.is_none() => first_error = Some(error),
-            Err(_) => {}
-        }
-    }
-    if cancel.try_recv().is_ok() {
-        Pipeline::close_links(links, true).await;
-        return Err(GenerationCancelled.into());
-    }
-    if let Some(error) = first_error {
-        Pipeline::close_links(links, true).await;
-        return Err(error);
-    }
-    if let Err(error) = Pipeline::validate_links(&links, &state.expectations) {
-        Pipeline::close_links(links, true).await;
-        return Err(error);
-    }
-    let pipeline = Pipeline::new(links, &state.expectations)?;
+    let pipeline = opened?;
     let context = state.manifest.context;
     // Checked before `Started` so an oversized prompt is still answered with a 400.
     if let Err(error) = pipeline.ensure_prompt_fits(context) {
         pipeline.close(true).await;
         return Err(error.into());
     }
-    // A send fails only once the handler is gone; its cancellation signal then ends the run.
     let _ = events.send(Event::Started).await;
     let limits = GenerationLimits {
         max_tokens,
@@ -528,6 +538,38 @@ async fn generate(
             }
         })
         .await
+}
+
+/// Opens every stage of a pipeline manifest at once and validates them.
+async fn open_pipeline(state: &FrontendState, prompt: &str) -> anyhow::Result<Pipeline> {
+    let links = try_join_all(
+        state
+            .manifest
+            .stages
+            .iter()
+            .map(|stage| open_link(state, stage, prompt)),
+    )
+    .await?;
+    Pipeline::new(links, &state.expectations)
+}
+
+/// Starts the local stage 0 and the ring session at once and validates them together.
+async fn open_ring_pipeline(
+    state: &FrontendState,
+    ring: &RingRuntime,
+    prompt: &str,
+) -> anyhow::Result<Pipeline> {
+    let (stage, expected) = state
+        .manifest
+        .stages
+        .first()
+        .zip(state.expectations.first())
+        .context("the ring manifest has no local stage")?;
+    let (local, link) = tokio::try_join!(
+        open_link(state, stage, prompt),
+        RingLink::open(&state.endpoint, &ring.plan, &ring.settings),
+    )?;
+    Pipeline::with_ring(local, link, expected)
 }
 
 async fn open_link(
@@ -577,7 +619,7 @@ async fn buffered_response(mut events: Receiver<Event>, _task: GenerationTask) -
     }
 }
 
-/// State of one streamed reply; dropping it signals cooperative generation cancellation.
+/// State of one streamed reply; dropping it (client disconnect) aborts the generation.
 struct SseStream {
     events: Receiver<Event>,
     completion: Completion,
@@ -663,11 +705,13 @@ fn error_response(status: StatusCode, message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shard::manifest::ChatTemplate;
 
     const CAP: u32 = 64;
 
     fn parse(body: Value) -> Result<ChatRequest, String> {
-        parse_chat_request(body.to_string().as_bytes(), ChatTemplate::Chatml, CAP)
+        let renderer = ChatRenderer::load(&ChatTemplate::Chatml).unwrap();
+        parse_chat_request(body.to_string().as_bytes(), &renderer, CAP)
     }
 
     #[test]

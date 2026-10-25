@@ -1,4 +1,4 @@
-"""Package terminal executables, browser dashboard, and a standalone Node runtime."""
+"""Package terminal executables, browser dashboard, in one Rust process."""
 import argparse
 import hashlib
 import json
@@ -21,7 +21,6 @@ def main() -> None:
     parser.add_argument('--target', required=True)
     parser.add_argument('--revision', required=True)
     parser.add_argument('--target-dir', default=os.environ.get('CARGO_TARGET_DIR', 'target'))
-    parser.add_argument('--node', default=shutil.which('node'))
     args = parser.parse_args()
     windows = 'windows' in args.target
     extension = '.exe' if windows else ''
@@ -30,10 +29,8 @@ def main() -> None:
     for binary in binaries:
         if not binary.is_file():
             raise SystemExit(f'Release executable missing: {binary}')
-    if not args.node or not (Path('apps/web/build/handler.js')).is_file():
-        raise SystemExit('Build apps/web and install the official Node distribution before packaging.')
-    node = Path(args.node).resolve()
-    node_version = subprocess.check_output([str(node), '--version'], text=True).strip()
+    if not Path('apps/web/build/index.html').is_file():
+        raise SystemExit('Build apps/web before packaging.')
     output = Path('dist')
     output.mkdir(exist_ok=True)
     stem = f'meshthing-{args.target}'
@@ -44,21 +41,7 @@ def main() -> None:
             executable = bundle / binary.name
             shutil.copy2(binary, executable)
             executable.chmod(0o755)
-        runtime = bundle / 'runtime'
-        runtime.mkdir()
-        shutil.copy2(node, runtime / ('node' + extension))
-        (runtime / ('node' + extension)).chmod(0o755)
-        license_bytes = subprocess.check_output([
-            str(node), '--input-type=module', '-e',
-            'const r = await fetch(process.argv[1]); if (!r.ok) throw Error(`License HTTP ${r.status}`); process.stdout.write(await r.text());',
-            f'https://raw.githubusercontent.com/nodejs/node/{node_version}/LICENSE',
-        ], timeout=30)
-        (runtime / 'Node-LICENSE.txt').write_bytes(license_bytes)
         shutil.copytree('apps/web/build', bundle / 'web/build')
-        (bundle / 'web/scripts').mkdir()
-        for name in ['serve.mjs', 'validation.mjs']:
-            shutil.copy2(Path('apps/web/scripts') / name, bundle / 'web/scripts' / name)
-        (bundle / 'web/package.json').write_text('{"type":"module"}\n', encoding='utf-8')
         # Preserve notices for dependencies compiled into the dashboard, including its fonts.
         notices = bundle / 'third-party-licenses'
         notices.mkdir()
@@ -87,18 +70,16 @@ def main() -> None:
         (bundle / 'build.json').write_text(json.dumps({
             'revision': args.revision, 'target': args.target,
             'executables': {binary.name: digest(binary) for binary in binaries},
-            'node_version': node_version, 'node_sha256': digest(node),
         }, indent=2) + '\n', encoding='utf-8')
         (bundle / 'README.txt').write_text(
             'MeshThing terminal tools + browser dashboard\n\n'
             f'Run meshthing{extension} in a terminal to start the dashboard and open your default browser.\n'
-            'The terminal stays running. Ctrl+C stops the dashboard only.\n'
-            'Default data source: a separately running local core at http://127.0.0.1:8080.\n'
-            'For the diagnostic demo: meshthing --source live-demo\n'
-            'Use --runtime http://127.0.0.1:PORT for another loopback runtime, or --no-open.\n'
+            'The terminal stays running. Ctrl+C stops the runtime and its dashboard.\n'
+            'The runtime owns membership, heartbeat, and the local OpenAI API.\n'
+            'Use --upstream 127.0.0.1:PORT to attach a running inference backend, or --no-open.\n'
             f'Run llm-cluster{extension} --help for core commands.\n'
-            'Keep web/ and runtime/ beside the executables. Node need not be installed.\n'
-            'Neither launcher starts workers or downloads models. Native inference runners/model weights are separate.\n'
+            'Keep web/ beside the executables. No Node runtime is needed.\n'
+            'Inference runners and model weights remain separate.\n'
             'Development executables are unsigned and not notarized.\n'
             f'\nSource revision: {args.revision}\nTarget: {args.target}\n', encoding='utf-8')
         if windows:
