@@ -90,7 +90,21 @@ const OWNER_ONLY_MODE: u32 = 0o600;
 ///
 /// Uses the n0 defaults: public relays plus DNS address lookup, so peers can dial by node ID alone.
 pub async fn bind_endpoint(key_path: &Path, alpns: Vec<Vec<u8>>) -> anyhow::Result<Endpoint> {
-    bind_with_preset(key_path, alpns, presets::N0).await
+    bind_endpoint_with_key(load_or_create_secret_key(key_path)?, alpns).await
+}
+
+/// Shares the core's Internet-capable endpoint configuration with embedded apps
+/// that already own a persisted identity. Does not replace or migrate that key.
+pub async fn bind_endpoint_with_key(
+    key: SecretKey,
+    alpns: Vec<Vec<u8>>,
+) -> anyhow::Result<Endpoint> {
+    Ok(endpoint_builder_with_key(key, alpns).bind().await?)
+}
+
+/// The core transport defaults, also used by mobile embeddings and relay tests.
+pub fn endpoint_builder_with_key(key: SecretKey, alpns: Vec<Vec<u8>>) -> iroh::endpoint::Builder {
+    Endpoint::builder(presets::N0).secret_key(key).alpns(alpns)
 }
 
 /// Like [`bind_endpoint`] but with no relays and no address lookup, for tests and isolated LANs.
@@ -226,6 +240,16 @@ pub async fn accept_peer(
     peers: &SharedPeerTable,
 ) -> anyhow::Result<PeerSession> {
     let connection = incoming.await.context("incoming connection failed")?;
+    accept_peer_connection(connection, local, peers).await
+}
+
+/// Completes the core hello after a protocol router has authenticated and admitted
+/// a connection. The caller must enforce its membership policy before calling.
+pub async fn accept_peer_connection(
+    connection: Connection,
+    local: &Hello,
+    peers: &SharedPeerTable,
+) -> anyhow::Result<PeerSession> {
     let (hello, token) =
         finish_handshake(&connection, acceptor_handshake(&connection, local, peers)).await?;
     Ok(PeerSession::start(connection, hello, token, peers))
@@ -290,21 +314,30 @@ async fn run_control_session(
 ) {
     match accept_peer(incoming, local, peers).await {
         Ok(session) => {
-            let watchdog = HeartbeatWatchdog::new(options.heartbeat_timeout, Arming::AtStart);
-            let sender = send_heartbeats(
-                session.connection(),
-                &local.node_id,
-                options.heartbeat_interval,
-            );
-            // The sender never completes, so the session ends exactly when receiving does, and
-            // the sender is dropped with it.
-            let reason = tokio::select! {
-                reason = receive_control_streams(&session, peers, watchdog) => reason,
-                never = sender => match never {},
-            };
+            let reason = maintain_peer_session(&session, &local.node_id, peers, options).await;
             info!(peer = %session.hello().node_id, %reason, "peer disconnected");
         }
         Err(error) => warn!("rejected incoming connection: {error:#}"),
+    }
+}
+
+/// Maintains an already admitted core session with bidirectional heartbeats.
+/// Used by the mesh protocol router after the membership-gated hello.
+pub async fn maintain_peer_session(
+    session: &PeerSession,
+    local_node_id: &str,
+    peers: &SharedPeerTable,
+    options: ControlOptions,
+) -> ConnectionError {
+    let watchdog = HeartbeatWatchdog::new(nonzero(options.heartbeat_timeout), Arming::AtStart);
+    let sender = send_heartbeats(
+        session.connection(),
+        local_node_id,
+        nonzero(options.heartbeat_interval),
+    );
+    tokio::select! {
+        reason = receive_control_streams(session, peers, watchdog) => reason,
+        never = sender => match never {},
     }
 }
 
@@ -451,6 +484,7 @@ async fn receive_control_streams(
                 Ok(recv) => {
                     let reader = StreamReader {
                         peer: session.node_id(),
+                        connection_token: session.connection_token(),
                         peers: Arc::clone(peers),
                         accepted_heartbeat: Arc::clone(&accepted_heartbeat),
                     };
@@ -485,6 +519,7 @@ async fn close_for_heartbeat_timeout(
 /// peer table accepts.
 struct StreamReader {
     peer: NodeId,
+    connection_token: u64,
     peers: SharedPeerTable,
     accepted_heartbeat: Arc<Notify>,
 }
@@ -510,7 +545,7 @@ impl StreamReader {
 
     /// Records `heartbeat` and, if the table accepts it, resets the session's watchdog.
     fn on_heartbeat(&self, heartbeat: &Heartbeat) {
-        if record_heartbeat(&self.peers, self.peer, heartbeat) {
+        if record_heartbeat(&self.peers, self.peer, self.connection_token, heartbeat) {
             self.accepted_heartbeat.notify_one();
         }
     }
@@ -518,7 +553,12 @@ impl StreamReader {
 
 /// Records a heartbeat from `peer`, dropping it if it names another node or is stale; returns
 /// whether the table accepted it.
-fn record_heartbeat(peers: &SharedPeerTable, peer: NodeId, heartbeat: &Heartbeat) -> bool {
+fn record_heartbeat(
+    peers: &SharedPeerTable,
+    peer: NodeId,
+    connection_token: u64,
+    heartbeat: &Heartbeat,
+) -> bool {
     if parse_node_id(&heartbeat.node_id).ok() != Some(peer) {
         warn!(%peer, claimed = %heartbeat.node_id, "ignoring heartbeat sent for another node");
         return false;
@@ -527,6 +567,11 @@ fn record_heartbeat(peers: &SharedPeerTable, peer: NodeId, heartbeat: &Heartbeat
         warn!(%peer, "peer table lock poisoned; dropping heartbeat");
         return false;
     };
+    // A superseded connection must not overwrite the replacement's sequence or
+    // liveness. Check under the same lock as the update, just like peer cleanup.
+    if table.get(&peer).map(|info| info.connection_token) != Some(connection_token) {
+        return false;
+    }
     let accepted = table.record_heartbeat(&peer, heartbeat);
     if accepted {
         debug!(%peer, epoch = heartbeat.epoch, sequence = heartbeat.sequence, "heartbeat");
@@ -730,6 +775,58 @@ fn encode_hex(bytes: &[u8; SECRET_KEY_LEN]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn superseded_connection_cannot_update_reconnected_peers_heartbeat() {
+        let peer = SecretKey::generate().public();
+        let hello = Hello {
+            node_id: peer.to_string(),
+            protocol_version: 1,
+            cluster_id: "test".into(),
+            last_log_index: 0,
+        };
+        let peers = Arc::new(Mutex::new(crate::node::PeerTable::new()));
+        let old = peers
+            .lock()
+            .unwrap()
+            .record_connection(peer, &hello)
+            .connection_token;
+        let current = peers
+            .lock()
+            .unwrap()
+            .record_connection(peer, &hello)
+            .connection_token;
+        let stale = Heartbeat {
+            node_id: peer.to_string(),
+            epoch: 0,
+            sequence: 500,
+        };
+        assert!(!record_heartbeat(&peers, peer, old, &stale));
+        assert_eq!(
+            peers
+                .lock()
+                .unwrap()
+                .get(&peer)
+                .unwrap()
+                .last_heartbeat_sequence,
+            None
+        );
+        let fresh = Heartbeat {
+            sequence: 1,
+            ..stale.clone()
+        };
+        assert!(record_heartbeat(&peers, peer, current, &fresh));
+        assert!(!record_heartbeat(&peers, peer, old, &stale));
+        assert_eq!(
+            peers
+                .lock()
+                .unwrap()
+                .get(&peer)
+                .unwrap()
+                .last_heartbeat_sequence,
+            Some(1)
+        );
+    }
 
     fn temp_key_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("meshthing-{}-{name}.key", std::process::id()))

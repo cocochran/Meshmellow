@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use iroh::Endpoint;
 use iroh::endpoint::{Connection, ConnectionError, SendStream};
+use iroh::{Endpoint, EndpointAddr};
 use llm_cluster::network::{
     self, ControlOptions, HEARTBEAT_TIMEOUT_CODE, PeerSession, SharedPeerTable,
 };
@@ -17,6 +17,18 @@ use llm_cluster::node::PeerTable;
 use llm_cluster::protocol::{self, CONTROL_ALPN, Heartbeat, Hello, Message};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+
+/// Local-only tests must not depend on interface discovery racing endpoint startup.
+fn loopback_addr(endpoint: &Endpoint) -> EndpointAddr {
+    let port = endpoint
+        .bound_sockets()
+        .iter()
+        .find(|addr| addr.is_ipv4())
+        .expect("IPv4 socket is bound")
+        .port();
+    EndpointAddr::new(endpoint.id())
+        .with_ip_addr(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+}
 
 const NODE_COUNT: usize = 3;
 const CLUSTER_ID: &str = "p2p-local-test";
@@ -173,7 +185,7 @@ impl TestNode {
     async fn dial(&self, other: &TestNode) -> PeerSession {
         let session = network::dial_peer(
             &self.endpoint,
-            other.endpoint.addr(),
+            loopback_addr(&other.endpoint),
             &self.hello,
             &self.peers,
         )
@@ -260,7 +272,7 @@ async fn peer_from_another_cluster_is_rejected() {
 
     let result = network::dial_peer(
         &outsider.endpoint,
-        member.endpoint.addr(),
+        loopback_addr(&member.endpoint),
         &outsider.hello,
         &outsider.peers,
     )
@@ -522,7 +534,7 @@ async fn dialer_closes_the_link_when_acceptor_heartbeats_stop() {
     let acceptor = tokio::spawn(heartbeat_then_go_silent(endpoint.clone(), hello));
     let session = network::dial_peer(
         &dialer.endpoint,
-        endpoint.addr(),
+        loopback_addr(&endpoint),
         &dialer.hello,
         &dialer.peers,
     )
