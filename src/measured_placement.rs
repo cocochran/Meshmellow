@@ -149,7 +149,8 @@ fn invalid(message: &str) -> MeasuredError {
 }
 
 fn fresh(time: u64, request: &MeasuredRequest) -> bool {
-    time <= request.observed_at_unix_ms
+    time > 0
+        && time <= request.observed_at_unix_ms
         && request.observed_at_unix_ms - time <= request.max_profile_age_ms
 }
 
@@ -211,20 +212,15 @@ pub fn plan(request: &MeasuredRequest) -> Result<MeasuredPlacement, MeasuredErro
             return Err(invalid("invalid link observation"));
         }
     }
-    let mut active = request
+    let mut capacity_fresh = request
         .peers
         .iter()
         .filter(|p| p.authorized && p.healthy && fresh(p.capacity_observed_at_unix_ms, request))
         .collect::<Vec<_>>();
-    active.sort_by(|a, b| a.id.cmp(&b.id));
-    if active.len() > MAX_PEERS {
-        return Err(invalid("exact search supports at most 8 eligible peers"));
-    }
-    if request.min_peers > active.len() || request.min_peers > request.workload.layers {
-        return Err(MeasuredError::NoFeasiblePlacement);
-    }
+    capacity_fresh.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut active = Vec::new();
     let mut ranges = Vec::new();
-    for peer in &active {
+    for peer in capacity_fresh {
         let mut observed = HashMap::new();
         for range in &peer.ranges {
             if range.workload != request.workload || !fresh(range.measured_at_unix_ms, request) {
@@ -244,7 +240,17 @@ pub fn plan(request: &MeasuredRequest) -> Result<MeasuredPlacement, MeasuredErro
                 return Err(invalid("duplicate eligible range observation"));
             }
         }
+        if observed.is_empty() {
+            continue;
+        }
+        active.push(peer);
         ranges.push(observed);
+    }
+    if active.len() > MAX_PEERS {
+        return Err(invalid("exact search supports at most 8 eligible peers"));
+    }
+    if request.min_peers > active.len() || request.min_peers > request.workload.layers {
+        return Err(MeasuredError::NoFeasiblePlacement);
     }
     let mut links = HashMap::new();
     for edge in &request.links {
