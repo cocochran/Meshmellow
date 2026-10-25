@@ -1,12 +1,12 @@
 pub mod cli;
+pub mod invitation;
 pub mod membership;
-pub mod rendezvous;
 #[cfg(test)]
 mod tests;
 
 use anyhow::{Context, Result, bail, ensure};
 use iroh::{Endpoint, EndpointAddr, SecretKey};
-use membership::{INVITE_SECONDS, Ledger, emoji_code, name, normalize_code, now};
+use membership::{INVITE_SECONDS, Ledger, name, now};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -130,24 +130,22 @@ pub struct Node {
     record: Arc<Mutex<Record>>,
     peers: Arc<Mutex<BTreeMap<String, Peer>>>,
     remote_pending: Arc<Mutex<Vec<Pending>>>,
-    registry: Option<EndpointAddr>,
     internet: bool,
-    published: Arc<Mutex<(String, u64)>>,
     control_peers: crate::network::SharedPeerTable,
     control_tasks: Arc<Mutex<BTreeMap<String, tokio::task::JoinHandle<()>>>>,
 }
 
 impl Node {
     pub async fn open(directory: impl AsRef<Path>) -> Result<Self> {
-        Self::open_with(directory.as_ref(), true, rendezvous::configured_address()?).await
+        Self::open_with(directory.as_ref(), true).await
     }
 
     #[cfg(test)]
     async fn open_local(directory: impl AsRef<Path>) -> Result<Self> {
-        Self::open_with(directory.as_ref(), false, None).await
+        Self::open_with(directory.as_ref(), false).await
     }
 
-    async fn open_with(dir: &Path, internet: bool, registry: Option<EndpointAddr>) -> Result<Self> {
+    async fn open_with(dir: &Path, internet: bool) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
         #[cfg(unix)]
         {
@@ -206,9 +204,7 @@ impl Node {
             record: Arc::new(Mutex::new(record)),
             peers: Default::default(),
             remote_pending: Default::default(),
-            registry,
             internet,
-            published: Default::default(),
             control_peers: Default::default(),
             control_tasks: Default::default(),
         };
@@ -281,69 +277,42 @@ impl Node {
                 .await
                 .context("Cannot reach Iroh. Check your Internet connection.")?;
         }
-        let code = self
-            .change(|r| {
-                ensure!(r.ledger.is_some(), "Create or join a mesh first.");
-                ensure!(
-                    !r.requests
-                        .iter()
-                        .any(|p| p.status == "pending" && p.expires > now()),
-                    "Approve or decline the current request first."
-                );
-                r.requests
-                    .retain(|p| p.status == "approved" || p.expires > now());
-                ensure!(
-                    r.requests.len() < 64,
-                    "Too many recent invitations. Try again later."
-                );
-                let invite = Invite {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    expires: now() + INVITE_SECONDS,
-                };
-                let code = emoji_code(&self.id(), &invite.id);
-                r.invite = Some(invite);
-                Ok(code)
-            })
-            .await?;
-        // A directory outage must not prevent sharing a self-contained ticket.
-        if let Err(error) = self.publish_invitation().await {
-            self.change(|r| {
-                r.notice = format!(
-                    "Short-code lookup unavailable: {error}. Share the full invitation instead."
-                );
-                Ok(())
-            })
-            .await?;
-        }
-        Ok(code)
+        self.change(|r| {
+            ensure!(r.ledger.is_some(), "Create or join a mesh first.");
+            ensure!(
+                !r.requests
+                    .iter()
+                    .any(|p| p.status == "pending" && p.expires > now()),
+                "Approve or decline the current request first."
+            );
+            r.requests
+                .retain(|p| p.status == "approved" || p.expires > now());
+            ensure!(
+                r.requests.len() < 64,
+                "Too many recent invitations. Try again later."
+            );
+            let invite = Invite {
+                id: uuid::Uuid::new_v4().to_string(),
+                expires: now() + INVITE_SECONDS,
+            };
+            let ticket = self.signed_invitation(&invite).ticket();
+            r.invite = Some(invite);
+            Ok(ticket)
+        })
+        .await
     }
 
-    async fn publish_invitation(&self) -> Result<()> {
-        let Some(registry) = &self.registry else {
-            return Ok(());
-        };
-        let invite = self.record.lock().await.invite.clone();
-        let Some(invite) = invite.filter(|i| i.expires > now()) else {
-            return Ok(());
-        };
-        let mut published = self.published.lock().await;
-        if published.0 == invite.id && now().saturating_sub(published.1) < 60 {
-            return Ok(());
-        }
-        tokio::time::timeout(Duration::from_secs(15), self.endpoint.online())
-            .await
-            .context("Cannot reach Iroh. Check your Internet connection.")?;
-        let relay = self
-            .endpoint
-            .addr()
-            .relay_urls()
-            .next()
-            .map(ToString::to_string);
-        let locator =
-            rendezvous::Locator::signed(&self.key, invite.id.clone(), invite.expires, relay);
-        rendezvous::publish(&self.endpoint, registry.clone(), locator).await?;
-        *published = (invite.id, now());
-        Ok(())
+    fn signed_invitation(&self, invite: &Invite) -> invitation::Invitation {
+        invitation::Invitation::signed(
+            &self.key,
+            invite.id.clone(),
+            invite.expires,
+            self.endpoint
+                .addr()
+                .relay_urls()
+                .next()
+                .map(ToString::to_string),
+        )
     }
 
     pub async fn discover(&self, peers: Vec<Peer>) -> Result<()> {
@@ -359,32 +328,14 @@ impl Node {
         Ok(())
     }
 
-    pub async fn join_code(&self, code: &str, device_name: &str) -> Result<()> {
-        if code.trim().starts_with("layercake://join/") {
-            return self
-                .join(rendezvous::Locator::from_ticket(code)?.peer(), device_name)
-                .await;
+    pub async fn join_invitation(&self, ticket: &str, device_name: &str) -> Result<()> {
+        let mut peer = invitation::Invitation::from_ticket(ticket)?.peer();
+        // Optional address hints do not change the signed issuer identity.
+        // Iroh authenticates that identity before accepting the connection.
+        if let Some(known) = self.peers.lock().await.get(&peer.id) {
+            peer.addresses = known.addresses.clone();
         }
-        let code = normalize_code(code)?;
-        if let Some(registry) = &self.registry {
-            let peer = rendezvous::resolve(&self.endpoint, registry.clone(), &code).await?;
-            return self.join(peer, device_name).await;
-        }
-        ensure!(
-            !self.internet,
-            "Paste the full invitation from the trusted device. Eight-emoji lookup is not configured."
-        );
-        let peers = self.peers.lock().await.clone();
-        let matches: Vec<_> = peers
-            .values()
-            .filter(|p| !p.invite.is_empty() && emoji_code(&p.id, &p.invite) == code)
-            .cloned()
-            .collect();
-        ensure!(
-            matches.len() == 1,
-            "Invitation not found. Keep the inviting app open and check the eight emojis."
-        );
-        self.join(matches[0].clone(), device_name).await
+        self.join(peer, device_name).await
     }
 
     pub async fn join(&self, peer: Peer, device_name: &str) -> Result<()> {
@@ -496,7 +447,6 @@ impl Node {
     }
 
     pub async fn refresh(&self) -> Result<()> {
-        let publication = self.publish_invitation().await;
         let r = self.record.lock().await.clone();
         if let Some(joining) = r.joining {
             {
@@ -563,7 +513,13 @@ impl Node {
             });
             let ledger = ledger.clone();
             jobs.spawn(async move {
-                let reply = node.rpc(&peer, Wire::Sync { ledger }).await?;
+                // An offline member must not stall every UI refresh or command.
+                let reply = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    node.rpc(&peer, Wire::Sync { ledger }),
+                )
+                .await
+                .context("Member sync timed out.")??;
                 Ok::<_, anyhow::Error>((peer.id, reply))
             });
         }
@@ -581,7 +537,7 @@ impl Node {
             }
         }
         *self.remote_pending.lock().await = pending;
-        publication
+        Ok(())
     }
 
     pub async fn snapshot(&self) -> Result<Value> {
@@ -600,7 +556,6 @@ impl Node {
                 .into_iter()
                 .filter(|p| p.expires > now()),
         );
-        let published = self.published.lock().await.0.clone();
         let invite = r.invite.filter(|i| i.expires > now());
         let connected: Vec<String> = self
             .control_peers
@@ -623,8 +578,7 @@ impl Node {
             "mesh": r.ledger.as_ref().map(|l| json!({"id": l.genesis.id(), "name": l.genesis.name})),
             "members": members, "pending": pending,
             "invite": invite.map(|i| {
-                let locator = rendezvous::Locator::signed(&self.key, i.id.clone(), i.expires, self.endpoint.addr().relay_urls().next().map(ToString::to_string));
-                json!({"id": i.id, "code": emoji_code(&self.id(), &i.id), "expires": i.expires, "ticket": locator.ticket(), "code_available": published == i.id})
+                json!({"id": i.id, "expires": i.expires, "ticket": self.signed_invitation(&i).ticket()})
             }),
             "connected_peers": connected,
             "joining": r.joining.map(|j| json!({"name": j.ledger.genesis.name, "expires": j.expires})),
@@ -649,7 +603,10 @@ impl Node {
                 self.discover(serde_json::from_value(command["peers"].clone())?)
                     .await?
             }
-            "join" => self.join_code(text("code")?, text("device_name")?).await?,
+            "join" => {
+                self.join_invitation(text("invitation")?, text("device_name")?)
+                    .await?
+            }
             "refresh" => self.refresh().await?,
             "decide" => {
                 self.decide(
@@ -719,7 +676,7 @@ impl Node {
                     if let Some(existing) = r.requests.iter().find(|p| p.id == invite) {
                         ensure!(
                             existing.applicant == remote && existing.status == "pending",
-                            "This invitation is already in use. Ask for a new code."
+                            "This invitation is already in use. Ask for a new invitation."
                         );
                         reply.pending.push(existing.clone());
                     } else {
@@ -814,7 +771,7 @@ impl Node {
                 } else {
                     ensure!(
                         pending.expires > now(),
-                        "This request expired. Ask for a new code."
+                        "This request expired. Ask for a new invitation."
                     );
                     if approve {
                         current.admit(&self.key, &pending.applicant, &pending.name, &pending.id)?;

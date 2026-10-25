@@ -133,7 +133,7 @@ struct PairingView: View {
             Picker("Set up", selection: $mode) { Text("Create a mesh").tag("create"); Text("Join a mesh").tag("join") }.pickerStyle(.segmented)
             VStack(alignment: .leading, spacing: 12) {
                 Text(mode == "create" ? "Start something\nshared." : "You're invited.").font(MeshType.display(36))
-                Text(mode == "create" ? "This device is your first trusted member. Give your mesh a name, then invite the others." : "Paste the invitation shared by a trusted device. You can also enter eight emojis when short-code lookup is available.")
+                Text(mode == "create" ? "This device is your first trusted member. Give your mesh a name, then invite the others." : "Paste the invitation shared by a trusted device. Any trusted member can approve your request.")
                     .font(.subheadline).foregroundStyle(MeshPalette.muted).lineSpacing(4)
             }
             MeshField(title: "This device’s name", value: $deviceName).onChange(of: deviceName) { _, value in if value.count > 48 { deviceName = String(value.prefix(48)) } }
@@ -148,16 +148,16 @@ struct PairingView: View {
                     .disabled(enrollment.busy || enrollment.state == nil || name.trimmingCharacters(in: .whitespaces).isEmpty || deviceName.trimmingCharacters(in: .whitespaces).isEmpty)
             } else {
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("Invitation or emoji code").font(.subheadline.weight(.medium))
-                    TextField("Paste an invitation or eight emojis", text: $code, axis: .vertical)
-                        .font(.system(size: 27)).lineLimit(2...3).padding(18)
+                    Text("Invitation").font(.subheadline.weight(.medium))
+                    TextField("Paste your invitation", text: $code, axis: .vertical)
+                        .font(.system(size: 14, design: .monospaced)).lineLimit(3...5).padding(18)
                         .background(MeshPalette.surface, in: RoundedRectangle(cornerRadius: 14))
                         .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(MeshPalette.line, lineWidth: 1))
                         .autocorrectionDisabled().textInputAutocapitalization(.never)
-                        .onChange(of: code) { _, value in if value.count > 4096 { code = String(value.prefix(4096)) } }.accessibilityIdentifier("join-code")
+                        .onChange(of: code) { _, value in if value.count > 4096 { code = String(value.prefix(4096)) } }.accessibilityIdentifier("join-invitation")
                 }
                 Button {
-                    Task { await enrollment.perform(["op": "join", "code": code, "device_name": deviceName]) }
+                    Task { await enrollment.perform(["op": "join", "invitation": code, "device_name": deviceName]) }
                 } label: { HStack { Text("Request to join"); Spacer(); Image(systemName: "arrow.right") } }.buttonStyle(MeshButtonStyle())
                     .disabled(enrollment.busy || code.isEmpty || enrollment.state == nil || deviceName.trimmingCharacters(in: .whitespaces).isEmpty)
                 StatusNote(symbol: "checkmark.shield", text: "A trusted member will approve your request before you join.")
@@ -174,19 +174,23 @@ struct PairingView: View {
                     .font(.subheadline).foregroundStyle(MeshPalette.muted).lineSpacing(4)
             }
             if let invite = enrollment.state?.invite {
-                Eyebrow(text: invite.codeAvailable == true ? "Emoji code" : "Invitation fingerprint")
-                emojiGrid(invite.code)
-                if invite.codeAvailable != true {
-                    Text("Use Share or Copy invitation to connect directly. These emojis identify the invitation; entering them alone needs short-code lookup.").font(.footnote).foregroundStyle(MeshPalette.muted)
-                }
+                VStack(alignment: .leading, spacing: 14) {
+                    Label("Private invitation", systemImage: "link").font(.headline)
+                    Text(invite.ticket).font(.caption.monospaced()).lineLimit(3)
+                        .foregroundStyle(MeshPalette.muted)
+                        .accessibilityIdentifier("invitation-link")
+                    Text("One invitation. One new device.").font(.subheadline)
+                }.padding(22).frame(maxWidth: .infinity, alignment: .leading)
+                    .background(MeshPalette.surface, in: RoundedRectangle(cornerRadius: 18))
+                    .overlay(RoundedRectangle(cornerRadius: 18).strokeBorder(MeshPalette.line, lineWidth: 1))
                 HStack {
                     Label { Text("Expires in \(Date(timeIntervalSince1970: invite.expires), style: .relative)") } icon: { Image(systemName: "clock") }
                     Spacer()
                     Text("ONE DEVICE").font(MeshType.label)
                 }.font(.caption).foregroundStyle(MeshPalette.muted)
                 ViewThatFits(in: .horizontal) {
-                    HStack(spacing: 12) { share(invite.shareValue); copy(invite.shareValue) }
-                    VStack(alignment: .leading, spacing: 12) { share(invite.shareValue); copy(invite.shareValue) }
+                    HStack(spacing: 12) { share(invite.ticket); copy(invite.ticket) }
+                    VStack(alignment: .leading, spacing: 12) { share(invite.ticket); copy(invite.ticket) }
                 }
                 Button("Create a new invitation") { Task { await enrollment.perform(["op": "invite"]); copied = false } }
                     .font(.subheadline).foregroundStyle(MeshPalette.muted)
@@ -197,19 +201,6 @@ struct PairingView: View {
             }
             StatusNote(symbol: "checkmark.shield", text: "You stay in control. A trusted member must approve each new device.")
         }
-    }
-    private func emojiGrid(_ code: String) -> some View {
-        let symbols = code.split(separator: " ").map(String.init)
-        return LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 4), spacing: 10) {
-            ForEach(Array(symbols.enumerated()), id: \.offset) { index, symbol in
-                VStack(spacing: 10) {
-                    Text(symbol).font(.system(size: 35))
-                    Text(String(format: "%02d", index + 1)).font(MeshType.label).foregroundStyle(MeshPalette.muted)
-                }.frame(maxWidth: .infinity).padding(.vertical, 18)
-                    .background(MeshPalette.surface, in: RoundedRectangle(cornerRadius: 18))
-                    .overlay(RoundedRectangle(cornerRadius: 18).strokeBorder(MeshPalette.line, lineWidth: 1))
-            }
-        }.accessibilityElement(children: .ignore).accessibilityLabel(code).accessibilityIdentifier("invitation-code")
     }
     private func share(_ code: String) -> some View {
         ShareLink(item: code) { Label("Share invitation", systemImage: "square.and.arrow.up") }.buttonStyle(MeshButtonStyle())

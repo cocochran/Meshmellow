@@ -19,13 +19,14 @@ final class EnrollmentUITests: XCTestCase {
         expectation(for: enabled, evaluatedWith: create)
         waitForExpectations(timeout: 15)
         create.tap()
-        XCTAssertTrue(app.descendants(matching: .any)["invitation-code"].waitForExistence(timeout: 50))
-        let code = app.descendants(matching: .any)["invitation-code"].label
-        XCTAssertEqual(code.split(separator: " ").count, 8)
-        let invitation = XCTAttachment(screenshot: app.screenshot()); invitation.name = "Create mesh and emoji invitation"; invitation.lifetime = .keepAlways; add(invitation)
+        XCTAssertTrue(app.descendants(matching: .any)["invitation-link"].waitForExistence(timeout: 50))
+        let code = app.descendants(matching: .any)["invitation-link"].label
+        XCTAssertTrue(code.hasPrefix("layercake://join/"))
+        let invitation = XCTAttachment(screenshot: app.screenshot()); invitation.name = "Create mesh and signed invitation"; invitation.lifetime = .keepAlways; add(invitation)
         print("ENROLLMENT_INVITATION \(code)")
+        app.buttons["Copy invitation"].tap()
         app.buttons["Done"].tap()
-        // The companion CLI integration driver joins through Internet invitation lookup + Iroh.
+        // The companion CLI integration driver joins through a self-contained invitation + the core Iroh endpoint.
         XCTAssertTrue(app.buttons["Trust device"].waitForExistence(timeout: 120))
         app.buttons["Trust device"].tap()
         XCTAssertTrue(app.staticTexts["Validation peer"].waitForExistence(timeout: 15))

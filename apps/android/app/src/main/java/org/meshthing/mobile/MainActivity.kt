@@ -7,8 +7,6 @@ import android.os.PowerManager
 import android.content.Context
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.ui.text.font.FontFamily
@@ -40,7 +38,6 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.CancellationException
 import java.text.DateFormat
 import java.util.Date
 
@@ -199,24 +196,20 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable private fun ModelScreen(store: MeshStore) {
-    val scope = rememberCoroutineScope()
-    var error by remember { mutableStateOf("") }
-    var removing by remember { mutableStateOf(false) }
-    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        if (uri != null) scope.launch { try { store.selectModel(uri); error = "" } catch (cancelled: CancellationException) { throw cancelled } catch (e: Exception) { error = e.message ?: "Cannot read this file." } }
-    }
-    InfoCard("One model", store.snapshot?.model ?: "Connect your dashboard to see the mesh model.")
-    Text("Local model file", style = MaterialTheme.typography.titleLarge)
-    if (store.modelName.isEmpty()) {
-        Button(onClick = { picker.launch(arrayOf("*/*")) }, enabled = !store.selectingModel) { Text(if (store.selectingModel) "Checking file…" else "Choose a GGUF file") }
+    Text("Shared intelligence.", style = MaterialTheme.typography.headlineLarge)
+    InfoCard("Qwen3.8-27B", "UD-Q5_K_M · One model for the whole mesh.\nThe Qwen model used in our mesh tests.")
+    Text("Automatic setup on new devices is still being connected to the core.", style = MaterialTheme.typography.bodyMedium)
+    Text("Runtime", style = MaterialTheme.typography.titleLarge)
+    val snapshot = store.snapshot
+    if (snapshot == null) {
+        Text("Connect a dashboard in Settings to see model activity and layer assignments.")
     } else {
-        InfoCard(store.modelName, "${if (store.modelBytes > 0) bytes(store.modelBytes.toDouble()) else "Size not reported"}\n${store.modelNote}")
-        OutlinedButton(onClick = { scope.launch { store.checkModel() } }) { Text("Check file access") }
-        TextButton(onClick = { removing = true }) { Text("Remove selection", color = MaterialTheme.colorScheme.error) }
+        InfoCard(snapshot.model, if (store.connected) { if (snapshot.active) "Running" else "Idle" } else "Unavailable")
+        snapshot.devices.forEach { device ->
+            Text("${device.name} · Layers ${device.range}", style = MaterialTheme.typography.bodyMedium)
+        }
     }
-    if (error.isNotEmpty()) Text(error, color = MaterialTheme.colorScheme.error)
-    Text("The file stays in its original location. No weights are copied, uploaded, loaded or shared. Full GGUF validation, download and placement need the native core.", style = MaterialTheme.typography.bodyMedium)
-    if (removing) AlertDialog(onDismissRequest = { removing = false }, title = { Text("Remove this selection?") }, text = { Text("The original file stays on disk.") }, confirmButton = { TextButton(onClick = { store.removeModel(); removing = false }) { Text("Remove selection") } }, dismissButton = { TextButton(onClick = { removing = false }) { Text("Cancel") } })
+    if (store.error.isNotEmpty()) Text(store.error, color = MaterialTheme.colorScheme.error)
 }
 
 @Composable private fun SettingsScreen(store: MeshStore) {

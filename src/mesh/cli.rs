@@ -25,27 +25,30 @@ pub async fn run(directory: std::path::PathBuf) -> Result<()> {
             }
         }
     });
-    let mut timer = tokio::time::interval(Duration::from_secs(2));
-    loop {
-        let request = tokio::select! {
-            line = rx.recv() => { let Some(line) = line else { break }; Some(line) }
-            _ = timer.tick() => None,
-        };
-        if let Some(line) = request {
-            let result = match serde_json::from_slice::<Value>(&line) {
-                Ok(command) => node.command(command).await,
-                Err(error) => Err(error.into()),
-            };
-            let output = match result {
-                Ok(state) => json!({"ok": true, "state": state}),
-                Err(error) => json!({"ok": false, "error": error.to_string()}),
-            };
-            println!("{output}");
-            std::io::stdout().flush()?;
-        } else {
-            let _ = node.refresh().await;
+    // Remote polling runs independently; a slow/offline peer cannot starve stdin
+    // commands such as snapshot, approve or shutdown.
+    let refresh_node = node.clone();
+    let refresh_task = tokio::spawn(async move {
+        let mut timer = tokio::time::interval(Duration::from_secs(2));
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            timer.tick().await;
+            let _ = tokio::time::timeout(Duration::from_secs(6), refresh_node.refresh()).await;
         }
+    });
+    while let Some(line) = rx.recv().await {
+        let result = match serde_json::from_slice::<Value>(&line) {
+            Ok(command) => node.command(command).await,
+            Err(error) => Err(error.into()),
+        };
+        let output = match result {
+            Ok(state) => json!({"ok": true, "state": state}),
+            Err(error) => json!({"ok": false, "error": error.to_string()}),
+        };
+        println!("{output}");
+        std::io::stdout().flush()?;
     }
+    refresh_task.abort();
     node.close().await;
     Ok(())
 }
