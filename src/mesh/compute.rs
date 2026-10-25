@@ -220,12 +220,7 @@ impl Node {
                 .await;
             }
         });
-        if let Some(previous) = self
-            .control_tasks
-            .lock()
-            .await
-            .insert("native-compute".into(), task)
-        {
+        if let Some(previous) = self.compute_task.lock().await.replace(task) {
             previous.abort();
         }
     }
