@@ -26,9 +26,7 @@ struct EnrollmentState: Decodable {
     struct Mesh: Decodable { let id: String; let name: String }
     struct Member: Decodable, Identifiable { let id: String; let name: String; let online: Bool? }
     struct Invitation: Decodable {
-        let id: String; let code: String; let expires: Double; let ticket: String?; let codeAvailable: Bool?
-        enum CodingKeys: String, CodingKey { case id, code, expires, ticket; case codeAvailable = "code_available" }
-        var shareValue: String { ticket ?? code }
+        let id: String; let expires: Double; let ticket: String
     }
     struct Joining: Decodable { let name: String; let expires: Double }
     struct Pending: Decodable, Identifiable {

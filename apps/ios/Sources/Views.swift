@@ -1,5 +1,4 @@
 import SwiftUI
-import UniformTypeIdentifiers
 
 private func bytes(_ value: Double?) -> String {
     guard let value, value.isFinite, value >= 0, value < Double(Int64.max) else { return "Not reported" }
@@ -160,7 +159,7 @@ struct MeshView: View {
                 Eyebrow(text: "A simple way in")
                 setupStep("01", title: "Start with this device", detail: "Create a mesh and give it a name.", icon: "ipad")
                 Divider().overlay(MeshPalette.line)
-                setupStep("02", title: "Share an emoji code", detail: "Your other devices enter the same eight emojis.", icon: "face.smiling")
+                setupStep("02", title: "Share an invitation", detail: "Copy your invitation and paste it on another device.", icon: "link")
                 Divider().overlay(MeshPalette.line)
                 setupStep("03", title: "Let them in", detail: "Approve the request from any trusted device.", icon: "checkmark.shield")
             }
@@ -236,36 +235,21 @@ struct DeviceView: View {
 struct ModelView: View {
     @EnvironmentObject private var store: MeshStore
     var openSettings: () -> Void = {}
-    @State private var importing = false
-    @State private var removing = false
-    @State private var failure = ""
     var body: some View {
         Page {
             PageHeading(eyebrow: "One model", title: "Shared intelligence.", subtitle: "One model for the whole mesh. Each device plays its part.")
             Surface {
                 VStack(alignment: .leading, spacing: 20) {
-                    Label("LOCAL MODEL FILE", systemImage: "doc").font(MeshType.label).foregroundStyle(MeshPalette.muted)
-                    if store.modelName.isEmpty {
-                        Text("Bring your model.").font(MeshType.display(28))
-                        Text("Choose a GGUF file to keep ready on this device. It stays in its original location.").font(.subheadline).foregroundStyle(MeshPalette.muted)
-                        Button { importing = true } label: { Label("Choose a GGUF file", systemImage: "plus") }.buttonStyle(MeshButtonStyle())
-                    } else {
-                        Text(store.modelName).font(.title3.weight(.medium))
-                        DetailRow(label: "File size", value: bytes(Double(store.modelBytes)))
-                        Text(store.modelNote).font(.subheadline).foregroundStyle(MeshPalette.muted)
-                        Button("Check file access") { store.verifySelectedFile() }.buttonStyle(MeshButtonStyle(primary: false))
-                        Button("Remove selection", role: .destructive) { removing = true }
-                    }
-                    StatusNote(symbol: "pause.circle", text: "Selecting a file does not start inference. Automatic benchmarks and model execution are still being connected.")
-                    if !failure.isEmpty { Text(failure).foregroundStyle(MeshPalette.warning).font(.subheadline) }
+                    Label("MESH MODEL", systemImage: "square.stack.3d.up").font(MeshType.label).foregroundStyle(MeshPalette.muted)
+                    Text("Qwen3.8-27B").font(MeshType.display(30))
+                    Text("The Qwen model used in our mesh tests. Shared across the devices in your mesh.").font(.subheadline).foregroundStyle(MeshPalette.muted)
+                    DetailRow(label: "Quantization", value: "UD-Q5_K_M")
+                    StatusNote(symbol: "clock", text: "Automatic setup on new devices is still being connected to the core.")
                 }
             }
             runtime
         }.toolbar(.hidden, for: .navigationBar)
-        .fileImporter(isPresented: $importing, allowedContentTypes: [.data], allowsMultipleSelection: false) { result in
-            do { guard let url = try result.get().first else { return }; try store.selectModel(url); failure = "" } catch { failure = error.localizedDescription }
-        }
-        .confirmationDialog("Remove this file selection? The original file will stay on disk.", isPresented: $removing, titleVisibility: .visible) { Button("Remove selection", role: .destructive) { store.removeModel() } }
+
     }
     private var runtime: some View {
         Surface {

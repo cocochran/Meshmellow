@@ -21,12 +21,12 @@ The installable development artifact is
 `app/build/outputs/apk/debug/app-debug.apk`. It uses the Android debug signing key;
 production signing and Play distribution are separate work.
 
-For a connected physical phone, substitute its exact ID below:
+For a dedicated emulator, substitute its exact ID below:
 
 ```sh
-adb -s DEVICE_ID install -r app/build/outputs/apk/debug/app-debug.apk
-adb -s DEVICE_ID reverse tcp:3210 tcp:3210
-adb -s DEVICE_ID shell am start -n org.meshthing.mobile/.MainActivity
+adb -s emulator-5580 install -r app/build/outputs/apk/debug/app-debug.apk
+adb -s emulator-5580 reverse tcp:3210 tcp:3210
+adb -s emulator-5580 shell am start -n org.meshthing.mobile/.MainActivity
 ```
 
 With the web UI running on the host, save `http://127.0.0.1:3210` in the app's
@@ -40,8 +40,8 @@ or interfere with active experimental workers while validating the app.
 
 See [mobile capabilities and core integration](../README.md). The application
 runs the core Iroh endpoint with Internet invitation lookup while in the foreground.
-It creates meshes, exchanges emoji invitations and manages trusted membership.
+It creates meshes, shares signed invitations and manages trusted membership.
 Native inference and automatic benchmarking are not yet connected. No broad storage permission, background
 service, wake lock, diagnostic peer identity or model weights are included.
 
-For Internet emoji pairing, set `LAYERCAKE_RENDEZVOUS_ID` when building the Rust library. See [lookup deployment](../enrollment/README.md#invitation-lookup-deployment). Device validation uses physical phones; do not start an Android emulator.
+Full invitations work over Iroh without a lookup service. No Layercake server needs to be hosted. See [core membership](../../docs/mesh-membership.md). Device validation uses physical phones; do not start an Android emulator.

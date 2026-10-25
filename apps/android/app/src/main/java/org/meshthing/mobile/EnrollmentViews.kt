@@ -3,6 +3,7 @@ package org.meshthing.mobile
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -17,7 +18,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
 import java.text.DateFormat
 import java.util.Date
@@ -74,24 +74,24 @@ import java.util.Date
             if (state?.meshName != null) {
                 Text(state.meshName, style = MaterialTheme.typography.titleLarge)
                 Text("Share the invitation, then paste it into Join a mesh on the other device.")
-                if (state.code.isNotEmpty()) {
-                    Text(if (state.codeAvailable) "EMOJI CODE" else "INVITATION FINGERPRINT", style = MaterialTheme.typography.labelSmall)
-                    val emojis = state.code.split(" ").filter { it.isNotBlank() }
-                    emojis.chunked(4).forEachIndexed { row, group ->
-                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                            group.forEachIndexed { column, emoji ->
-                                Column(Modifier.weight(1f).background(MaterialTheme.colorScheme.surface, RoundedCornerShape(16.dp)).padding(vertical = 14.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    Text(emoji, fontSize = 28.sp)
-                                    Text("${row * 4 + column + 1}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                }
-                            }
-                        }
+                if (state.ticket.isNotEmpty()) {
+                    Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface, RoundedCornerShape(18.dp)).padding(22.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                        Text("Private invitation", style = MaterialTheme.typography.titleMedium)
+                        Text(state.ticket, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall, maxLines = 3, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("One invitation. One new device.", style = MaterialTheme.typography.bodyMedium)
                     }
                     Text("Expires at ${DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(state.expires * 1000))}", style = MaterialTheme.typography.labelSmall)
-                    OutlinedButton(onClick = { (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("Layercake invitation", state.ticket.ifEmpty { state.code })) }) { Text("Copy invitation") }
+                    Button(onClick = {
+                        val send = Intent(Intent.ACTION_SEND).apply {
+                            type = "text/plain"
+                            putExtra(Intent.EXTRA_TEXT, state.ticket)
+                        }
+                        context.startActivity(Intent.createChooser(send, "Share invitation"))
+                    }) { Text("Share invitation") }
+                    OutlinedButton(onClick = { (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("Layercake invitation", state.ticket)) }) { Text("Copy invitation") }
                 }
-                Button(onClick = { scope.launch { enrollment.perform("invite") } }, enabled = !enrollment.busy && state.pending.isEmpty()) { Text(if (state.code.isEmpty()) "Create invitation" else "Replace invitation") }
-                Text("Copy the full invitation to connect directly through Iroh. The eight emojis identify it; using only emojis requires short-code lookup. Invitations expire after ten minutes and require approval.", style = MaterialTheme.typography.bodySmall)
+                Button(onClick = { scope.launch { enrollment.perform("invite") } }, enabled = !enrollment.busy && state.pending.isEmpty()) { Text(if (state.ticket.isEmpty()) "Create invitation" else "Replace invitation") }
+                Text("Invitations expire after ten minutes. A trusted member must approve each new device.", style = MaterialTheme.typography.bodySmall)
             } else if (state?.joiningName == null) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     FilterChip(selected = !join, onClick = { join = false }, label = { Text("Create") })
@@ -99,12 +99,12 @@ import java.util.Date
                 }
                 OutlinedTextField(value = deviceName, onValueChange = { if (it.length <= 48) deviceName = it }, label = { Text("This device’s name") }, singleLine = true)
                 if (join) {
-                    OutlinedTextField(value = code, onValueChange = { if (it.length <= 4096) code = it }, label = { Text("Paste invitation or eight emojis") })
+                    OutlinedTextField(value = code, onValueChange = { if (it.length <= 4096) code = it }, label = { Text("Paste invitation") })
                     Text("Paste the full invitation from a trusted device. Any trusted member can approve your request.")
-                    Button(onClick = { scope.launch { enrollment.perform("join", "code" to code, "device_name" to deviceName) } }, enabled = !enrollment.busy && state != null && code.isNotBlank() && deviceName.isNotBlank()) { Text("Request to join") }
+                    Button(onClick = { scope.launch { enrollment.perform("join", "invitation" to code, "device_name" to deviceName) } }, enabled = !enrollment.busy && state != null && code.isNotBlank() && deviceName.isNotBlank()) { Text("Request to join") }
                 } else {
                     OutlinedTextField(value = meshName, onValueChange = { if (it.length <= 48) meshName = it }, label = { Text("Mesh name") }, singleLine = true)
-                    Text("This device becomes your first trusted member. Then invite your other devices with an emoji code.")
+                    Text("This device becomes your first trusted member. Then invite your other devices with an invitation.")
                     Button(onClick = { scope.launch {
                         enrollment.perform("create", "name" to meshName, "device_name" to deviceName)
                         if (enrollment.state?.meshName != null) enrollment.perform("invite")

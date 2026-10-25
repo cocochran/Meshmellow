@@ -1,9 +1,6 @@
 package org.meshthing.mobile
 
 import android.app.Application
-import android.content.Intent
-import android.net.Uri
-import android.provider.OpenableColumns
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -26,10 +23,6 @@ class MeshStore(app: Application) : AndroidViewModel(app) {
     var snapshot by mutableStateOf<MeshSnapshot?>(null); private set
     var refreshing by mutableStateOf(false); private set
     var error by mutableStateOf(""); private set
-    var modelName by mutableStateOf(preferences.getString("modelName", "")!!); private set
-    var modelBytes by mutableStateOf(preferences.getLong("modelBytes", 0)); private set
-    var modelNote by mutableStateOf("Runtime validation pending. No model is loaded by this app."); private set
-    var selectingModel by mutableStateOf(false); private set
     val connected get() = error.isEmpty() && snapshot?.connected == true
 
     fun saveEndpoint(value: String) {
@@ -71,45 +64,5 @@ class MeshStore(app: Application) : AndroidViewModel(app) {
         } catch (cancelled: CancellationException) { throw cancelled }
         catch (_: Exception) { if (requestedEndpoint == endpoint) error = "Cannot read the dashboard. Check the address and connection." }
         finally { refreshing = false }
-    }
-    suspend fun selectModel(uri: Uri) {
-        if (selectingModel) return
-        selectingModel = true
-        try {
-            require(modelName.isEmpty()) { "Remove the current selection first. One model at a time." }
-            val resolver = getApplication<Application>().contentResolver
-            val info = withContext(Dispatchers.IO) {
-                val version = resolver.openInputStream(uri)?.use { Validation.ggufVersion(Validation.readHeader(it)) } ?: error("File cannot be read")
-                var name = "Selected GGUF"
-                var size = 0L
-                resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)?.use { cursor ->
-                    if (cursor.moveToFirst()) {
-                        name = cursor.getString(0) ?: name
-                        size = if (cursor.isNull(1)) 0L else cursor.getLong(1)
-                    }
-                }
-                Triple(name, size, version)
-            }
-            resolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            preferences.edit().putString("modelUri", uri.toString()).putString("modelName", info.first).putLong("modelBytes", info.second).apply()
-            modelName = info.first; modelBytes = info.second
-            modelNote = "GGUF v${info.third} header recognized. Full integrity and runtime support are not verified."
-        } finally { selectingModel = false }
-    }
-    suspend fun checkModel() {
-        try {
-            val uri = Uri.parse(preferences.getString("modelUri", ""))
-            val version = withContext(Dispatchers.IO) {
-                getApplication<Application>().contentResolver.openInputStream(uri)?.use { Validation.ggufVersion(Validation.readHeader(it)) } ?: error("File cannot be read")
-            }
-            modelNote = "File accessible · GGUF v$version. Runtime validation pending."
-        } catch (cancelled: CancellationException) { throw cancelled }
-        catch (_: Exception) { modelNote = "File unavailable or invalid. Remove the selection and choose it again." }
-    }
-    fun removeModel() {
-        val uri = preferences.getString("modelUri", null)
-        if (uri != null) runCatching { getApplication<Application>().contentResolver.releasePersistableUriPermission(Uri.parse(uri), Intent.FLAG_GRANT_READ_URI_PERMISSION) }
-        preferences.edit().remove("modelUri").remove("modelName").remove("modelBytes").apply()
-        modelName = ""; modelBytes = 0
     }
 }

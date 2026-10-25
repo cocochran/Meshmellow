@@ -17,12 +17,11 @@ See [mesh creation and pairing](../enrollment/README.md) for the flow and limits
 Native SwiftUI application targeting iOS 17+. The iPad layout uses a workspace
 sidebar; compact windows and iPhones use tabs. Membership and approvals live on
 Mesh, with runtime observations on Model. Light and dark palettes share semantic
-colors, and invitations display eight numbered emoji tiles.
+colors, and invitations have copy and share actions.
 
 Requires Xcode, CMake 3.28+ and
-the iOS SDK. No model or private key is bundled. Set `LAYERCAKE_RENDEZVOUS_ID`
-when building the Rust library to select the shared public invitation lookup ID.
-See [lookup deployment](../enrollment/README.md#invitation-lookup-deployment).
+the iOS SDK. No model or private key is bundled. Full signed invitations work without a lookup service. No Layercake server needs to be hosted.
+See [core membership](../../docs/mesh-membership.md).
 
 From this directory, generate the Xcode project and build for Simulator:
 
@@ -85,4 +84,4 @@ Start `python3 ../enrollment/tests/ios-peer.py SIMULATOR_UUID` in another termin
 (after building the enrollment CLI), then run the same xcodebuild command with
 `-parallel-testing-enabled NO test-without-building`. XCTest creates the mesh,
 shows the invitation, approves the discovered peer and checks relaunch persistence.
-The driver uses the configured invitation lookup plus real authenticated Iroh.
+The driver uses a full signed invitation and real authenticated Iroh.

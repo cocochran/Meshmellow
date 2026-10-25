@@ -11,11 +11,6 @@ name = "meshthing-enrollment"
 path = "src/bin/enrollment.rs"
 required-features = ["cli"]
 
-[[bin]]
-name = "layercake-rendezvous"
-path = "src/bin/rendezvous.rs"
-required-features = ["cli"]
-
 [features]
 cli = []
 
