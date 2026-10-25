@@ -32,7 +32,8 @@ Compatible models and native inference runners must be supplied separately.
 Each archive includes `build.json` with revision and executable SHA-256 hashes;
 a separate `.sha256` file verifies the archive. These are unsigned development
 builds, not notarized/signed releases. Actions retains artifacts for 30 days.
-The workflow runs on relevant pushes/PRs and supports **Run workflow** on a branch.
+The workflow runs on relevant pull requests and main-branch updates, and supports
+**Run workflow** on a branch. Feature-branch pushes do not duplicate PR builds.
 
 For a source checkout, the original terminal-launched web server remains available:
 see [web UI instructions](../apps/web/README.md).
