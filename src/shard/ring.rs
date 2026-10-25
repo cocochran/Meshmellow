@@ -674,7 +674,8 @@ async fn read_line<R: AsyncBufRead + Unpin>(r: &mut R) -> anyhow::Result<Option<
 }
 
 /// What a ring worker runs and where it sits in the ring.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RingWorkerConfig {
     /// The `shard_runner` binary.
     pub runner: PathBuf,
@@ -744,26 +745,7 @@ pub async fn serve_ring_worker_with(
     config: RingWorkerConfig,
     timeouts: RingWriteTimeouts,
 ) -> anyhow::Result<()> {
-    let shard = Shard::load(config.shard_config()).await?;
-    info!(
-        id = %endpoint.id(),
-        begin = config.begin,
-        end = config.end,
-        model_sha256 = %shard.model_sha256(),
-        upstream = %config.upstream,
-        origin = %config.origin,
-        next = ?config.next,
-        "shard-ring worker serving (experimental)"
-    );
-    let worker = Arc::new(RingWorker {
-        endpoint: endpoint.clone(),
-        shard,
-        upstream: config.upstream,
-        origin: config.origin,
-        next: config.next,
-        gate: Semaphore::new(1),
-        timeouts,
-    });
+    let worker = RingWorker::load(endpoint.clone(), config, timeouts).await?;
 
     let connection_slots = Arc::new(Semaphore::new(MAX_RING_CONNECTIONS));
     let mut connections = JoinSet::new();
@@ -794,7 +776,9 @@ pub async fn serve_ring_worker_with(
 
 /// A serving ring worker: its stage, its place in the ring, the one-session gate and the bounds
 /// on its writes.
-struct RingWorker {
+pub struct RingWorker {
+    begin: u32,
+    end: u32,
     endpoint: Endpoint,
     shard: Shard,
     upstream: EndpointId,
@@ -802,6 +786,55 @@ struct RingWorker {
     next: Option<EndpointId>,
     gate: Semaphore,
     timeouts: RingWriteTimeouts,
+}
+
+impl RingWorker {
+    /// Attach a native worker to an existing client's Iroh endpoint.
+    pub async fn load(
+        endpoint: Endpoint,
+        config: RingWorkerConfig,
+        timeouts: RingWriteTimeouts,
+    ) -> anyhow::Result<Arc<Self>> {
+        let shard = Shard::load(config.shard_config()).await?;
+        info!(
+            id = %endpoint.id(),
+            begin = config.begin,
+            end = config.end,
+            model_sha256 = %shard.model_sha256(),
+            upstream = %config.upstream,
+            origin = %config.origin,
+            next = ?config.next,
+            "shard-ring worker serving (experimental)"
+        );
+        let worker = Arc::new(Self {
+            begin: config.begin,
+            end: config.end,
+            endpoint: endpoint.clone(),
+            shard,
+            upstream: config.upstream,
+            origin: config.origin,
+            next: config.next,
+            gate: Semaphore::new(1),
+            timeouts,
+        });
+
+        Ok(worker)
+    }
+
+    pub fn participants(&self) -> Vec<EndpointId> {
+        let mut peers = vec![self.upstream, self.origin];
+        peers.extend(self.next);
+        peers
+    }
+
+    pub fn status(&self) -> serde_json::Value {
+        serde_json::json!({"role": "worker", "begin": self.begin, "end": self.end, "upstream": self.upstream.to_string(),
+                          "origin": self.origin.to_string(), "next": self.next.map(|id| id.to_string())})
+    }
+
+    pub async fn handle_connection(self: &Arc<Self>, connection: Connection) {
+        handle_worker_connection(connection, self.clone()).await;
+    }
 }
 
 /// One Iroh connection: refuse anyone but the upstream, then serve its streams in turn.
@@ -813,6 +846,10 @@ async fn serve_connection(incoming: Incoming, worker: Arc<RingWorker>) {
             return;
         }
     };
+    handle_worker_connection(connection, worker).await;
+}
+
+async fn handle_worker_connection(connection: Connection, worker: Arc<RingWorker>) {
     let peer = connection.remote_id();
     if peer != worker.upstream || connection.alpn() != RING_ALPN {
         warn!(%peer, alpn = %String::from_utf8_lossy(connection.alpn()), "rejecting ring peer");
@@ -1033,6 +1070,11 @@ impl NativeRunner {
             .await
             .context("timed out waiting for the shard runner to start")??;
         shard.stamp_metadata(&mut meta)?;
+        // A whole GGUF has no exporter source field. Its verified file digest
+        // is the model identity; exported slices still require their source pin.
+        if meta.source_sha256.is_empty() {
+            meta.source_sha256 = shard.model_sha256().to_owned();
+        }
         Ok(meta)
     }
 

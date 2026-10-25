@@ -12,4 +12,5 @@ pub mod ring;
 pub mod ring_origin;
 pub mod serve;
 pub mod template;
+pub mod telemetry;
 pub mod wire;

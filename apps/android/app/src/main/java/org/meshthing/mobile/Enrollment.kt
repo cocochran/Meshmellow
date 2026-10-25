@@ -25,17 +25,20 @@ data class EnrollmentState(
     val id: String, val port: Int, val meshName: String?, val joiningName: String?,
     val inviteID: String, val expires: Long,
     val members: List<TrustedMember>, val pending: List<JoinRequest>, val notice: String,
-    val ticket: String = ""
+    val ticket: String = "",
+    val workerBegin: Int? = null,
+    val workerEnd: Int? = null
 ) {
     companion object {
         fun parse(json: JSONObject): EnrollmentState {
+            val worker = json.optJSONObject("inference")?.optJSONObject("worker")
             val members = json.getJSONArray("members")
             val pending = json.getJSONArray("pending")
             val invite = json.optJSONObject("invite")
             return EnrollmentState(json.getString("id"), json.getInt("port"), json.optJSONObject("mesh")?.getString("name"), json.optJSONObject("joining")?.getString("name"),
                 invite?.getString("id") ?: "", invite?.getLong("expires") ?: 0,
                 (0 until members.length()).map { members.getJSONObject(it).let { m -> TrustedMember(m.getString("id"), m.getString("name"), m.optBoolean("online"), m.optJSONObject("api")?.let { a -> NodeAPI(a.getString("base_url"), a.getBoolean("inference_ready"), a.getString("message")) }) } },
-                (0 until pending.length()).map { pending.getJSONObject(it).let { p -> JoinRequest(p.getString("id"), p.getString("issuer"), p.getString("applicant"), p.getString("name")) } }, json.getString("notice"), invite?.optString("ticket") ?: "")
+                (0 until pending.length()).map { pending.getJSONObject(it).let { p -> JoinRequest(p.getString("id"), p.getString("issuer"), p.getString("applicant"), p.getString("name")) } }, json.getString("notice"), invite?.optString("ticket") ?: "", worker?.getInt("begin"), worker?.getInt("end"))
         }
     }
 }
@@ -60,6 +63,14 @@ class EnrollmentController(private val app: Application, private val directory: 
         active = true
         try {
             EnrollmentNative.initialize(app)
+            // The model cache supplies the pin and memory policy; the installed
+            // executable always comes from this APK, never a peer-supplied path.
+            val computeFile = java.io.File(directory, "compute.json")
+            if (computeFile.isFile) {
+                val compute = JSONObject(computeFile.readText())
+                compute.put("runner", java.io.File(app.applicationInfo.nativeLibraryDir, "libmesh_worker.so").absolutePath)
+                computeFile.writeText(compute.toString())
+            }
             call(JSONObject().put("op", "open").put("directory", directory.absolutePath))
             error = ""
         } catch (cancelled: CancellationException) { throw cancelled }

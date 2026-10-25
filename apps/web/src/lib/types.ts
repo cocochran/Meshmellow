@@ -17,6 +17,9 @@ export interface Peer {
   lastHeartbeat: number | null;
 }
 export interface MeshSnapshot {
+  inferenceReady?: boolean;
+  execution?: Execution | null;
+  hardware?: { id: string; totalBytes: number | null; availableBytes: number | null }[];
   connected: boolean;
   source: Source;
   endpoint: string | null;
@@ -32,6 +35,18 @@ export interface MeshSnapshot {
   decodeRate: number | null;
   outputSteps: number | null;
   jobs: Job[];
+}
+export interface StageObservation {
+  id: string; begin: number; end: number; status: string; executions: number;
+  computeMs: number | null; bufferBytes: number | null; peakRssBytes: number | null;
+  inputBytes: number; outputBytes: number; updatedAt: number;
+}
+export interface Execution {
+  job: string; active: boolean; phase: string; startedAt: number; elapsedMs: number;
+  outputTokens: number; decodeTps: number | null; ttftMs: number | null; returnBytes: number;
+  stages: StageObservation[];
+  samples: { at: number; tokens: number; tps: number | null; buffers: number; activationBytes: number }[];
+  events: { at: number; node: string; begin: number; step: number; event: string; bytes: number | null }[];
 }
 export interface Preferences { displayName: string; refreshSeconds: number }
 export const defaultPreferences: Preferences = { displayName: 'My mesh', refreshSeconds: 5 };

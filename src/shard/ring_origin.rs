@@ -104,6 +104,7 @@ struct PendingJob {
 /// It also keeps the traffic of the last [`TRAFFIC_HISTORY`] finished ring sessions.
 #[derive(Default)]
 pub struct ResultChannels {
+    pub execution: super::telemetry::ExecutionTelemetry,
     pending: Mutex<HashMap<String, PendingJob>>,
     finished: Mutex<VecDeque<RingTraffic>>,
 }
@@ -311,7 +312,7 @@ impl ResultChannel {
 }
 
 /// What one ring session read and sent, for checking that no activation reached the origin.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct RingTraffic {
     /// The session's job id.
     pub job: String,
@@ -625,11 +626,13 @@ impl Drop for DrainTask {
 async fn drain_progress(
     mut recv: Counted<BufReader<RecvStream>>,
     job: String,
+    channels: Arc<ResultChannels>,
 ) -> anyhow::Result<()> {
     while let Some(message) = recv.control().await? {
         match message {
             RingMessage::Progress(body) => {
                 let progress = Value::Object(body);
+                channels.execution.progress(&job, &progress);
                 debug!(%job, %progress, "ring progress");
             }
             other => bail!("unexpected {} line on the ring entry stream", other.kind()),
@@ -689,7 +692,8 @@ impl RingLink {
         );
         let counter = Arc::new(TrafficCounter::default());
         let progress = Counted::new(stream.recv, Arc::clone(&counter));
-        let drain = DrainTask(Some(tokio::spawn(drain_progress(progress, job.clone()))));
+        settings.channels.execution.ready(&job, stream.stages.iter().map(|s| s.meta.clone()));
+        let drain = DrainTask(Some(tokio::spawn(drain_progress(progress, job.clone(), settings.channels.clone()))));
         let (result_connection, results) = channel.into_parts();
         Ok(Self {
             results: Counted::new(results, Arc::clone(&counter)),
@@ -710,6 +714,14 @@ impl RingLink {
     /// The validated chain, from the entry to the terminal.
     pub fn stages(&self) -> &[RingStageInfo] {
         &self.stages
+    }
+
+    pub(crate) fn observe_origin(&self, metadata: &StageMetadata) {
+        self.channels.execution.ready(&self.job, [metadata.clone()]);
+    }
+
+    pub(crate) fn origin_progress(&self, event: Value) {
+        self.channels.execution.progress(&self.job, &event);
     }
 
     /// Sends `rows` (`count` rows of stage 0's output at `step` and `position`) to the entry and
@@ -740,6 +752,7 @@ impl RingLink {
         let read_started = Instant::now();
         let before = self.results.consumed;
         let result = self.await_result(step, deadline).await?;
+        self.channels.execution.token(&self.job, result.reply.eog, self.results.consumed.saturating_sub(before));
         debug!(
             session = %self.label,
             step,

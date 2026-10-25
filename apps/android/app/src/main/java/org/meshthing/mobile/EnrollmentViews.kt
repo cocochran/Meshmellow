@@ -51,7 +51,7 @@ import java.util.Date
                     Text("OpenAI-compatible API", fontWeight = FontWeight.SemiBold)
                     val api = member.api
                     if (api != null) {
-                        Text(if (api.ready) "Ready" else "Listening · inference unavailable")
+                        Text(if (api.ready) "Ready" else "Local prompt API unavailable")
                         androidx.compose.foundation.text.selection.SelectionContainer { Text(api.baseURL, fontFamily = FontFamily.Monospace) }
                         Text(if (member.id == state.id) "On this device only" else "On that device only", style = MaterialTheme.typography.bodySmall)
                         OutlinedButton(onClick = {
@@ -67,7 +67,7 @@ import java.util.Date
             }
 
         }
-        Text("Devices are enrolled. Model benchmarking and compute setup are still pending.", style = MaterialTheme.typography.bodySmall)
+        Text(if (state.workerBegin != null && state.workerEnd != null) "Contributing layers ${state.workerBegin}–${state.workerEnd - 1}. Assignments update automatically as native workers join or leave." else "Connected to the mesh. Waiting for a native model and compute assignment.", style = MaterialTheme.typography.bodySmall)
         LeaveMeshButton(enrollment)
     }
     state?.joiningName?.let { name ->

@@ -94,6 +94,15 @@ struct RingRuntime {
     settings: RingSettings,
 }
 
+struct ReconcileTask(Option<JoinHandle<()>>);
+impl Drop for ReconcileTask {
+    fn drop(&mut self) {
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
+    }
+}
+
 /// Serves `GET /health` and `POST /v1/chat/completions` on `config.listen` until `shutdown`
 /// resolves, then finishes in-flight requests and returns.
 ///
@@ -106,6 +115,39 @@ pub async fn serve_frontend(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     ensure_loopback(config.listen)?;
+    let listener = TcpListener::bind(config.listen)
+        .await
+        .with_context(|| format!("failed to bind shard frontend on {}", config.listen))?;
+    serve_frontend_on(config, listener, shutdown).await
+}
+
+/// Serve on a listener already reserved by the owning desktop client.
+pub async fn serve_frontend_on(
+    config: FrontendConfig,
+    listener: TcpListener,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
+    serve_frontend_inner(config, listener, shutdown, None).await
+}
+
+pub async fn serve_client_frontend(
+    config: FrontendConfig,
+    listener: TcpListener,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+    node: crate::mesh::Node,
+) -> anyhow::Result<()> {
+    let automatic = node.compute_enabled().await.then_some(node);
+    serve_frontend_inner(config, listener, shutdown, automatic).await
+}
+
+async fn serve_frontend_inner(
+    config: FrontendConfig,
+    listener: TcpListener,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+    automatic: Option<crate::mesh::Node>,
+) -> anyhow::Result<()> {
+    ensure_loopback(listener.local_addr()?)?;
+    ensure_loopback(config.listen)?;
     config.manifest.validate()?;
     let ring = ring_runtime(&config.manifest, config.ring)?;
     let renderer = ChatRenderer::load(&config.manifest.chat_template)?;
@@ -117,27 +159,46 @@ pub async fn serve_frontend(
         ring,
         renderer,
         generation_lock: Arc::new(Mutex::new(())),
+        automatic,
     });
+    let reconcile = ReconcileTask(state.automatic.as_ref().map(|node| {
+        let node = node.clone();
+        let state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                {
+                    let _turn = state.generation_lock.lock().await;
+                    if let Err(error) = node.prepare_compute_ring(&state.manifest).await {
+                        warn!(%error, "automatic compute route waiting");
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        })
+    }));
     let router = Router::new()
         .route(HEALTH_PATH, get(health))
+        .route("/v1/models", get(|| async {
+            Json(serde_json::json!({"object":"list", "data":[{"id":"meshthing-shard", "object":"model", "owned_by":"layercake"}]}))
+        }))
         .route(CHAT_COMPLETIONS_PATH, post(chat_completions))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state);
-    let listener = TcpListener::bind(config.listen)
-        .await
-        .with_context(|| format!("failed to bind shard frontend on {}", config.listen))?;
     let local = listener
         .local_addr()
         .context("failed to read shard frontend address")?;
     info!(listen = %local, "shard frontend listening");
-    axum::serve(listener, router)
+    let result = axum::serve(listener, router)
         .with_graceful_shutdown(shutdown)
         .await
-        .context("shard frontend failed")
+        .context("shard frontend failed");
+    drop(reconcile);
+    result
 }
 
 /// State shared by every request handler.
 struct FrontendState {
+    automatic: Option<crate::mesh::Node>,
     manifest: ShardManifest,
     endpoint: iroh::Endpoint,
     expectations: Vec<StageExpectation>,
@@ -476,8 +537,35 @@ async fn run_generation(
         queue_wait_ms = queued_at.elapsed().as_millis(),
         "shard generation acquired slot"
     );
+    let prepared = if let Some(node) = &state.automatic {
+        tokio::select! {
+            _ = &mut cancel => return,
+            result = node.prepare_compute_ring(&state.manifest) => result.and_then(|manifest| {
+                Ok(Arc::new(FrontendState {
+                    expectations: stage_expectations(&manifest),
+                    ring: ring_runtime(&manifest, Some(node.inference_ring_settings()))?,
+                    renderer: ChatRenderer::load(&manifest.chat_template)?,
+                    manifest, endpoint: state.endpoint.clone(),
+                    generation_lock: state.generation_lock.clone(), automatic: None,
+                }))
+            }),
+        }
+    } else {
+        Ok(state.clone())
+    };
+    let state = match prepared {
+        Ok(state) => state,
+        Err(error) => {
+            let _ = events
+                .send(Event::Failed(Failure::from_error(&error)))
+                .await;
+            return;
+        }
+    };
+    if let Some(ring) = &state.ring { ring.settings.channels.execution.begin(&state.manifest, &state.endpoint.id().to_string()); }
     let event = match generate(&state, &prompt, max_tokens, &events, cancel).await {
         Ok(generation) => {
+            if let Some(ring) = &state.ring { ring.settings.channels.execution.finish("done"); }
             info!(
                 finish = generation.finish.as_str(),
                 completion_tokens = generation.completion_tokens,
@@ -486,10 +574,12 @@ async fn run_generation(
             Event::Finished(generation)
         }
         Err(error) if error.downcast_ref::<GenerationCancelled>().is_some() => {
+            if let Some(ring) = &state.ring { ring.settings.channels.execution.finish("cancelled"); }
             info!("client disconnected; shard generation canceled after cleanup");
             return;
         }
         Err(error) => {
+            if let Some(ring) = &state.ring { ring.settings.channels.execution.finish("error"); }
             warn!(error = %format!("{error:#}"), "shard generation failed");
             Event::Failed(Failure::from_error(&error))
         }

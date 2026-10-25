@@ -45,6 +45,12 @@ pub struct Options {
     /// Existing local inference backend. No model is launched unless configured elsewhere.
     #[arg(long)]
     pub upstream: Option<SocketAddr>,
+    /// Run this client's local prefix and remote mesh stages from this ring manifest.
+    #[arg(long, conflicts_with_all = ["upstream", "shard_worker"])]
+    pub shard_manifest: Option<PathBuf>,
+    /// Serve an assigned model slice to approved mesh members using this worker JSON.
+    #[arg(long, conflicts_with_all = ["upstream", "shard_manifest"])]
+    pub shard_worker: Option<PathBuf>,
     /// Print the URL without opening the browser.
     #[arg(long)]
     pub no_open: bool,
@@ -54,6 +60,7 @@ struct App {
     origin: String,
     queue: Arc<JobQueue>,
     upstream: Option<SocketAddr>,
+    inference_manifest: Option<crate::shard::manifest::ShardManifest>,
     client: reqwest::Client,
     directory: PathBuf,
     commands: Mutex<()>,
@@ -61,14 +68,42 @@ struct App {
 }
 impl App {
     async fn api_status(&self) -> ApiEndpoint {
-        let member = match mesh_membership(self.node.snapshot().await) {
+        let snapshot = self.node.snapshot().await;
+        let worker = snapshot
+            .as_ref()
+            .ok()
+            .is_some_and(|s| s["inference"]["worker"].is_object());
+        let active_manifest = self.node.active_compute_manifest().await;
+        let connected = snapshot
+            .as_ref()
+            .ok()
+            .and_then(|s| s["connected_peers"].as_array());
+        let peers_ready = active_manifest
+            .as_ref()
+            .or(self.inference_manifest.as_ref())
+            .is_none_or(|manifest| {
+                manifest.stages.iter().all(|stage| match &stage.location {
+                    crate::shard::manifest::StageLocation::Remote { worker } => connected
+                        .is_some_and(|ids| {
+                            ids.iter()
+                                .any(|id| id.as_str() == Some(&worker.to_string()))
+                        }),
+                    _ => true,
+                })
+            });
+        let member = match mesh_membership(snapshot) {
             Ok(member) => Some(member),
             Err(error) => {
                 debug!(%error, "mesh state unavailable while checking inference readiness");
                 None
             }
         };
+        let route_ready = self.inference_manifest.is_none()
+            || !self.node.compute_enabled().await
+            || active_manifest.is_some();
         let ready = if member == Some(true)
+            && peers_ready
+            && route_ready
             && let Some(upstream) = self.upstream
         {
             self.client
@@ -88,7 +123,15 @@ impl App {
             } else if member == Some(false) {
                 "Create or join a mesh to enable inference."
             } else if self.upstream.is_none() {
-                "API listening. No inference backend is attached."
+                if worker {
+                    "Contributing a model slice to the mesh. Send prompts through the coordinator."
+                } else {
+                    "Connected to the mesh; waiting for a native compute assignment."
+                }
+            } else if !route_ready {
+                "Preparing model slices for the connected native workers."
+            } else if !peers_ready {
+                "Waiting for the model's contributing mesh clients to connect."
             } else if !ready {
                 "API listening. Inference backend is unavailable."
             } else {
@@ -154,12 +197,46 @@ pub async fn run(options: Options) -> Result<()> {
         "Inference upstream cannot be the dashboard itself."
     );
     let node = Node::open(&directory).await?;
+    let mut inference_tasks = tokio::task::JoinSet::new();
+    if let Some(path) = options.shard_worker {
+        let bytes = crate::config::read_file_limited(&path, 64 * 1024)?;
+        let config =
+            serde_json::from_slice(&bytes).context("Invalid shard worker configuration")?;
+        node.configure_inference_worker(config).await?;
+    }
+    let mut inference_manifest = None;
+    let upstream = if let Some(path) = options.shard_manifest {
+        let manifest = crate::shard::manifest::ShardManifest::load(&path)?;
+        ensure!(
+            manifest.is_ring(),
+            "Client shared inference requires a ring manifest with remote stages."
+        );
+        inference_manifest = Some(manifest.clone());
+        let backend_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let address = backend_listener.local_addr()?;
+        let config = crate::shard::frontend::FrontendConfig {
+            listen: address,
+            manifest,
+            endpoint: node.inference_endpoint(),
+            ring: Some(node.inference_ring_settings()),
+        };
+        inference_tasks.spawn(crate::shard::frontend::serve_client_frontend(
+            config,
+            backend_listener,
+            std::future::pending(),
+            node.clone(),
+        ));
+        Some(address)
+    } else {
+        options.upstream
+    };
     let app = Arc::new(App {
         node,
         origin: format!("http://{local}"),
         directory,
         queue: Arc::new(JobQueue::new()),
-        upstream: options.upstream,
+        upstream,
+        inference_manifest,
         client: reqwest::Client::builder()
             .timeout(Duration::from_secs(1))
             .redirect(reqwest::redirect::Policy::none())
@@ -199,9 +276,15 @@ pub async fn run(options: Options) -> Result<()> {
     let completed = tokio::select! {
         result = &mut serving => Some(result),
         _ = shutdown() => None,
+        result = inference_tasks.join_next(), if !inference_tasks.is_empty() => {
+            eprintln!("Inference runtime stopped: {result:?}");
+            None
+        },
     };
     let _ = stop.send(());
     background.abort();
+    inference_tasks.abort_all();
+    while inference_tasks.join_next().await.is_some() {}
     app.node.set_api_endpoint(None).await;
     app.node.close().await;
     if let Some(result) = completed {
@@ -339,7 +422,7 @@ async fn snapshot(State(app): State<Arc<App>>) -> Response {
 async fn command(State(app): State<Arc<App>>, Json(command): Json<Value>) -> Response {
     if !matches!(
         command["op"].as_str(),
-        Some("create" | "join" | "invite" | "decide" | "cancel_join" | "leave")
+        Some("create" | "join" | "invite" | "decide" | "cancel_join" | "leave" | "kick")
     ) {
         return error(StatusCode::BAD_REQUEST, "Unsupported mesh command.");
     }
@@ -391,11 +474,38 @@ async fn telemetry(State(app): State<Arc<App>>) -> Json<Value> {
             })
         })
         .collect::<Vec<_>>();
+    let membership = app.node.snapshot().await.unwrap_or_default();
+    let active_manifest = app.node.active_compute_manifest().await;
+    let manifest = active_manifest.as_ref().or(app.inference_manifest.as_ref());
+    let sessions = app.node.inference_ring_settings().channels.traffic();
+    let execution = app.node.inference_ring_settings().channels.execution.snapshot();
+    let hardware = app.node.compute_hardware().await;
+    let hardware: Vec<Value> = hardware.iter().filter(|(id, _)| membership["members"].as_array().is_some_and(|ms| ms.iter().any(|m| m["id"] == *id && m["online"] == true))).map(|(id, offer)| json!({"id":id,"totalBytes":offer.total_memory_bytes,"availableBytes":offer.available_memory_bytes})).collect();
+    let executed: u64 = sessions
+        .iter()
+        .filter(|s| s.succeeded)
+        .map(|s| u64::from(s.steps))
+        .sum();
+    let devices: Vec<Value> = manifest.map(|manifest| manifest.stages.iter().map(|stage| {
+        let id = match &stage.location {
+            crate::shard::manifest::StageLocation::Remote { worker } => worker.to_string(),
+            _ => app.node.id(),
+        };
+        let member = membership["members"].as_array().and_then(|members| members.iter().find(|m| m["id"] == id));
+        json!({"id": id, "name": member.and_then(|m| m["name"].as_str()).unwrap_or("Assigned peer"),
+            "hardware": "Native model worker", "begin": stage.begin, "end": stage.end,
+            "status": if member.is_some_and(|m| m["online"] == true) {"connected"} else {"offline"},
+            "executions": executed, "computeMs": null, "bufferBytes": null})
+    }).collect()).unwrap_or_default();
     Json(
         json!({"connected": true, "source": "core", "endpoint": app.origin,
         "checkedAt": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
-        "message": api.message, "active": jobs.iter().any(|j| !j.status.is_finished()), "event": if api.inference_ready {"ready"} else {"waiting"},
-        "model":"Qwen3.8-27B", "devices":[], "peers":peers, "peerStatusAvailable":peer_status_available, "layers":null, "decodeRate":null, "outputSteps":null,
+        "message": api.message, "active": execution.as_ref().is_some_and(|e| e.active) || jobs.iter().any(|j| !j.status.is_finished()), "event": execution.as_ref().map(|e| e.phase.as_str()).unwrap_or(if api.inference_ready {"ready"} else {"waiting"}),
+        "model": if app.inference_manifest.is_some() {"Shared model"} else {"No distributed model configured"},
+        "devices":devices, "peers":peers, "peerStatusAvailable":peer_status_available,
+        "layers":app.inference_manifest.as_ref().map(|m| m.layers), "decodeRate":execution.as_ref().and_then(|e| e.decode_tps),
+        "execution":execution, "hardware":hardware, "inferenceReady":api.inference_ready,
+        "outputSteps":sessions.last().map(|s| s.steps),
         "jobs": jobs.iter().map(|j| json!({"id":j.request_id,"status":j.status,"createdAt":j.created_at_unix_ms})).collect::<Vec<_>>() }),
     )
 }

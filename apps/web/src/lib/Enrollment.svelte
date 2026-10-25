@@ -4,12 +4,13 @@
   import CakeQR from './CakeQR.svelte';
   import QRScanner from './QRScanner.svelte';
   import type { EnrollmentState } from './enrollment';
-  let { onchange }: { onchange: (value: EnrollmentState | null) => void } = $props();
+  let { onchange, stages = [] }: { onchange: (value: EnrollmentState | null) => void; stages?: import('./types').Device[] } = $props();
   let meshState = $state<EnrollmentState | null>(null);
   let loaded = $state(false), busy = $state(false), error = $state(''), note = $state('');
   let mode = $state('create'), name = $state('My mesh'), deviceName = $state('My computer'), invitation = $state('');
   let scanning = $state(false);
   let confirmingLeave = $state(false);
+  let kicking = $state<string | null>(null);
   let dialog: HTMLDialogElement;
   let active = false;
   let revision = 0;
@@ -69,17 +70,22 @@
       {/if}
       <button class="button primary" disabled={busy || !meshState}>{busy ? 'Working…' : mode === 'create' ? 'Create mesh' : 'Request to join'}</button>
     </form>
-    <p class="fine-print">One mesh. Qwen3.8-27B. Devices join after a trusted member approves.</p>
+    <p class="fine-print">Devices join after a trusted member approves. Native workers receive model slices automatically.</p>
   </section>
 {:else if meshState?.joining}
   <section class="panel welcome"><h2>Waiting for a little trust.</h2><p>Ask a trusted member of {meshState.joining.name} to approve this device. Keep both apps open.</p><button class="button secondary" disabled={busy} onclick={() => command('cancel_join')}>Cancel request</button></section>
 {:else if meshState?.mesh}
-  <section class="panel membership-panel"><div class="panel-heading"><div><h2>{meshState.mesh.name}</h2><p>{meshState.members.length} trusted {meshState.members.length === 1 ? 'device' : 'devices'} · Qwen3.8-27B</p></div><button class="button secondary" onclick={showInvitation}>Invite a device</button></div>
+  <section class="panel membership-panel"><div class="panel-heading"><div><h2>{meshState.mesh.name}</h2><p>{meshState.members.length} trusted {meshState.members.length === 1 ? 'device' : 'devices'} · {meshState.members.filter(m => m.online).length} connected</p></div><button class="button secondary" onclick={showInvitation}>Invite a device</button></div>
     <div class="leave-mesh">
       {#if confirmingLeave}<p>Disconnect this computer and return to Create / Join? Other devices keep their mesh and trust history.</p><button class="button secondary" onclick={() => confirmingLeave = false}>Stay in mesh</button><button class="button primary" disabled={busy} onclick={async () => { await command('leave'); confirmingLeave = false; }}>Leave mesh</button>
       {:else}<button class="button secondary" onclick={() => confirmingLeave = true}>Leave mesh</button>{/if}
     </div>
-    <div class="member-list">{#each meshState.members as member}<div><strong>{member.name}</strong><small>{member.self ? 'This computer' : member.online ? 'Connected' : 'Offline'}</small><ApiEndpoint api={member.api} local={member.self}/></div>{/each}</div>
+    <div class="member-list">{#each meshState.members as member}{@const stage = stages.find(s => s.id === member.id)}<div><strong>{member.name}</strong><small>{member.self ? 'This computer' : member.online ? 'Connected' : 'Offline'}</small><small>{stage ? `Assigned layers ${stage.begin}–${(stage.end ?? 1) - 1}` : 'No model slice assigned yet'}</small><ApiEndpoint api={member.api} local={member.self}/>
+      {#if meshState.can_kick && !member.self}
+        {#if kicking === member.id}<p>Kick {member.name}? Its connections and model contribution will stop.</p><button class="button primary" disabled={busy} onclick={async () => { await command('kick', { member: member.id }); kicking = null; }}>Confirm kick</button><button class="button secondary" disabled={busy} onclick={() => kicking = null}>Cancel</button>
+        {:else}<button class="button secondary" disabled={busy} onclick={() => kicking = member.id}>Kick device</button>{/if}
+      {/if}
+    </div>{/each}</div>
     {#each meshState.pending as request}<div class="trust-request"><h3>{request.name} wants a slice.</h3><p>Device {request.applicant.slice(0,12)} · Trusted devices can approve others.</p><button class="button primary" disabled={busy} onclick={() => command('decide', { issuer: request.issuer, request: request.id, approve: true })}>Trust device</button><button class="button secondary" disabled={busy} onclick={() => command('decide', { issuer: request.issuer, request: request.id, approve: false })}>Decline</button></div>{/each}
   </section>
 {/if}

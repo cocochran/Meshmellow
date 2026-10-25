@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod compute;
 pub mod invitation;
 pub mod membership;
 #[cfg(test)]
@@ -96,6 +97,10 @@ struct Record {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum Wire {
+    ComputeOffer,
+    AssignCompute {
+        assignment: compute::Assignment,
+    },
     Join {
         invite: String,
         name: String,
@@ -119,6 +124,8 @@ enum Wire {
 #[derive(Serialize, Deserialize)]
 struct Reply {
     #[serde(default)]
+    compute: Option<compute::ComputeOffer>,
+    #[serde(default)]
     api: Option<ApiEndpoint>,
     error: Option<String>,
     ledger: Option<Ledger>,
@@ -129,6 +136,7 @@ struct Reply {
 impl Reply {
     fn empty() -> Self {
         Self {
+            compute: None,
             api: None,
             error: None,
             ledger: None,
@@ -151,6 +159,12 @@ pub struct Node {
     peer_apis: Arc<Mutex<BTreeMap<String, ApiEndpoint>>>,
     internet: bool,
     artifact_seed: Arc<Mutex<Option<Arc<crate::artifact::Seed>>>>,
+    inference_worker: Arc<Mutex<Option<Arc<crate::shard::ring::RingWorker>>>>,
+    inference_ring: crate::shard::ring_origin::RingSettings,
+    compute: Arc<Mutex<Option<compute::ComputeState>>>,
+    compute_status: Arc<Mutex<Option<compute::ComputeStatus>>>,
+    compute_hardware: Arc<Mutex<Vec<(String, compute::ComputeOffer)>>>,
+    compute_route: Arc<Mutex<Option<(String, crate::shard::manifest::ShardManifest)>>>,
     membership_epoch: tokio::sync::watch::Sender<u64>,
     control_peers: crate::network::SharedPeerTable,
     control_tasks: Arc<Mutex<BTreeMap<String, tokio::task::JoinHandle<()>>>>,
@@ -208,6 +222,7 @@ impl Node {
                     ALPN.to_vec(),
                     crate::protocol::CONTROL_ALPN.to_vec(),
                     crate::artifact::transport::ALPN.to_vec(),
+                    crate::shard::ring::RING_ALPN.to_vec(),
                 ],
             );
             // Internet integration tests deliberately have no IP transport, so
@@ -222,6 +237,7 @@ impl Node {
                     ALPN.to_vec(),
                     crate::protocol::CONTROL_ALPN.to_vec(),
                     crate::artifact::transport::ALPN.to_vec(),
+                    crate::shard::ring::RING_ALPN.to_vec(),
                 ])
                 .bind()
                 .await?
@@ -236,6 +252,12 @@ impl Node {
             failed_sync_members: Default::default(),
             internet,
             artifact_seed: Default::default(),
+            inference_worker: Default::default(),
+            inference_ring: Default::default(),
+            compute: Default::default(),
+            compute_status: Default::default(),
+            compute_hardware: Default::default(),
+            compute_route: Default::default(),
             local_api: Default::default(),
             peer_apis: Default::default(),
             membership_epoch: tokio::sync::watch::channel(0).0,
@@ -244,7 +266,37 @@ impl Node {
         };
         node.serve();
         node.maintain_mesh();
+        let compute_path = dir.join("compute.json");
+        if compute_path.exists() {
+            let config = serde_json::from_slice(&read_file_limited(&compute_path, 64 * 1024)?)?;
+            node.enable_compute(config).await?;
+        }
         Ok(node)
+    }
+
+    /// The client owns one identity for membership and distributed inference.
+    pub fn inference_endpoint(&self) -> Endpoint {
+        self.endpoint.clone()
+    }
+
+    pub fn inference_ring_settings(&self) -> crate::shard::ring_origin::RingSettings {
+        self.inference_ring.clone()
+    }
+
+    pub async fn configure_inference_worker(
+        &self,
+        config: crate::shard::ring::RingWorkerConfig,
+    ) -> Result<()> {
+        let mut configured = self.inference_worker.lock().await;
+        ensure!(
+            configured.is_none(),
+            "An inference worker is already configured."
+        );
+        let worker =
+            crate::shard::ring::RingWorker::load(self.endpoint.clone(), config, Default::default())
+                .await?;
+        *configured = Some(worker);
+        Ok(())
     }
 
     /// Attach verified exports to this node; membership still gates every transfer.
@@ -295,6 +347,9 @@ impl Node {
         }
     }
     pub async fn close(&self) {
+        self.membership_epoch
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+        self.inference_worker.lock().await.take();
         self.endpoint.close().await;
         for (_, task) in std::mem::take(&mut *self.control_tasks.lock().await) {
             task.abort();
@@ -316,9 +371,29 @@ impl Node {
         let mut record = self.record.lock().await;
         let mut next = record.clone();
         let result = f(&mut next)?;
+        let old_members = record
+            .ledger
+            .as_ref()
+            .map(Ledger::members)
+            .transpose()?
+            .unwrap_or_default();
+        let new_members = next
+            .ledger
+            .as_ref()
+            .map(Ledger::members)
+            .transpose()?
+            .unwrap_or_default();
+        let removed = old_members.keys().any(|id| !new_members.contains_key(id));
+        if next.ledger.is_some() && !new_members.contains_key(&self.id()) {
+            next = Record { notice: "This device was removed from the mesh. Ask the mesh creator for a new invitation.".into(), ..Record::default() };
+        }
         if serde_json::to_vec(&next)? != serde_json::to_vec(&*record)? {
             self.persist(&next)?;
             *record = next;
+            if removed {
+                self.membership_epoch
+                    .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+            }
         }
         Ok(result)
     }
@@ -362,6 +437,50 @@ impl Node {
         self.peers.lock().await.clear();
         self.remote_pending.lock().await.clear();
         self.failed_sync_members.lock().await.clear();
+        Ok(())
+    }
+
+    pub async fn kick(&self, member: &str) -> Result<()> {
+        let peers = self
+            .record
+            .lock()
+            .await
+            .ledger
+            .as_ref()
+            .context("No mesh")?
+            .members()?;
+        self.change(|r| {
+            r.ledger
+                .as_mut()
+                .context("No mesh")?
+                .set_member_allowed(&self.key, member, false)
+        })
+        .await?;
+        self.peer_apis.lock().await.remove(member);
+        *self.compute_route.lock().await = None;
+        let ledger = self.record.lock().await.ledger.clone().context("No mesh")?;
+        let mut deliveries = tokio::task::JoinSet::new();
+        // Include the removed device so its app can return to the Join screen.
+        // Offline devices receive the signed decision on their next sync.
+        for id in peers.keys().filter(|id| **id != self.id()) {
+            let node = self.clone();
+            let ledger = ledger.clone();
+            let id = id.clone();
+            deliveries.spawn(async move {
+                let peer = Peer {
+                    id,
+                    addresses: vec![],
+                    relay: None,
+                    invite: String::new(),
+                };
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    node.rpc(&peer, Wire::Sync { ledger }),
+                )
+                .await;
+            });
+        }
+        while deliveries.join_next().await.is_some() {}
         Ok(())
     }
 
@@ -701,9 +820,14 @@ impl Node {
             vec![]
         };
         Ok(json!({
+            "inference": {
+                "worker": self.inference_worker.lock().await.as_ref().map(|worker| worker.status()),
+                "completed_sessions": self.inference_ring.channels.traffic(),
+            },
             "api": local_api,
             "id": self.id(), "port": self.endpoint.bound_sockets().iter().find(|s| s.is_ipv4()).map(|s| s.port()).unwrap_or(0),
             "mesh": r.ledger.as_ref().map(|l| json!({"id": l.genesis.id(), "name": l.genesis.name})),
+            "can_kick": r.ledger.as_ref().is_some_and(|l| l.genesis.root == self.id()),
             "members": members, "pending": pending,
             "invite": invite.map(|i| {
                 json!({"id": i.id, "expires": i.expires, "ticket": self.signed_invitation(&i).ticket()})
@@ -724,6 +848,7 @@ impl Node {
         match text("op")? {
             "snapshot" => {}
             "leave" => self.leave().await?,
+            "kick" => self.kick(text("member")?).await?,
             "create" => self.create(text("name")?, text("device_name")?).await?,
             "invite" => {
                 self.invite().await?;
@@ -785,6 +910,7 @@ impl Node {
         self.change(|r| {
             let mut reply = Reply::empty();
             match message {
+                Wire::ComputeOffer | Wire::AssignCompute { .. } => unreachable!(),
                 Wire::Join {
                     invite,
                     name: device_name,
@@ -911,6 +1037,7 @@ impl Node {
                 }
             }
             Ok(Reply {
+                compute: None,
                 api: None,
                 error: None,
                 ledger: Some(current.clone()),
@@ -928,7 +1055,32 @@ impl Node {
 
     async fn dispatch(&self, remote: &str, message: Wire) -> Result<Reply> {
         match message {
+            Wire::ComputeOffer => {
+                self.control_hello(remote).await?;
+                Ok(Reply {
+                    compute: self.compute_offer().await,
+                    ..Reply::empty()
+                })
+            }
+            Wire::AssignCompute { assignment } => {
+                self.assign_compute(remote, assignment).await?;
+                Ok(Reply::empty())
+            }
             Wire::Sync { ledger } => {
+                let current = self.record.lock().await.ledger.clone();
+                if let Some(current) = current
+                    && current.genesis == ledger.genesis
+                    && current.grants.iter().any(|g| g.member == remote)
+                    && !current.members()?.contains_key(remote)
+                {
+                    // A removed peer may learn the signed decision, but cannot
+                    // merge new grants or receive any local API announcement.
+                    return Ok(Reply {
+                        ledger: Some(current),
+                        status: Some("removed".into()),
+                        ..Reply::empty()
+                    });
+                }
                 let mut reply = self.handle_trusted(remote, ledger, None).await?;
                 reply.api = self.local_api.lock().await.clone();
                 Ok(reply)
@@ -952,6 +1104,10 @@ impl Node {
             .ledger
             .as_ref()
             .context("Create or join a mesh first.")?;
+        ensure!(
+            ledger.members()?.contains_key(&self.id()),
+            "This device is no longer a member"
+        );
         ensure!(
             ledger.members()?.contains_key(remote),
             "This device is not a trusted member."
@@ -1055,13 +1211,22 @@ impl Node {
                                             if last_dial_error.take().is_some() {
                                                 info!(member = %remote, "mesh control connection recovered");
                                             }
-                                            crate::network::maintain_peer_session(
+                                            let mut epoch = client.membership_epoch.subscribe();
+                                            let client_id = client.id();
+                                            if client.control_hello(&remote).await.is_err() {
+                                                session.connection().close(1u32.into(), b"membership removed");
+                                                continue;
+                                            }
+                                            tokio::select! {
+                                            _ = epoch.changed() => { session.connection().close(1u32.into(), b"membership changed"); },
+                                            _ = crate::network::maintain_peer_session(
                                                 &session,
-                                                &client.id(),
+                                                &client_id,
                                                 &client.control_peers,
                                                 Self::control_options(),
                                             )
-                                            .await;
+                                            => {},
+                                            }
                                         }
                                         Ok(Err(error)) => report_control_dial_failure(
                                             &remote,
@@ -1113,6 +1278,36 @@ impl Node {
                             }
                         };
                     let remote = connection.remote_id().to_string();
+                    if connection.alpn() == crate::shard::ring::RING_ALPN {
+                        let mut epoch = node.membership_epoch.subscribe();
+                        if node.control_hello(&remote).await.is_err() {
+                            connection
+                                .close(1u32.into(), b"mesh membership required for inference");
+                            return;
+                        }
+                        let configured_worker = node.inference_worker.lock().await.clone();
+                        if let Some(worker) = configured_worker {
+                            for participant in worker.participants() {
+                                if node.control_hello(&participant.to_string()).await.is_err() {
+                                    connection.close(
+                                        1u32.into(),
+                                        b"inference participant is not a mesh member",
+                                    );
+                                    return;
+                                }
+                            }
+                            tokio::select! {
+                                _ = epoch.changed() => { connection.close(1u32.into(), b"membership changed"); },
+                                _ = worker.handle_connection(connection.clone()) => {},
+                            }
+                        } else {
+                            tokio::select! {
+                                _ = epoch.changed() => { connection.close(1u32.into(), b"membership changed"); },
+                                _ = node.inference_ring.channels.handle_connection(connection.clone()) => {},
+                            }
+                        }
+                        return;
+                    }
                     if connection.alpn() == crate::artifact::transport::ALPN {
                         let mut epoch = node.membership_epoch.subscribe();
                         if node.control_hello(&remote).await.is_err() {
@@ -1170,7 +1365,7 @@ impl Node {
                         return;
                     }
                     let request_peer = remote.clone();
-                    let result = tokio::time::timeout(Duration::from_secs(30), async move {
+                    let result = tokio::time::timeout(Duration::from_secs(150), async move {
                         let (mut send, mut recv) = connection.accept_bi().await?;
                         let data = recv.read_to_end(MAX_WIRE).await?;
                         let reply = match serde_json::from_slice::<Wire>(&data) {
@@ -1199,7 +1394,12 @@ impl Node {
     }
 
     async fn rpc(&self, peer: &Peer, wire: Wire) -> Result<Reply> {
-        tokio::time::timeout(Duration::from_secs(25), async {
+        let deadline = if matches!(wire, Wire::AssignCompute { .. }) {
+            140
+        } else {
+            25
+        };
+        tokio::time::timeout(Duration::from_secs(deadline), async {
             let connection = self.endpoint.connect(peer.addr()?, ALPN).await?;
             let result = async {
                 let (mut send, mut recv) = connection.open_bi().await?;

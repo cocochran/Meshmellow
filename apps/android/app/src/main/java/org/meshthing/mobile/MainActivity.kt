@@ -78,6 +78,9 @@ class MainActivity : ComponentActivity() {
     override fun onStop() { runtime.visible(this, false); super.onStop() }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (java.io.File(noBackupFilesDir, "enrollment/compute.json").isFile) {
+            window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
         val store = ViewModelProvider(this)[MeshStore::class.java]
         setContent { LayercakeTheme { MeshApp(store) } }
         lifecycleScope.launch {
@@ -195,7 +198,8 @@ class MainActivity : ComponentActivity() {
     Row(verticalAlignment = Alignment.CenterVertically) { Text("Only while plugged in", Modifier.weight(1f)); Switch(checked = power, onCheckedChange = { power = it }) }
     Button(onClick = { try { store.saveDevice(name, budget, power); notice = "Preferences saved on this device." } catch (e: Exception) { notice = e.message.orEmpty() } }) { Text("Save preferences") }
     if (notice.isNotEmpty()) Text(notice)
-    InfoCard("Compute integration pending", "These preferences are not yet enforced by a runtime. Model-specific benchmarks and a managed native worker are required before this device can contribute.")
+    InfoCard("Native compute", store.enrollment.state?.let { state -> if (state.workerBegin != null && state.workerEnd != null) "Contributing layers ${state.workerBegin}–${state.workerEnd - 1}. The native runner checked this range before assignment." else "Waiting for a local model and automatic assignment." } ?: "Join a mesh to contribute.")
+    Text("The native configuration currently sets the memory limit. These preference controls do not change a running worker.", style = MaterialTheme.typography.bodySmall)
 }
 
 @Composable private fun ModelScreen(store: MeshStore) {
@@ -225,5 +229,5 @@ class MainActivity : ComponentActivity() {
     Button(onClick = { try { store.saveEndpoint(endpoint); notice = "Connection saved."; scope.launch { store.refresh() } } catch (e: Exception) { notice = e.message.orEmpty() } }) { Text("Save connection") }
     if (notice.isNotEmpty()) Text(notice)
     Text("Use the web dashboard address, not the raw core port. Reads /api/mesh. Leave empty to disconnect. Development uses http://127.0.0.1:3210 after an adb port forward.")
-    InfoCard("Private by default", "Dashboard polling pauses in the background. Keep mesh active controls the separate peer connection. No prompt history is stored. Dashboard access does not join a mesh; membership is managed on the Mesh tab. Compute integration is still pending.")
+    InfoCard("Private by default", "Dashboard polling pauses in the background. Keep mesh active controls the separate peer connection. No prompt history is stored. Dashboard access does not join a mesh; membership is managed on the Mesh tab. Native compute uses a locally configured model and a bounded memory budget.")
 }
