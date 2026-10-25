@@ -97,6 +97,41 @@ costs. Reservation, worker readiness and manifest activation remain runtime
 responsibilities. The existing v1 JSON contract is unchanged until a compatible
 input schema and migration are implemented.
 
+### Native candidate diagnostic input boundary
+
+The current producer is `native_candidate_diagnostic` schema version 1, emitted
+by `experiments/model-validation/profile_candidate.py`. Its `report.json`
+includes a pinned request, reference provenance, per-session initialization and
+completion state, and summaries; `samples.jsonl` retains each checked step and
+its buffer/RSS/VM observations. The report deliberately sets
+`eligible_for_placement: false` for every outcome. This flag remains false even
+when `status` is `passed`: it means the pinned local fixture completed its
+diagnostic checks, not that the range is qualified or admitted.
+
+An M-5 adapter may read this format only as raw source evidence. It must check
+both schema version and `kind`, retain the report and sample-file identities,
+and preserve every session and terminal outcome. A non-passing report, missing
+or incomplete session, missing required sample, or failed correctness result
+cannot be converted into a successful range observation. A retry is a separate
+profile; it cannot overwrite or repair the earlier outcome. The request pins
+the model source, artifact, runner and listed dependencies, exact range,
+context, fixture and requested offload settings, but the current report does
+not attest the effective backend or unlisted dynamic dependencies. Its buffer,
+RSS and VM measurements do not establish complete physical-pool contribution
+peaks, and the operator-supplied thermal/power descriptions are not sensor
+measurements. It also has no shared compute admission, current availability,
+reservation, or directed-link evidence.
+
+Therefore this diagnostic format is not a serialization of measured-planner
+v1 `RangeObservation`, and a passing report cannot be copied into that input.
+Promotion requires a separately versioned qualification record that links the
+raw report and samples to independently attested backend identity, complete
+per-pool load/inference peaks, an explicit versioned threshold policy, full
+successful repetitions, and the required reference/workload provenance. The
+qualified record remains a whole-range observation. Placement admission then
+joins it with fresh capacity/reservation and directed-link evidence; neither
+step mutates or upgrades the diagnostic report itself.
+
 ## Runtime acceptance still required
 
 ### Available Qwen3.8 ring evidence (partial)
