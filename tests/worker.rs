@@ -9,8 +9,9 @@ use std::time::Duration;
 
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::presets;
+use iroh::endpoint::{ConnectionError, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode};
-use llm_cluster::network::{self, SharedPeerTable};
+use llm_cluster::network::{self, HEARTBEAT_TIMEOUT_CODE, PeerSession, SharedPeerTable};
 use llm_cluster::node::PeerTable;
 use llm_cluster::protocol::{self, CONTROL_ALPN, Heartbeat, Message, RPC_BRIDGE_ALPN};
 use llm_cluster::rpc_bridge;
@@ -32,6 +33,12 @@ const LOOPBACK_ANY_PORT: &str = "127.0.0.1:0";
 const PAYLOAD: &[u8] = b"ggml rpc through the worker";
 /// QUIC application close code the test leader uses to drop a worker's control link.
 const KICK_CODE: u32 = 7;
+/// How often the stalling test leader heartbeats before it goes silent.
+const LEADER_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(50);
+/// How long the worker waits for the leader's next heartbeat: six leader intervals.
+const LEADER_HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(300);
+/// Heartbeats the stalling test leader sends before going silent.
+const LEADER_BEATS_BEFORE_SILENCE: u64 = 3;
 
 fn init_tracing() {
     // Another test in this binary may already have installed the subscriber; that is fine.
@@ -85,6 +92,8 @@ fn worker_config(rpc_server: PathBuf, rpc_port: u16, leader: EndpointId) -> Work
         leader: Some(leader),
         allowed_peers: Vec::new(),
         heartbeat_interval: HEARTBEAT_INTERVAL,
+        // On in every test: leaders that never heartbeat must not trip it.
+        leader_heartbeat_timeout: Some(LEADER_HEARTBEAT_TIMEOUT),
     }
 }
 
@@ -280,6 +289,62 @@ async fn worker_redials_and_keeps_counting_after_the_leader_drops_it() {
         "sequences {first} then {after_redial}"
     );
 
+    cancel_and_expect_child_gone(worker_task, rpc_addr).await;
+    leader.close().await;
+}
+
+/// Accepts one control connection, heartbeats to the worker a few times, then goes silent
+/// while keeping the connection and its stream open; returns both so the caller holds them.
+async fn heartbeat_then_go_silent(
+    leader: &Endpoint,
+    peers: &SharedPeerTable,
+) -> (PeerSession, SendStream) {
+    let hello = network::local_hello(leader, CLUSTER_ID, 0);
+    let incoming = timeout(TEST_TIMEOUT, leader.accept())
+        .await
+        .expect("worker dials in time")
+        .expect("leader endpoint open");
+    let session = network::accept_peer(incoming, &hello, peers)
+        .await
+        .expect("hello");
+    let mut stream = session.connection().open_uni().await.expect("open stream");
+    for sequence in 1..=LEADER_BEATS_BEFORE_SILENCE {
+        let heartbeat = Message::Heartbeat(Heartbeat {
+            node_id: hello.node_id.clone(),
+            epoch: network::HEARTBEAT_EPOCH,
+            sequence,
+        });
+        protocol::write_frame(&mut stream, &heartbeat)
+            .await
+            .expect("write heartbeat");
+        tokio::time::sleep(LEADER_HEARTBEAT_INTERVAL).await;
+    }
+    (session, stream)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_redials_when_the_leader_stops_heartbeating() {
+    init_tracing();
+    let leader = bind_endpoint(vec![CONTROL_ALPN.to_vec()], None).await;
+    let worker = bind_endpoint(worker_alpns(), None).await;
+    let rpc_addr = free_loopback_port().await;
+    let config = worker_config(example_bin("fake_rpc_server"), rpc_addr.port(), leader.id());
+    let worker_task = spawn_worker(worker, direct_addr(&leader), config);
+
+    let peers: SharedPeerTable = Arc::new(Mutex::new(PeerTable::new()));
+    let (stalled, _stream) = heartbeat_then_go_silent(&leader, &peers).await;
+    // The worker closes the silent link itself, then dials again; the redial reaches the leader.
+    let closed = timeout(TEST_TIMEOUT, stalled.connection().closed())
+        .await
+        .expect("worker drops the silent leader");
+    let ConnectionError::ApplicationClosed(close) = closed else {
+        panic!("expected an application close, got {closed:?}");
+    };
+    assert_eq!(close.error_code, HEARTBEAT_TIMEOUT_CODE.into());
+    let redialled = kick_after_one_heartbeat(&leader, &peers).await;
+    assert!(redialled >= 1, "heartbeat {redialled} after the redial");
+
+    drop(stalled);
     cancel_and_expect_child_gone(worker_task, rpc_addr).await;
     leader.close().await;
 }

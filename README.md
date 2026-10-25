@@ -2,6 +2,12 @@
  
 A peer-to-peer mesh VPN client that splits a large language model's layers across the devices in a mesh, so a group of ordinary machines can run a model none of them could hold alone. The P2P layer is built on [Iroh](https://iroh.computer), which handles peer discovery, NAT traversal, and encrypted QUIC connections.
  
+## Downloads
+
+GitHub Actions builds Windows, Linux, Apple Silicon macOS, and Intel macOS
+terminal executables that open the web dashboard in your browser. See [download instructions](docs/downloads.md)
+for artifact locations, platform requirements, and what each package contains.
+
 ## How it works
  
 ### Layer distribution
@@ -50,6 +56,9 @@ Early development.
 The leader can also run jobs on david-codex's shard runner (`leader --backend shard`); see [shard backend](docs/shard-backend.md).
 
 ## Browser client
+
+For opt-in step and stage timings while debugging a run, use `llm-cluster
+--debug ...`; see [runtime diagnostics](docs/runtime-diagnostics.md).
 
 When the leader is running, open `http://127.0.0.1:8080` for the built-in chat
 client. It streams replies from the leader and shows recent queued, running,

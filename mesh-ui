@@ -1,0 +1,3 @@
+#!/usr/bin/env node
+// Resolve relative to this file so the launcher also works from another directory.
+await import('./apps/web/scripts/serve.mjs');
