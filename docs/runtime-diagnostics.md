@@ -45,6 +45,13 @@ outage while keeping the normal two-second polling loop from flooding warning lo
 The shared control listener accepts at most 128 concurrent sessions, and each session reads at
 most 16 concurrent heartbeat streams; excess connections are refused and excess streams are
 stopped. This bounds task growth from peers that open many idle streams.
+RPC bridges cap each worker bridge at 128 local clients, each worker endpoint at 128 incoming
+connections, and each remote connection at 128 streams. When a cap is reached, new clients are
+dropped or streams are reset; limit events are logged at debug level, with one warning per
+connection for repeated excess streams.
+The shard relay caps incoming connections at 128, including sessions waiting for the single
+runner slot. Experimental ring workers cap them at 16. Excess connections are refused and
+logged at debug level.
 Readiness-probe error excerpts are capped at 512 characters (at most 2 KiB read), and the
 external run-evidence file is capped at 1 MiB per poll.
 The CLI rejects plan, profile and shard-manifest JSON files larger than 64 MiB before parsing;

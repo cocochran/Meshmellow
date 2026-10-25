@@ -42,7 +42,7 @@ use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::rpc_bridge::{PEER_NOT_APPROVED, PEER_NOT_APPROVED_REASON};
 use crate::shard::serve::{
@@ -64,6 +64,9 @@ pub const MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
 /// Most stages a ring may have; also bounds the metrics an execute frame carries.
 pub const MAX_CHAIN_STAGES: usize = 16;
+
+/// Maximum inbound connections to a ring worker, including sessions waiting on its runner.
+const MAX_RING_CONNECTIONS: usize = 16;
 
 /// How long a peer may take to send its next control line.
 pub const CONTROL_LINE_TIMEOUT: Duration = Duration::from_secs(CONTROL_LINE_TIMEOUT_SECS);
@@ -666,6 +669,7 @@ pub async fn serve_ring_worker(endpoint: Endpoint, config: RingWorkerConfig) -> 
         gate: Semaphore::new(1),
     });
 
+    let connection_slots = Arc::new(Semaphore::new(MAX_RING_CONNECTIONS));
     let mut connections = JoinSet::new();
     loop {
         tokio::select! {
@@ -674,7 +678,16 @@ pub async fn serve_ring_worker(endpoint: Endpoint, config: RingWorkerConfig) -> 
                     info!("endpoint closed; shard-ring worker stopping");
                     return Ok(());
                 };
-                connections.spawn(serve_connection(incoming, Arc::clone(&worker)));
+                let Ok(permit) = connection_slots.clone().try_acquire_owned() else {
+                    incoming.refuse();
+                    debug!(limit = MAX_RING_CONNECTIONS, "shard-ring connection limit reached; refusing connection");
+                    continue;
+                };
+                let worker = Arc::clone(&worker);
+                connections.spawn(async move {
+                    let _permit = permit;
+                    serve_connection(incoming, worker).await;
+                });
             }
             Some(joined) = connections.join_next(), if !connections.is_empty() => {
                 log_task_panic(joined);
