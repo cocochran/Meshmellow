@@ -15,6 +15,7 @@ use llm_cluster::leader::{self, LeaderConfig};
 use llm_cluster::network::{self, SharedPeerTable};
 use llm_cluster::node::PeerTable;
 use llm_cluster::protocol::{CONTROL_ALPN, RPC_BRIDGE_ALPN};
+use llm_cluster::shard::serve::{ShardServeConfig, serve_shard};
 use llm_cluster::worker::{self, WorkerConfig};
 use llm_cluster::{api, rpc_bridge};
 use tracing_subscriber::EnvFilter;
@@ -107,6 +108,36 @@ enum Command {
         /// Local address to accept RPC clients on.
         #[arg(long, default_value = "127.0.0.1:50052")]
         listen: SocketAddr,
+    },
+    /// Serve one layer range of a model to leaders through a local shard runner.
+    ShardServe {
+        /// The shard_runner binary.
+        #[arg(long)]
+        runner: PathBuf,
+        /// The model (or exported shard) file passed to the runner.
+        #[arg(long)]
+        model: PathBuf,
+        /// Half-open layer range served, as `BEGIN:END` (e.g. `0:32`).
+        #[arg(long, value_parser = parse_layer_range)]
+        range: LayerRange,
+        /// Context window passed to the runner.
+        #[arg(long)]
+        context: u32,
+        /// Layers the runner offloads to the GPU.
+        #[arg(long, default_value_t = 0)]
+        gpu_layers: u32,
+        /// Runtime buffer budget passed to the runner, in bytes.
+        #[arg(long)]
+        budget_bytes: u64,
+        /// SHA-256 the model file must have; checked at startup.
+        #[arg(long)]
+        expected_sha256: String,
+        /// Original model identity an exported shard must report; announced as its model hash.
+        #[arg(long)]
+        source_sha256: Option<String>,
+        /// Node ID allowed to use this shard (the leader's); repeatable, at least one required.
+        #[arg(long = "allow-peer", required = true)]
+        allow_peers: Vec<String>,
     },
     /// Contribute this device to a cluster: supervise ggml-rpc-server and bridge it to the leader.
     Worker {
@@ -249,6 +280,30 @@ async fn main() -> anyhow::Result<()> {
             ref node_id,
             listen,
         } => bridge_connect(&cli.key, node_id, listen).await,
+        Command::ShardServe {
+            runner,
+            model,
+            range,
+            context,
+            gpu_layers,
+            budget_bytes,
+            expected_sha256,
+            source_sha256,
+            ref allow_peers,
+        } => {
+            let config = ShardServeConfig {
+                runner,
+                model,
+                begin: range.begin,
+                end: range.end,
+                context,
+                gpu_layers,
+                budget_bytes,
+                expected_sha256,
+                source_sha256,
+            };
+            shard_serve(&cli.key, config, &parse_node_ids(allow_peers)?).await
+        }
         Command::Worker {
             rpc_server,
             rpc_port,
@@ -386,6 +441,39 @@ async fn bridge_serve(
     print_node_id(&endpoint);
     let serve = rpc_bridge::serve_worker(endpoint.clone(), target, allowed);
     run_until_ctrl_c(&endpoint, serve).await
+}
+
+async fn shard_serve(
+    key: &Path,
+    config: ShardServeConfig,
+    allow_peers: &[iroh::EndpointId],
+) -> anyhow::Result<()> {
+    let allowed = rpc_bridge::PeerAllowlist::new(allow_peers.iter().copied())?;
+    let endpoint = network::bind_endpoint(key, vec![RPC_BRIDGE_ALPN.to_vec()]).await?;
+    print_node_id(&endpoint);
+    let serve = serve_shard(endpoint.clone(), config, allowed);
+    run_until_ctrl_c(&endpoint, serve).await
+}
+
+/// A half-open layer range `[begin, end)` given as `BEGIN:END`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LayerRange {
+    begin: u32,
+    end: u32,
+}
+
+/// Parses `--range BEGIN:END`, refusing an empty or reversed range.
+fn parse_layer_range(text: &str) -> Result<LayerRange, String> {
+    let invalid = || format!("invalid layer range {text:?}: expected BEGIN:END, e.g. 0:32");
+    let (begin, end) = text.split_once(':').ok_or_else(invalid)?;
+    let begin: u32 = begin.trim().parse().map_err(|_| invalid())?;
+    let end: u32 = end.trim().parse().map_err(|_| invalid())?;
+    if begin >= end {
+        return Err(format!(
+            "invalid layer range {text:?}: begin must be below end"
+        ));
+    }
+    Ok(LayerRange { begin, end })
 }
 
 /// Parses every `--allow-peer` value, naming the first invalid one.
@@ -539,6 +627,101 @@ mod tests {
             panic!("expected bridge-serve, got {:?}", cli.command);
         };
         assert_eq!(allow_peers, ["a", "b"]);
+    }
+
+    /// `shard-serve` over `range` with its other required flags (except `--allow-peer`) plus
+    /// `extra`.
+    fn parse_shard_serve(range: &str, extra: &[&str]) -> Result<Command, clap::Error> {
+        let required = [
+            "meshthing",
+            "shard-serve",
+            "--runner",
+            "shard_runner",
+            "--model",
+            "model.gguf",
+            "--range",
+            range,
+            "--context",
+            "512",
+            "--budget-bytes",
+            "1048576",
+            "--expected-sha256",
+            "abc123",
+        ];
+        Cli::try_parse_from(required.iter().chain(extra)).map(|cli| cli.command)
+    }
+
+    #[test]
+    fn shard_serve_requires_an_allowed_peer() {
+        assert!(
+            parse_shard_serve("0:32", &[]).is_err(),
+            "shard-serve without --allow-peer must be refused"
+        );
+
+        let command = parse_shard_serve("0:32", &["--allow-peer", "a", "--allow-peer", "b"])
+            .expect("shard-serve");
+        let Command::ShardServe {
+            runner,
+            range,
+            context,
+            gpu_layers,
+            budget_bytes,
+            expected_sha256,
+            source_sha256,
+            allow_peers,
+            ..
+        } = command
+        else {
+            panic!("expected shard-serve, got {command:?}");
+        };
+        assert_eq!(runner, PathBuf::from("shard_runner"));
+        assert_eq!(range, LayerRange { begin: 0, end: 32 });
+        assert_eq!((context, gpu_layers, budget_bytes), (512, 0, 1_048_576));
+        assert_eq!(expected_sha256, "abc123");
+        assert_eq!(source_sha256, None);
+        assert_eq!(allow_peers, ["a", "b"]);
+    }
+
+    #[test]
+    fn shard_serve_parses_optional_flags() {
+        let command = parse_shard_serve(
+            "0:32",
+            &[
+                "--allow-peer",
+                "a",
+                "--gpu-layers",
+                "99",
+                "--source-sha256",
+                "def456",
+            ],
+        )
+        .expect("shard-serve");
+        let Command::ShardServe {
+            gpu_layers,
+            source_sha256,
+            ..
+        } = command
+        else {
+            panic!("expected shard-serve, got {command:?}");
+        };
+        assert_eq!(gpu_layers, 99);
+        assert_eq!(source_sha256.as_deref(), Some("def456"));
+    }
+
+    #[test]
+    fn layer_range_must_be_begin_below_end() {
+        assert_eq!(
+            parse_layer_range("32:64"),
+            Ok(LayerRange { begin: 32, end: 64 })
+        );
+        for text in ["", "32", "5:5", "6:5", "a:b", "-1:3", "1:2:3"] {
+            assert!(
+                parse_layer_range(text).is_err(),
+                "{text:?} should be refused"
+            );
+        }
+        let flag = parse_shard_serve("8:4", &["--allow-peer", "a"]);
+        assert!(flag.is_err(), "a reversed --range must be refused");
     }
 
     #[test]
