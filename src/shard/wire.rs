@@ -29,7 +29,7 @@ pub const REQUEST_MAGIC: u32 = 0x4d53_4831;
 pub const MAX_BATCH_TOKENS: u32 = 128;
 
 /// Largest context window the runner accepts.
-pub const MAX_CONTEXT: u32 = 4096;
+pub const MAX_CONTEXT: u32 = 8192;
 
 /// Bound on a metadata or reply JSON line, newline excluded.
 pub const MAX_LINE_BYTES: usize = 1 << 20;

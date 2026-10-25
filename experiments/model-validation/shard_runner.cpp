@@ -70,7 +70,7 @@ int mesh_shard_run_stream(int argc, char ** argv, FILE * input, FILE * output) {
         const int context = std::stoi(argv[4]), gpu = std::stoi(argv[5]);
         const uint64_t budget = std::stoull(argv[6]);
         const bool return_logits = std::stoi(argv[8]) != 0;
-        if (begin < 0 || end <= begin || context < 32 || context > 4096 || budget == 0) {
+        if (begin < 0 || end <= begin || context < 32 || context > 8192 || budget == 0) {
             throw std::runtime_error("invalid partition/context/budget");
         }
         const uint16_t endian = 1;

@@ -401,7 +401,7 @@ pub fn decode_activations(payload: &[u8]) -> anyhow::Result<Vec<f32>> {
 /// Checks an execute frame against the session's state and returns its payload size.
 ///
 /// Same rules as ring.rs's `check_frame`: the job must match; `step` and `pos` must be the next
-/// expected ones (so a replayed or reordered frame fails); `1 <= n <= 128`; `pos + n <= 4096`;
+/// expected ones (so a replayed or reordered frame fails); `1 <= n <= 128`; `pos + n <= MAX_CONTEXT`;
 /// and `payload_bytes` must equal `n * embd * 4`, at most [`MAX_PAYLOAD_BYTES`]. Also refuses a
 /// frame that already carries [`MAX_CHAIN_STAGES`] metrics, which ring.rs refuses after running.
 pub fn check_execute(
@@ -1557,9 +1557,10 @@ mod tests {
         assert!(check_execute(&frame(JOB, 0, 0, 0, 0), JOB, 0, 0, EMBD).is_err());
         assert!(check_execute(&frame(JOB, 0, 0, 128, size(128)), JOB, 0, 0, EMBD).is_ok());
         assert!(check_execute(&frame(JOB, 0, 0, 129, size(129)), JOB, 0, 0, EMBD).is_err());
-        // The context bound: pos + n <= 4096.
-        assert!(check_execute(&frame(JOB, 1, 4095, 1, size(1)), JOB, 1, 4095, EMBD).is_ok());
-        assert!(check_execute(&frame(JOB, 1, 4095, 2, size(2)), JOB, 1, 4095, EMBD).is_err());
+        // The context bound: pos + n <= MAX_CONTEXT.
+        let last = MAX_CONTEXT - 1;
+        assert!(check_execute(&frame(JOB, 1, last, 1, size(1)), JOB, 1, last, EMBD).is_ok());
+        assert!(check_execute(&frame(JOB, 1, last, 2, size(2)), JOB, 1, last, EMBD).is_err());
         assert!(
             check_execute(&frame(JOB, 1, u32::MAX, 1, size(1)), JOB, 1, u32::MAX, EMBD).is_err()
         );

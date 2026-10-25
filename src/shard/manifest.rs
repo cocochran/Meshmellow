@@ -688,7 +688,12 @@ mod tests {
 
     #[test]
     fn context_must_be_in_range() {
-        for (context, valid) in [(31, false), (32, true), (MAX_CONTEXT, true), (4097, false)] {
+        for (context, valid) in [
+            (31, false),
+            (32, true),
+            (MAX_CONTEXT, true),
+            (MAX_CONTEXT + 1, false),
+        ] {
             let mut value = manifest_json(vec![local(0, 4)]);
             value["context"] = json!(context);
             assert_eq!(validate(value).is_ok(), valid, "context {context}");
