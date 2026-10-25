@@ -85,3 +85,8 @@ destination before starting, and collect trustworthy total contribution peaks
 and fresh compute events for the exact run. Compare repeated measured decode
 times with predictions and record failures and exclusions. Until those gates
 pass, M-5 remains in progress.
+
+The proposed bounded profiling lifecycle, cancellation contract, admission
+requirements, and ownership boundaries are documented in
+[runtime profiling](runtime-profiling.md). That contract does not imply a
+candidate-range executor or remote reservation is implemented.
