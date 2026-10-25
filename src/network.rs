@@ -7,6 +7,12 @@
 //!
 //! After the hello, the dialer may open unidirectional streams of framed messages. The acceptor
 //! records every [`Heartbeat`] on them in its [`PeerTable`] and logs and ignores anything else.
+//!
+//! [`serve_control_with`] can also enforce a heartbeat timeout: if a peer goes longer than
+//! [`ControlOptions::heartbeat_timeout`] without a heartbeat the table accepts (measured on the
+//! monotonic clock from the hello onward), the acceptor closes the connection with
+//! [`HEARTBEAT_TIMEOUT_CODE`] and the session's usual cleanup forgets the peer. [`serve_control`]
+//! never times peers out.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -16,7 +22,9 @@ use anyhow::{Context, anyhow, bail, ensure};
 use iroh::endpoint::presets::{self, Preset};
 use iroh::endpoint::{Connection, ConnectionError, Incoming, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
+use tokio::sync::Notify;
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::node::{NodeId, PeerTable};
@@ -33,6 +41,24 @@ const HELLO_REJECTED_CODE: u32 = 1;
 
 /// QUIC close reason sent with [`HELLO_REJECTED_CODE`].
 const HELLO_REJECTED_REASON: &[u8] = b"hello rejected";
+
+/// QUIC application close code for a connection dropped because the peer stopped heartbeating.
+pub const HEARTBEAT_TIMEOUT_CODE: u32 = 4;
+
+/// QUIC close reason sent with [`HEARTBEAT_TIMEOUT_CODE`].
+const HEARTBEAT_TIMEOUT_REASON: &[u8] = b"heartbeat timeout";
+
+/// Options for [`serve_control_with`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ControlOptions {
+    /// Longest an accepted peer may go without a heartbeat the [`PeerTable`] accepts before its
+    /// connection is closed with [`HEARTBEAT_TIMEOUT_CODE`]; `None` (the default) never times out.
+    ///
+    /// The clock starts when the peer's hello is accepted. Stale heartbeats and heartbeats sent
+    /// for another node do not reset it. `Some(Duration::ZERO)` is not meaningful and is treated
+    /// as `None`; callers should map a configured `0` to `None` themselves.
+    pub heartbeat_timeout: Option<Duration>,
+}
 
 /// Length of an Ed25519 secret key in bytes.
 const SECRET_KEY_LEN: usize = 32;
@@ -188,18 +214,35 @@ pub async fn accept_peer(
 
 /// Accepts control connections on `endpoint` until it is closed, keeping each one open until the peer leaves.
 ///
-/// While a connection is open, heartbeats the peer sends on unidirectional streams are recorded in `peers`.
+/// While a connection is open, heartbeats the peer sends on unidirectional streams are recorded in
+/// `peers`. Idle peers are never timed out; use [`serve_control_with`] for that.
 pub async fn serve_control(
     endpoint: Endpoint,
     local: Hello,
     peers: SharedPeerTable,
 ) -> anyhow::Result<()> {
+    serve_control_with(endpoint, local, peers, ControlOptions::default()).await
+}
+
+/// Like [`serve_control`], but applies `options`, such as closing connections whose peer stops
+/// heartbeating.
+pub async fn serve_control_with(
+    endpoint: Endpoint,
+    local: Hello,
+    peers: SharedPeerTable,
+    options: ControlOptions,
+) -> anyhow::Result<()> {
     let local = Arc::new(local);
+    let heartbeat_timeout = options
+        .heartbeat_timeout
+        .filter(|timeout| !timeout.is_zero());
     let mut sessions = JoinSet::new();
     while let Some(incoming) = endpoint.accept().await {
         let local = Arc::clone(&local);
         let peers = Arc::clone(&peers);
-        sessions.spawn(async move { run_control_session(incoming, &local, &peers).await });
+        sessions.spawn(async move {
+            run_control_session(incoming, &local, &peers, heartbeat_timeout).await;
+        });
         // Reap finished sessions so a long-running listener does not accumulate them.
         while sessions.try_join_next().is_some() {}
     }
@@ -211,12 +254,18 @@ pub async fn serve_control(
 /// heartbeats while it is open and logging the outcome.
 ///
 /// When the connection closes the session removes the peer from `peers`, unless it has already
-/// reconnected on a newer connection.
-async fn run_control_session(incoming: Incoming, local: &Hello, peers: &SharedPeerTable) {
+/// reconnected on a newer connection. With a `heartbeat_timeout`, the session closes the
+/// connection itself once the peer stops heartbeating.
+async fn run_control_session(
+    incoming: Incoming,
+    local: &Hello,
+    peers: &SharedPeerTable,
+    heartbeat_timeout: Option<Duration>,
+) {
     match accept_peer(incoming, local, peers).await {
         Ok(session) => {
-            let reason =
-                receive_control_streams(session.connection(), session.node_id(), peers).await;
+            let watchdog = HeartbeatWatchdog::start(heartbeat_timeout);
+            let reason = receive_control_streams(&session, peers, watchdog).await;
             info!(peer = %session.hello().node_id, %reason, "peer disconnected");
         }
         Err(error) => warn!("rejected incoming connection: {error:#}"),
@@ -236,58 +285,135 @@ fn forget_peer(peers: &SharedPeerTable, node_id: &NodeId, connection_token: u64)
     }
 }
 
-/// Reads every unidirectional stream `peer` opens on `connection` until it closes; returns why it closed.
+/// Tracks when a session's peer must next heartbeat, on the monotonic clock.
+struct HeartbeatWatchdog {
+    timeout: Option<Duration>,
+    deadline: Option<Instant>,
+}
+
+impl HeartbeatWatchdog {
+    /// Arms the watchdog from now; with no `timeout` it never expires.
+    fn start(timeout: Option<Duration>) -> Self {
+        let mut watchdog = Self {
+            timeout,
+            deadline: None,
+        };
+        watchdog.reset();
+        watchdog
+    }
+
+    /// Moves the deadline a full timeout past now, as after an accepted heartbeat.
+    fn reset(&mut self) {
+        self.deadline = self.timeout.map(|timeout| Instant::now() + timeout);
+    }
+
+    /// Completes when the deadline passes; never completes without a timeout.
+    async fn expired(&self) {
+        match self.deadline {
+            Some(deadline) => tokio::time::sleep_until(deadline).await,
+            None => std::future::pending().await,
+        }
+    }
+}
+
+/// Reads every unidirectional stream the session's peer opens until the connection closes, or
+/// closes it when `watchdog` expires; returns why it closed.
 async fn receive_control_streams(
-    connection: &Connection,
-    peer: NodeId,
+    session: &PeerSession,
     peers: &SharedPeerTable,
+    mut watchdog: HeartbeatWatchdog,
 ) -> ConnectionError {
+    let accepted_heartbeat = Arc::new(Notify::new());
     let mut streams = JoinSet::new();
     loop {
         tokio::select! {
-            accepted = connection.accept_uni() => match accepted {
+            accepted = session.connection().accept_uni() => match accepted {
                 Ok(recv) => {
-                    streams.spawn(read_control_stream(recv, peer, Arc::clone(peers)));
+                    let reader = StreamReader {
+                        peer: session.node_id(),
+                        peers: Arc::clone(peers),
+                        accepted_heartbeat: Arc::clone(&accepted_heartbeat),
+                    };
+                    streams.spawn(reader.run(recv));
                 }
                 Err(reason) => return reason,
             },
             Some(_) = streams.join_next(), if !streams.is_empty() => {}
-        }
-    }
-}
-
-/// Reads framed messages from one stream until it ends, recording heartbeats and ignoring the rest.
-async fn read_control_stream(mut recv: RecvStream, peer: NodeId, peers: SharedPeerTable) {
-    loop {
-        match protocol::read_frame(&mut recv).await {
-            Ok(Some(Message::Heartbeat(heartbeat))) => record_heartbeat(&peers, peer, &heartbeat),
-            Ok(Some(other)) => {
-                warn!(%peer, kind = message_kind(&other), "ignoring unexpected control message");
-            }
-            Ok(None) => return,
-            Err(error) => {
-                warn!(%peer, %error, "control stream failed");
-                return;
+            () = accepted_heartbeat.notified() => watchdog.reset(),
+            () = watchdog.expired() => {
+                return close_for_heartbeat_timeout(session, watchdog.timeout).await;
             }
         }
     }
 }
 
-/// Records a heartbeat from `peer`, dropping it if it names another node or is stale.
-fn record_heartbeat(peers: &SharedPeerTable, peer: NodeId, heartbeat: &Heartbeat) {
+/// Closes `session`'s connection because its peer stopped heartbeating; returns the close reason.
+///
+/// The peer is then removed by the session's own token-matched cleanup, so a newer connection
+/// from the same peer is unaffected.
+async fn close_for_heartbeat_timeout(
+    session: &PeerSession,
+    timeout: Option<Duration>,
+) -> ConnectionError {
+    warn!(peer = %session.node_id(), ?timeout, "peer stopped heartbeating; closing connection");
+    let connection = session.connection();
+    connection.close(HEARTBEAT_TIMEOUT_CODE.into(), HEARTBEAT_TIMEOUT_REASON);
+    connection.closed().await
+}
+
+/// Reads one control stream from `peer`, signalling `accepted_heartbeat` for each heartbeat the
+/// peer table accepts.
+struct StreamReader {
+    peer: NodeId,
+    peers: SharedPeerTable,
+    accepted_heartbeat: Arc<Notify>,
+}
+
+impl StreamReader {
+    /// Reads framed messages until the stream ends, recording heartbeats and ignoring the rest.
+    async fn run(self, mut recv: RecvStream) {
+        let peer = self.peer;
+        loop {
+            match protocol::read_frame(&mut recv).await {
+                Ok(Some(Message::Heartbeat(heartbeat))) => self.on_heartbeat(&heartbeat),
+                Ok(Some(other)) => {
+                    warn!(%peer, kind = message_kind(&other), "ignoring unexpected control message");
+                }
+                Ok(None) => return,
+                Err(error) => {
+                    warn!(%peer, %error, "control stream failed");
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Records `heartbeat` and, if the table accepts it, resets the session's watchdog.
+    fn on_heartbeat(&self, heartbeat: &Heartbeat) {
+        if record_heartbeat(&self.peers, self.peer, heartbeat) {
+            self.accepted_heartbeat.notify_one();
+        }
+    }
+}
+
+/// Records a heartbeat from `peer`, dropping it if it names another node or is stale; returns
+/// whether the table accepted it.
+fn record_heartbeat(peers: &SharedPeerTable, peer: NodeId, heartbeat: &Heartbeat) -> bool {
     if parse_node_id(&heartbeat.node_id).ok() != Some(peer) {
         warn!(%peer, claimed = %heartbeat.node_id, "ignoring heartbeat sent for another node");
-        return;
+        return false;
     }
     let Ok(mut table) = peers.lock() else {
         warn!(%peer, "peer table lock poisoned; dropping heartbeat");
-        return;
+        return false;
     };
-    if table.record_heartbeat(&peer, heartbeat) {
+    let accepted = table.record_heartbeat(&peer, heartbeat);
+    if accepted {
         debug!(%peer, epoch = heartbeat.epoch, sequence = heartbeat.sequence, "heartbeat");
     } else {
         warn!(%peer, sequence = heartbeat.sequence, "ignoring stale heartbeat");
     }
+    accepted
 }
 
 /// Names a message's variant for logs without dumping its (possibly large) payload.
