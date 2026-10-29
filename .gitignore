@@ -7,21 +7,17 @@
 # Agent run state (plan, coordination log, change log, outbox)
 .agent-work/
 
-# Per-person bot identity for the agent skills (copy .claude/bot-identity.example.json)
-.claude/bot-identity.json
-
-# Claude Code agent worktrees
-.claude/worktrees/
-
 /dist/
 
 __pycache__/
 
 # Local secrets / per-person MCP config
 .mcp.json
-.claude/settings.local.json
+.claude
 .env
 .env.*
 
 # Per-person editor settings
 .vscode/
+
+.github
