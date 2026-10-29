@@ -18,6 +18,16 @@ __pycache__/
 .env.*
 
 # Per-person editor settings
-.vscode/
+.vscode
 
 .github
+
+/docs
+
+/build
+
+/tests
+
+/todos
+
+/examples
