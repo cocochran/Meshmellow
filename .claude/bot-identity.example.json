@@ -1,7 +1,0 @@
-{
-  "botId": "yourname-claude",
-  "human": "Your Name",
-  "kaneoUserId": "run Kaneo whoami and paste user.id",
-  "inboxChannelId": "id of #bot-inbox-yourname-claude",
-  "categoryId": "id of category 'Bot • yourname-claude'"
-}
