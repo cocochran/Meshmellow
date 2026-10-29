@@ -1,2 +1,0 @@
-16b246afe930f3fa39b2fb2692c98141396fb89306a295a4e43878c44123ff6b  /home/david/meshthing-qwen38/build-cuda/bin/mesh-shard-socket
-1562a5816924beb04bdc880d6aa857514f738dc3a5712484b6743cdad2cd9166  /home/david/meshthing-qwen38/build-cuda/bin/libllama.so.0.7.0

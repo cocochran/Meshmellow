@@ -1,9 +1,0 @@
-2026-10-24T20:20:35.508382Z  INFO llm_cluster::rpc_bridge: rpc bridge leader listening listen=127.0.0.1:50170 worker=6d937c03ea
-2026-10-24T20:20:38.510219Z  INFO endpoint{id=7c8c4f91e3}:relay-actor: iroh::socket::transports::relay::actor: home is now relay https://use1-1.relay.n0.iroh.link./, was None
-2026-10-24T20:21:07.601452Z  INFO llm_cluster::rpc_bridge: connected to rpc bridge worker worker=6d937c03ea path="relay"
-2026-10-24T20:22:40.943545Z  INFO llm_cluster::rpc_bridge: rpc bridge stream closed remote=6d937c03ea stream=client bidirectional stream 0 tcp_peer=127.0.0.1:51258 path="direct" tcp_to_iroh=0 iroh_to_tcp=357 duration_ms=93343 close_reason="both directions finished"
-2026-10-24T20:22:51.098824Z  INFO llm_cluster::rpc_bridge: rpc bridge stream closed remote=6d937c03ea stream=client bidirectional stream 1 tcp_peer=127.0.0.1:51311 path="direct" tcp_to_iroh=409 iroh_to_tcp=174933 duration_ms=5807 close_reason="both directions finished"
-2026-10-24T20:33:37.305350Z  INFO endpoint{id=7c8c4f91e3}:relay-actor: iroh::socket::transports::relay::actor: home is now relay https://usw1-1.relay.n0.iroh.link./, was Some(RelayUrl("https://use1-1.relay.n0.iroh.link./"))
-2026-10-24T20:34:01.183811Z  INFO endpoint{id=7c8c4f91e3}:relay-actor: iroh::socket::transports::relay::actor: home is now relay https://use1-1.relay.n0.iroh.link./, was Some(RelayUrl("https://usw1-1.relay.n0.iroh.link./"))
-2026-10-24T20:40:59.815805Z  INFO llm_cluster::rpc_bridge: connected to rpc bridge worker worker=6d937c03ea path="relay"
-2026-10-24T20:41:43.788826Z  INFO llm_cluster::rpc_bridge: rpc bridge stream closed remote=6d937c03ea stream=client bidirectional stream 0 tcp_peer=127.0.0.1:52843 path="relay" tcp_to_iroh=1153 iroh_to_tcp=1692721 duration_ms=43972 close_reason="both directions finished"

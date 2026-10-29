@@ -1,4 +1,0 @@
-2026-10-24T18:39:29.929635Z  INFO llm_cluster::network: generated new node identity path=${DEMO_ROOT}/iroh-unapproved-test.key
-2026-10-24T18:39:29.934834Z  INFO llm_cluster::rpc_bridge: rpc bridge leader listening listen=127.0.0.1:50154 worker=6d937c03ea
-2026-10-24T18:39:31.472205Z  INFO llm_cluster::rpc_bridge: connected to rpc bridge worker worker=6d937c03ea path="relay"
-2026-10-24T18:39:31.606452Z  WARN llm_cluster::rpc_bridge: rpc bridge stream failed remote=6d937c03ea stream=client bidirectional stream 0 tcp_peer=127.0.0.1:58081 path="relay" tcp_to_iroh=1 iroh_to_tcp=0 duration_ms=134 close_reason=iroh to tcp: connection lost: closed by peer: peer not approved (code 3)

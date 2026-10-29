@@ -1,4 +1,0 @@
-passed: 4 bytes per tensor
-passed: 4096 bytes per tensor
-passed: 65536 bytes per tensor
-passed: 80000 bytes per tensor
