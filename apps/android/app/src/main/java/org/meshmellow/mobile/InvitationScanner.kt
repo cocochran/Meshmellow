@@ -1,4 +1,4 @@
-package org.meshthing.mobile
+package org.meshmellow.mobile
 
 import android.Manifest
 import android.content.pm.PackageManager
@@ -61,7 +61,7 @@ import com.google.mlkit.vision.barcode.common.Barcode
                     val value = result.getValue(scanner)?.firstOrNull { it.rawValue != null }?.rawValue
                     if (value != null) {
                         if (InvitationQR.accepts(value)) { delivered = true; onResult(value) }
-                        else message = "That QR isn’t a Layercake invitation. Try the code on a trusted device."
+                        else message = "That QR isn’t a Meshmellow invitation. Try the code on a trusted device."
                     }
                 }
             })

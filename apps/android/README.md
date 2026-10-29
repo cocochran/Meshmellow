@@ -1,4 +1,4 @@
-# Layercake for Android
+# Meshmellow for Android
 
 Native Kotlin / Jetpack Compose application, Android 8/API 26 or later. Build
 with JDK 17+ compatible with Gradle 9.4.1 (JDK 21 recommended), Android SDK platform
@@ -26,7 +26,7 @@ For a dedicated emulator, substitute its exact ID below:
 ```sh
 adb -s emulator-5580 install -r app/build/outputs/apk/debug/app-debug.apk
 adb -s emulator-5580 reverse tcp:3210 tcp:3210
-adb -s emulator-5580 shell am start -n org.meshthing.mobile/.MainActivity
+adb -s emulator-5580 shell am start -n org.meshmellow.mobile/.MainActivity
 ```
 
 With the web UI running on the host, save `http://127.0.0.1:3210` in the app's
@@ -44,7 +44,7 @@ the app is visible; Keep mesh active opts into a foreground service.
 It creates meshes, shares signed invitations and manages trusted membership.
 Native inference and automatic benchmarking are not yet connected. No broad storage permission, diagnostic peer identity or model weights are included.
 
-Full invitations work over Iroh without a lookup service. No Layercake server needs to be hosted. See [core membership](../../docs/mesh-membership.md). Device validation uses physical phones; do not start an Android emulator.
+Full invitations work over Iroh without a lookup service. No Meshmellow server needs to be hosted. See [core membership](../../docs/mesh-membership.md). Device validation uses physical phones; do not start an Android emulator.
 
 Cake QR invitations are generated locally with ZXing. Join a mesh → Scan cake QR
 requests CAMERA permission on demand and opens a full-screen CameraX preview with bundled, offline ML Kit QR recognition.
@@ -81,7 +81,7 @@ switch can stop it. No camera service, boot receiver, alarm restart, or battery
 exemption request is added.
 
 For long screen-off sessions, use **Battery settings** to allow unrestricted
-battery usage for Layercake. Doze can suspend networking and ignore wake locks
+battery usage for Meshmellow. Doze can suspend networking and ignore wake locks
 without exemption, and vendor restrictions/resource pressure can still stop an
 app. The app never changes battery settings on the user's behalf. Background
 connectivity uses additional power; charging is preferable.

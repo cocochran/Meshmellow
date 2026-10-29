@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export function coreBinary(env = process.env, cwd = process.cwd(), platform = process.platform) {
-  if (env.LAYERCAKE_CORE_BIN) return resolve(cwd, env.LAYERCAKE_CORE_BIN);
+  if (env.MESHMELLOW_CORE_BIN) return resolve(cwd, env.MESHMELLOW_CORE_BIN);
   const target = env.CARGO_TARGET_DIR
     ? resolve(cwd, env.CARGO_TARGET_DIR)
     : fileURLToPath(new URL('../../../target/', import.meta.url));

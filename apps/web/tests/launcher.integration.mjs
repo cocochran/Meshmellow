@@ -10,7 +10,7 @@ import { requireCoreBinary, runtimeReady, stopChild } from './runtime-process.mj
 
 test('one runtime owns static UI, enrollment, API queue, settings and shutdown', { timeout: 60000 }, async (t) => {
   const binary = await requireCoreBinary();
-  const state = await mkdtemp(join(tmpdir(), 'layercake-runtime-'));
+  const state = await mkdtemp(join(tmpdir(), 'meshmellow-runtime-'));
   const requests = []; let active = 0; let maxActive = 0;
   const fixture = createServer(async (req, res) => {
     if (req.url === '/health') { res.end('{}'); return; }
@@ -28,7 +28,7 @@ test('one runtime owns static UI, enrollment, API queue, settings and shutdown',
   let child, origin;
   async function start(upstream = true) {
     child = spawn(binary, ['ui','--no-open','--port','0','--state-dir',state,'--assets',resolve('build'),...(upstream ? ['--upstream',`127.0.0.1:${fixture.address().port}`] : [])], { stdio: ['ignore','pipe','pipe'] });
-    origin = await runtimeReady(child, /Layercake: (http:\/\/127\.0\.0\.1:\d+)/);
+    origin = await runtimeReady(child, /Meshmellow: (http:\/\/127\.0\.0\.1:\d+)/);
   }
   async function stop() { await stopChild(child); }
   t.after(async () => {

@@ -51,7 +51,7 @@
       const response = await fetch('/v1/chat/completions', {
         method: 'POST', signal: controller.signal,
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: 'meshthing-shard', messages: [...conversation, message], max_tokens: replyTokens, stream: true })
+        body: JSON.stringify({ model: 'meshmellow-shard', messages: [...conversation, message], max_tokens: replyTokens, stream: true })
       });
       if (!response.ok) {
         const result = await response.json();
@@ -160,12 +160,12 @@
   }
 </script>
 
-<svelte:head><title>Layercake · {membership?.mesh?.name || 'Welcome'}</title><meta name="description" content="Monitor devices, model layers, and runtime performance in your Layercake network." /></svelte:head>
+<svelte:head><title>Meshmellow · {membership?.mesh?.name || 'Welcome'}</title><meta name="description" content="Monitor devices, model layers, and runtime performance in your Meshmellow network." /></svelte:head>
 
 <a class="skip-link" href="#main-content">Skip to content</a>
 <div class="app-shell">
   <aside class="sidebar">
-    <a class="brand" href="/" aria-label="Layercake overview"><span class="brand-mark" aria-hidden="true"><img src="/layercake-logo.png" width="41" height="41" alt="" /></span><span>Layercake</span></a>
+    <a class="brand" href="/" aria-label="Meshmellow overview"><span class="brand-mark" aria-hidden="true"><img src="/meshmellow-logo.png" width="41" height="41" alt="" /></span><span>Meshmellow</span></a>
     <div class="workspace"><span class="workspace-icon">L</span><div><strong>{membership?.mesh?.name || 'Welcome'}</strong><span>Local workspace</span></div></div>
     <span class="eyebrow sidebar-label">WORKSPACE</span>
     <nav aria-label="Main navigation">
@@ -175,7 +175,7 @@
     </nav>
     <div class="sidebar-bottom">
       <div class="sidebar-runtime"><span class="eyebrow">RUNTIME</span><strong><span class="dot" class:disconnected={!connected}></span>{loading ? 'Connecting…' : connected ? 'Connected' : 'Disconnected'}</strong><span>Core runtime · This device</span></div>
-      <div class="local-server">Layercake <span class="mono">v0.1</span></div>
+      <div class="local-server">Meshmellow <span class="mono">v0.1</span></div>
     </div>
   </aside>
 
@@ -193,8 +193,8 @@
         <section class="panel ask-panel" aria-labelledby="inference-title">
           <div class="panel-heading"><div><h2 id="inference-title">Chat with the mesh</h2><p>{inferenceReady ? 'Conversation stays in this tab. Earlier messages are included with each reply.' : snapshot?.message || 'Waiting for contributing devices.'}</p></div><button class="text-button" disabled={generating || (!conversation.length && !submittedPrompt)} onclick={newChat}>New chat</button></div>
           {#if conversation.length || submittedPrompt}<div bind:this={transcript} class="chat-transcript" role="log" aria-label="Conversation" aria-live="off">
-            {#each conversation as message}<article class="chat-message" class:from-user={message.role === 'user'}><strong>{message.role === 'user' ? 'You' : 'Layercake'}</strong><div>{message.content}</div></article>{/each}
-            {#if submittedPrompt}<article class="chat-message from-user"><strong>You</strong><div>{submittedPrompt}</div></article><article class="chat-message"><strong>Layercake <span>{generating ? completion ? 'Replying…' : 'Preparing reply…' : 'Interrupted'}</span></strong><div>{completion}</div></article>{/if}
+            {#each conversation as message}<article class="chat-message" class:from-user={message.role === 'user'}><strong>{message.role === 'user' ? 'You' : 'Meshmellow'}</strong><div>{message.content}</div></article>{/each}
+            {#if submittedPrompt}<article class="chat-message from-user"><strong>You</strong><div>{submittedPrompt}</div></article><article class="chat-message"><strong>Meshmellow <span>{generating ? completion ? 'Replying…' : 'Preparing reply…' : 'Interrupted'}</span></strong><div>{completion}</div></article>{/if}
           </div>{/if}
           {#if finishReason === 'length'}<p class="chat-limit" role="status">The reply reached the output or context limit. Send “continue” to carry on, or start a new chat if the conversation is full.</p>{/if}
           <form class="ask-form" onsubmit={generate}>

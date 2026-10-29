@@ -14,10 +14,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const PROTOCOL_VERSION: u16 = 1;
 
 /// ALPN for the control connection that carries framed [`Message`]s.
-pub const CONTROL_ALPN: &[u8] = b"meshthing/control/1";
+pub const CONTROL_ALPN: &[u8] = b"meshmellow/control/1";
 
 /// ALPN for the raw-byte bridge that tunnels the inference RPC between leader and worker.
-pub const RPC_BRIDGE_ALPN: &[u8] = b"meshthing/rpc-bridge/1";
+pub const RPC_BRIDGE_ALPN: &[u8] = b"meshmellow/rpc-bridge/1";
 
 /// Largest frame payload accepted on read or produced on write, in bytes.
 pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;

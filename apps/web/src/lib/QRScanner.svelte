@@ -17,7 +17,7 @@
         if (!active) return;
         scanner = new QRScanner(video, result => {
           if (!active) return;
-          if (!isInvitation(result.data)) { error = 'That is not a Layercake invitation. Try the cake QR.'; return; }
+          if (!isInvitation(result.data)) { error = 'That is not a Meshmellow invitation. Try the cake QR.'; return; }
           onscan(result.data.trim()); onclose();
         }, { preferredCamera: 'environment', returnDetailedScanResult: true, highlightScanRegion: true });
         await scanner.start();

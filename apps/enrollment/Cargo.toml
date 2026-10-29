@@ -1,5 +1,5 @@
 [package]
-name = "meshthing-enrollment"
+name = "meshmellow-enrollment"
 version = "0.1.0"
 edition = "2024"
 
@@ -7,7 +7,7 @@ edition = "2024"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [[bin]]
-name = "meshthing-enrollment"
+name = "meshmellow-enrollment"
 path = "src/bin/enrollment.rs"
 required-features = ["cli"]
 

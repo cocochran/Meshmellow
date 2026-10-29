@@ -1,4 +1,4 @@
-# Layercake
+# Meshmellow
  
 A peer-to-peer mesh VPN client that splits a large language model's layers across the devices in a mesh, so a group of ordinary machines can run a model none of them could hold alone. The P2P layer is built on [Iroh](https://iroh.computer), which handles peer discovery, NAT traversal, and encrypted QUIC connections.
  

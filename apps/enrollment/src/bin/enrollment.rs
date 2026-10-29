@@ -3,6 +3,6 @@ use anyhow::{Context, Result};
 async fn main() -> Result<()> {
     let dir = std::env::args()
         .nth(1)
-        .context("Usage: meshthing-enrollment PRIVATE_STATE_DIRECTORY")?;
+        .context("Usage: meshmellow-enrollment PRIVATE_STATE_DIRECTORY")?;
     llm_cluster::mesh::cli::run(dir.into()).await
 }

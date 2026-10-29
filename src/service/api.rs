@@ -113,7 +113,7 @@ pub async fn serve_api(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     ensure_loopback(config.listen)?;
-    let profiles = match std::env::var_os("LAYERCAKE_PROFILE_CONFIG") {
+    let profiles = match std::env::var_os("MESHMELLOW_PROFILE_CONFIG") {
         Some(path) => Some(
             crate::runtime::profiling::ProfileManager::from_file(std::path::Path::new(&path))
                 .await?,

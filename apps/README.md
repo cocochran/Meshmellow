@@ -1,4 +1,4 @@
-# Layercake applications
+# Meshmellow applications
 
 - [Web](web/README.md): terminal-launched SvelteKit dashboard; desktop uses a
   browser, with no Tauri or Electron shell.
@@ -14,7 +14,7 @@ shared [Rust enrollment core](enrollment/README.md). They do not execute model l
 
 Membership is owned by `llm_cluster::mesh` in the core. The mobile Rust library is
 a thin C/JNI adapter. Full signed invitations work across networks through Iroh
-without a lookup service or a Layercake server to host.
+without a lookup service or a Meshmellow server to host.
 See [core mesh creation and joining](../docs/mesh-membership.md).
 
 Both apps use the web dashboard's `GET /api/mesh` projection, including configured
@@ -44,7 +44,7 @@ or automatically benchmark devices. One mesh and one model remain the scope.
 
 ## Next native-core boundary
 
-The current diagnostic `meshthing_iroh_run` blocks on fixed peers, with no owned
+The current diagnostic `meshmellow_iroh_run` blocks on fixed peers, with no owned
 stop handle; its worker also embeds a fixed layer range. Production apps must not
 hide those limitations behind a Start button. Coordinate M-26 with the core owner:
 

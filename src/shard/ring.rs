@@ -1,4 +1,4 @@
-//! `meshthing/shard-ring/1`: chained remote stages that forward activations peer to peer.
+//! `meshmellow/shard-ring/1`: chained remote stages that forward activations peer to peer.
 //!
 //! EXPERIMENTAL, pending david-codex's production sign-off. This is the production counterpart of
 //! his diagnostic `experiments/mobile-probe/iroh-core/src/ring.rs` and stays byte-compatible
@@ -44,7 +44,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{timeout, timeout_at};
 use tracing::{debug, info, warn};
 
-use crate::net::rpc_bridge::{PEER_NOT_APPROVED, PEER_NOT_APPROVED_REASON};
+use crate::network::rpc_bridge::{PEER_NOT_APPROVED, PEER_NOT_APPROVED_REASON};
 use crate::shard::serve::{
     RUNNER_STARTUP_TIMEOUT, SESSION_ABORTED, STDERR_DRAIN_TIMEOUT, Shard, ShardServeConfig,
     forward_stderr, log_task_panic, reap,
@@ -54,7 +54,7 @@ use crate::shard::wire::{
 };
 
 /// ALPN of the ring protocol, separate from the v1 shard relay's.
-pub const RING_ALPN: &[u8] = b"meshthing/shard-ring/1";
+pub const RING_ALPN: &[u8] = b"meshmellow/shard-ring/1";
 
 /// Bound on one control line, newline included.
 pub const MAX_CONTROL_LINE_BYTES: usize = 65_536;

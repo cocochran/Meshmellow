@@ -58,7 +58,7 @@ use crate::shard::template::{ChatMessage, ChatRenderer};
 pub const HEALTH_PATH: &str = "/health";
 
 /// Model name reported in completion objects.
-const MODEL_NAME: &str = "meshthing-shard";
+const MODEL_NAME: &str = "meshmellow-shard";
 
 /// Largest accepted request body; long chat histories exceed axum's 2 MiB default.
 const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
@@ -179,7 +179,7 @@ async fn serve_frontend_inner(
     let router = Router::new()
         .route(HEALTH_PATH, get(health))
         .route("/v1/models", get(|| async {
-            Json(serde_json::json!({"object":"list", "data":[{"id":"meshthing-shard", "object":"model", "owned_by":"layercake"}]}))
+            Json(serde_json::json!({"object":"list", "data":[{"id":"meshmellow-shard", "object":"model", "owned_by":"meshmellow"}]}))
         }))
         .route(CHAT_COMPLETIONS_PATH, post(chat_completions))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))

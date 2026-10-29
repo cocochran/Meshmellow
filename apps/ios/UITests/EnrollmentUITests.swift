@@ -21,7 +21,7 @@ final class EnrollmentUITests: XCTestCase {
         create.tap()
         XCTAssertTrue(app.descendants(matching: .any)["invitation-link"].waitForExistence(timeout: 50))
         let code = app.descendants(matching: .any)["invitation-link"].label
-        XCTAssertTrue(code.hasPrefix("layercake://join/"))
+        XCTAssertTrue(code.hasPrefix("meshmellow://join/"))
         let invitation = XCTAttachment(screenshot: app.screenshot()); invitation.name = "Create mesh and signed invitation"; invitation.lifetime = .keepAlways; add(invitation)
         print("ENROLLMENT_INVITATION \(code)")
         app.buttons["Copy invitation"].tap()

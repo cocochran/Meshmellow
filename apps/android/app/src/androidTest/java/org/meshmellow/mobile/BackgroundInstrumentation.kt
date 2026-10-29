@@ -1,4 +1,4 @@
-package org.meshthing.mobile
+package org.meshmellow.mobile
 
 import android.app.*
 import android.content.Context
@@ -7,7 +7,7 @@ import android.os.Bundle
 import kotlinx.coroutines.*
 import java.io.File
 
-class IsolatedBackgroundApplication : LayercakeApplication() {
+class IsolatedBackgroundApplication : MeshmellowApplication() {
     val directory by lazy { File(cacheDir, "background-test-${java.util.UUID.randomUUID()}") }
     override val meshRuntime by lazy { MeshRuntime(this, directory) }
 }
@@ -108,7 +108,7 @@ class BackgroundInstrumentation : Instrumentation() {
                 // dumpsys also retains release history; only inspect currently held locks.
                 check(locks.contains("Wake Locks:")) { "Could not inspect active wake locks" }
                 val held = locks.substringAfter("Wake Locks:").substringBefore("\n\n")
-                check(!held.contains("Layercake:MeshConnection")) { "Wake lock leaked after Stop/Leave" }
+                check(!held.contains("Meshmellow:MeshConnection")) { "Wake lock leaked after Stop/Leave" }
                 code = Activity.RESULT_OK
                 result.putString("result", "PASS: real foreground service, Iroh heartbeats with Activity closed and screen off, notification Stop, resume, Leave cleanup, no wake-lock leak")
             } catch (failure: Throwable) { result.putString("error", failure.toString()) }

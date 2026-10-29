@@ -1,4 +1,4 @@
-package org.meshthing.mobile
+package org.meshmellow.mobile
 
 import android.Manifest
 import android.content.Intent
@@ -31,7 +31,7 @@ import com.google.zxing.qrcode.QRCodeWriter
 import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
 
 object InvitationQR {
-    fun accepts(text: String) = text.toByteArray(Charsets.UTF_8).size <= 4096 && text.startsWith("layercake://join/")
+    fun accepts(text: String) = text.toByteArray(Charsets.UTF_8).size <= 4096 && text.startsWith("meshmellow://join/")
     fun matrix(ticket: String) = QRCodeWriter().encode(ticket, BarcodeFormat.QR_CODE, 720, 720,
         mapOf(EncodeHintType.ERROR_CORRECTION to ErrorCorrectionLevel.M, EncodeHintType.MARGIN to 4))
 }
@@ -46,10 +46,10 @@ object InvitationQR {
         Column(Modifier.widthIn(max = 340.dp).fillMaxWidth().border(4.dp, Color(0xffd6bda1)).background(Color.White)) {
             Row(Modifier.fillMaxWidth().padding(horizontal = 22.dp, vertical = 12.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 repeat(2) { Box(Modifier.size(12.dp).background(Color(0xffb83f49))) }
-                Image(painterResource(R.drawable.layercake), null, Modifier.size(48.dp))
+                Image(painterResource(R.drawable.meshmellow), null, Modifier.size(48.dp))
                 repeat(2) { Box(Modifier.size(12.dp).background(Color(0xffb83f49))) }
             }
-            Image(bitmap, "Invitation QR code. Scan with Layercake on another device.", Modifier.fillMaxWidth().aspectRatio(1f).padding(horizontal = 8.dp), filterQuality = FilterQuality.None)
+            Image(bitmap, "Invitation QR code. Scan with Meshmellow on another device.", Modifier.fillMaxWidth().aspectRatio(1f).padding(horizontal = 8.dp), filterQuality = FilterQuality.None)
             Box(Modifier.fillMaxWidth().height(18.dp).background(Color(0xffbd8057)))
             Box(Modifier.fillMaxWidth().height(8.dp).background(Color(0xfff5d6b8)))
             Box(Modifier.fillMaxWidth().height(9.dp).background(Color(0xffb34a54)))

@@ -1,4 +1,4 @@
-package org.meshthing.mobile
+package org.meshmellow.mobile
 
 import android.app.Activity
 import android.app.Instrumentation

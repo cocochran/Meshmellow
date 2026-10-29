@@ -2,7 +2,7 @@ import Foundation
 import SwiftUI
 
 private final class EnrollmentBridge: @unchecked Sendable {
-    private let queue = DispatchQueue(label: "org.meshthing.enrollment")
+    private let queue = DispatchQueue(label: "org.meshmellow.enrollment")
     func command(_ value: [String: Any]) async throws -> Data {
         let input = String(decoding: try JSONSerialization.data(withJSONObject: value), as: UTF8.self)
         return try await withCheckedThrowingContinuation { continuation in

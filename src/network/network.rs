@@ -37,8 +37,8 @@ use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
 use crate::config::read_file_limited;
-use crate::net::node::{NodeId, PeerTable};
-use crate::net::protocol::{self, CONTROL_ALPN, Heartbeat, Hello, Message, PROTOCOL_VERSION};
+use crate::network::node::{NodeId, PeerTable};
+use crate::network::protocol::{self, CONTROL_ALPN, Heartbeat, Hello, Message, PROTOCOL_VERSION};
 
 /// Peer table shared between the accept loop and the code that dials out.
 pub type SharedPeerTable = Arc<Mutex<PeerTable>>;
@@ -864,7 +864,7 @@ mod tests {
             cluster_id: "test".into(),
             last_log_index: 0,
         };
-        let peers = Arc::new(Mutex::new(crate::net::node::PeerTable::new()));
+        let peers = Arc::new(Mutex::new(crate::network::node::PeerTable::new()));
         let old = peers
             .lock()
             .unwrap()
@@ -908,7 +908,7 @@ mod tests {
     }
 
     fn temp_key_path(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("meshthing-{}-{name}.key", std::process::id()))
+        std::env::temp_dir().join(format!("meshmellow-{}-{name}.key", std::process::id()))
     }
 
     #[test]

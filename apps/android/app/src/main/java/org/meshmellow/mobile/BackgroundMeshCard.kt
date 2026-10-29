@@ -1,4 +1,4 @@
-package org.meshthing.mobile
+package org.meshmellow.mobile
 
 import android.Manifest
 import android.content.Intent
@@ -20,7 +20,7 @@ import androidx.core.content.ContextCompat
     var notice by remember { mutableStateOf("") }
     fun start() {
         try { ContextCompat.startForegroundService(context, Intent(context, MeshBackgroundService::class.java)) }
-        catch (failure: Exception) { runtime.backgroundFailed(failure.message ?: "Open Layercake to enable background usage.") }
+        catch (failure: Exception) { runtime.backgroundFailed(failure.message ?: "Open Meshmellow to enable background usage.") }
     }
     val notifications = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (!granted) notice = "Notifications are off. You can stop background usage here or in Android’s Active apps."
@@ -41,10 +41,10 @@ import androidx.core.content.ContextCompat
             Text("Uses more battery; best while charging. This keeps mesh connections active, not model inference.", style = MaterialTheme.typography.bodySmall)
             if (runtime.enrollment.state?.meshName == null) Text("Create or join a mesh first.", style = MaterialTheme.typography.bodySmall)
             if (runtime.backgroundActive) {
-                Text("For long screen-off sessions, allow unrestricted battery usage for Layercake. Android can still stop the app under resource pressure.", style = MaterialTheme.typography.bodySmall)
+                Text("For long screen-off sessions, allow unrestricted battery usage for Meshmellow. Android can still stop the app under resource pressure.", style = MaterialTheme.typography.bodySmall)
                 OutlinedButton(onClick = {
                     try { context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }
-                    catch (_: Exception) { notice = "Open Android Settings → Apps → Layercake → Battery." }
+                    catch (_: Exception) { notice = "Open Android Settings → Apps → Meshmellow → Battery." }
                 }) { Text("Battery settings") }
             }
             if (notice.isNotEmpty()) Text(notice, style = MaterialTheme.typography.bodySmall)

@@ -4,7 +4,7 @@ use futures_util::TryStreamExt;
 use std::{path::Path, pin::Pin, time::Duration};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 
-pub const ALPN: &[u8] = b"layercake/artifact/1";
+pub const ALPN: &[u8] = b"meshmellow/artifact/1";
 const MAX_MESSAGE: usize = 8192;
 #[derive(Serialize, Deserialize)]
 struct Request {

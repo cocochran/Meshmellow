@@ -21,7 +21,7 @@ def main():
     parser.add_argument('--target', required=True)
     args = parser.parse_args()
     windows = 'windows' in args.target
-    stem = 'meshthing-' + args.target
+    stem = 'meshmellow-' + args.target
     archive = Path('dist') / (stem + ('.zip' if windows else '.tar.gz'))
     expected = archive.with_name(archive.name + '.sha256').read_text().split()[0]
     assert hashlib.sha256(archive.read_bytes()).hexdigest() == expected
@@ -43,7 +43,7 @@ def main():
         with socket.socket() as listener:
             listener.bind(('127.0.0.1', 0))
             port = listener.getsockname()[1]
-        command = [str(root / ('meshthing.exe' if windows else 'meshthing')),
+        command = [str(root / ('meshmellow.exe' if windows else 'meshmellow')),
                    '--no-open', '--port', str(port), '--state-dir', str(extracted / 'state')]
         with (extracted / 'launcher.log').open('w+') as log:
             process = subprocess.Popen(command, cwd=directory, env={**os.environ, 'PATH': ''},

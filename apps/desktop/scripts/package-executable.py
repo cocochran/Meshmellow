@@ -25,7 +25,7 @@ def main() -> None:
     windows = 'windows' in args.target
     extension = '.exe' if windows else ''
     release = Path(args.target_dir) / args.target / 'release'
-    binaries = [release / (name + extension) for name in ['meshthing', 'llm-cluster']]
+    binaries = [release / (name + extension) for name in ['meshmellow', 'llm-cluster']]
     for binary in binaries:
         if not binary.is_file():
             raise SystemExit(f'Release executable missing: {binary}')
@@ -33,7 +33,7 @@ def main() -> None:
         raise SystemExit('Build apps/web before packaging.')
     output = Path('dist')
     output.mkdir(exist_ok=True)
-    stem = f'meshthing-{args.target}'
+    stem = f'meshmellow-{args.target}'
     with tempfile.TemporaryDirectory() as folder:
         bundle = Path(folder) / stem
         bundle.mkdir()
@@ -72,8 +72,8 @@ def main() -> None:
             'executables': {binary.name: digest(binary) for binary in binaries},
         }, indent=2) + '\n', encoding='utf-8')
         (bundle / 'README.txt').write_text(
-            'MeshThing terminal tools + browser dashboard\n\n'
-            f'Run meshthing{extension} in a terminal to start the dashboard and open your default browser.\n'
+            'Meshmellow terminal tools + browser dashboard\n\n'
+            f'Run meshmellow{extension} in a terminal to start the dashboard and open your default browser.\n'
             'The terminal stays running. Ctrl+C stops the runtime and its dashboard.\n'
             'The runtime owns membership, heartbeat, and the local OpenAI API.\n'
             'Use --upstream 127.0.0.1:PORT to attach a running inference backend, or --no-open.\n'

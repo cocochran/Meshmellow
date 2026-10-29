@@ -189,7 +189,7 @@ async fn fixture(dir: &Path, peer: crate::mesh::Peer) -> Seed {
     data.extend(5u64.to_le_bytes());
     for (key, value) in [
         ("general.architecture", "qwen35"),
-        ("meshthing.source_sha256", model.source_sha256.as_str()),
+        ("meshmellow.source_sha256", model.source_sha256.as_str()),
     ] {
         string(&mut data, key);
         data.extend(8u32.to_le_bytes());
@@ -197,8 +197,8 @@ async fn fixture(dir: &Path, peer: crate::mesh::Peer) -> Seed {
     }
     for (key, value) in [
         ("qwen35.block_count", 4u32),
-        ("meshthing.shard_begin", 1),
-        ("meshthing.shard_end", 2),
+        ("meshmellow.shard_begin", 1),
+        ("meshmellow.shard_end", 2),
     ] {
         string(&mut data, key);
         data.extend(4u32.to_le_bytes());

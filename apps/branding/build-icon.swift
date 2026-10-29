@@ -1,11 +1,11 @@
 // Package the supplied logo on an opaque launcher canvas; preserve pixel edges.
-// From the repo root: swiftc apps/branding/build-icon.swift -o /tmp/layercake-icon
-// Then run /tmp/layercake-icon from the same directory.
+// From the repo root: swiftc apps/branding/build-icon.swift -o /tmp/meshmellow-icon
+// Then run /tmp/meshmellow-icon from the same directory.
 import Foundation
 import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
-let source = URL(fileURLWithPath: "apps/branding/layercake.png")
+let source = URL(fileURLWithPath: "apps/branding/meshmellow.png")
 let output = URL(fileURLWithPath: "apps/ios/Resources/Assets.xcassets/AppIcon.appiconset/app-icon.png")
 guard let input = CGImageSourceCreateWithURL(source as CFURL, nil),
       let logo = CGImageSourceCreateImageAtIndex(input, 0, nil),

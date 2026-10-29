@@ -22,7 +22,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::read_file_limited;
 
-const ALPN: &[u8] = b"meshthing/enrollment/1";
+const ALPN: &[u8] = b"meshmellow/enrollment/1";
 const MAX_WIRE: usize = 128 * 1024;
 const MAX_IDENTITY_KEY_BYTES: usize = 32;
 
@@ -161,7 +161,7 @@ pub struct Node {
     local_api: Arc<Mutex<Option<ApiEndpoint>>>,
     peer_apis: Arc<Mutex<BTreeMap<String, ApiEndpoint>>>,
     peer_compute: Arc<Mutex<BTreeMap<String, compute::ComputeStatus>>>,
-    internet: bool,
+    internetwork: bool,
     artifact_seed: Arc<Mutex<Option<Arc<crate::artifact::Seed>>>>,
     inference_worker: Arc<Mutex<Option<Arc<crate::shard::ring::RingWorker>>>>,
     inference_ring: crate::shard::ring_origin::RingSettings,
@@ -170,7 +170,7 @@ pub struct Node {
     compute_hardware: Arc<Mutex<Vec<(String, compute::ComputeOffer)>>>,
     compute_route: Arc<Mutex<Option<(String, crate::shard::manifest::ShardManifest)>>>,
     membership_epoch: tokio::sync::watch::Sender<u64>,
-    control_peers: crate::net::network::SharedPeerTable,
+    control_peers: crate::network::network::SharedPeerTable,
     control_tasks: Arc<Mutex<BTreeMap<String, tokio::task::JoinHandle<()>>>>,
     /// Native model verification; kept apart from per-member control links,
     /// which membership maintenance prunes.
@@ -187,7 +187,7 @@ impl Node {
         Self::open_with(directory.as_ref(), false).await
     }
 
-    async fn open_with(dir: &Path, internet: bool) -> Result<Self> {
+    async fn open_with(dir: &Path, internetwork: bool) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
         #[cfg(unix)]
         {
@@ -222,17 +222,17 @@ impl Node {
                 "Saved identity is not a member of this mesh."
             );
         }
-        let endpoint = if internet {
-            let builder = crate::net::network::endpoint_builder_with_key(
+        let endpoint = if internetwork {
+            let builder = crate::network::network::endpoint_builder_with_key(
                 key.clone(),
                 vec![
                     ALPN.to_vec(),
-                    crate::net::protocol::CONTROL_ALPN.to_vec(),
+                    crate::network::protocol::CONTROL_ALPN.to_vec(),
                     crate::artifact::transport::ALPN.to_vec(),
                     crate::shard::ring::RING_ALPN.to_vec(),
                 ],
             );
-            // Internet integration tests deliberately have no IP transport, so
+            // Internetwork integration tests deliberately have no IP transport, so
             // successful pairing cannot accidentally use loopback or the LAN.
             #[cfg(test)]
             let builder = builder.clear_ip_transports();
@@ -242,7 +242,7 @@ impl Node {
                 .secret_key(key.clone())
                 .alpns(vec![
                     ALPN.to_vec(),
-                    crate::net::protocol::CONTROL_ALPN.to_vec(),
+                    crate::network::protocol::CONTROL_ALPN.to_vec(),
                     crate::artifact::transport::ALPN.to_vec(),
                     crate::shard::ring::RING_ALPN.to_vec(),
                 ])
@@ -257,7 +257,7 @@ impl Node {
             peers: Default::default(),
             remote_pending: Default::default(),
             failed_sync_members: Default::default(),
-            internet,
+            internetwork,
             artifact_seed: Default::default(),
             inference_worker: Default::default(),
             inference_ring: Default::default(),
@@ -335,7 +335,7 @@ impl Node {
     }
 
     /// Shared authenticated control connections for the embedded read-only API.
-    pub fn control_peer_table(&self) -> crate::net::network::SharedPeerTable {
+    pub fn control_peer_table(&self) -> crate::network::network::SharedPeerTable {
         self.control_peers.clone()
     }
 
@@ -499,10 +499,10 @@ impl Node {
     }
 
     pub async fn invite(&self) -> Result<String> {
-        if self.internet {
+        if self.internetwork {
             tokio::time::timeout(Duration::from_secs(15), self.endpoint.online())
                 .await
-                .context("Cannot reach Iroh. Check your Internet connection.")?;
+                .context("Cannot reach Iroh. Check your Internetwork connection.")?;
         }
         self.change(|r| {
             ensure!(r.ledger.is_some(), "Create or join a mesh first.");
@@ -1122,7 +1122,7 @@ impl Node {
     }
 
     /// Snapshot the authoritative mesh identity and admit only signed members.
-    async fn control_hello(&self, remote: &str) -> Result<crate::net::protocol::Hello> {
+    async fn control_hello(&self, remote: &str) -> Result<crate::network::protocol::Hello> {
         let record = self.record.lock().await;
         let ledger = record
             .ledger
@@ -1136,15 +1136,15 @@ impl Node {
             ledger.members()?.contains_key(remote),
             "This device is not a trusted member."
         );
-        Ok(crate::net::network::local_hello(
+        Ok(crate::network::network::local_hello(
             &self.endpoint,
             &ledger.genesis.id(),
             0,
         ))
     }
 
-    fn control_options() -> crate::net::network::ControlOptions {
-        crate::net::network::ControlOptions {
+    fn control_options() -> crate::network::network::ControlOptions {
+        crate::network::network::ControlOptions {
             heartbeat_interval: Some(crate::roles::leader::DEFAULT_HEARTBEAT_INTERVAL),
             heartbeat_timeout: Some(crate::roles::leader::DEFAULT_HEARTBEAT_TIMEOUT),
         }
@@ -1224,7 +1224,7 @@ impl Node {
                                             continue;
                                         }
                                     };
-                                    let dial = crate::net::network::dial_peer(
+                                    let dial = crate::network::network::dial_peer(
                                         &client.endpoint,
                                         address,
                                         &hello,
@@ -1243,7 +1243,7 @@ impl Node {
                                             }
                                             tokio::select! {
                                             _ = epoch.changed() => { session.connection().close(1u32.into(), b"membership changed"); },
-                                            _ = crate::net::network::maintain_peer_session(
+                                            _ = crate::network::network::maintain_peer_session(
                                                 &session,
                                                 &client_id,
                                                 &client.control_peers,
@@ -1352,7 +1352,7 @@ impl Node {
                         }
                         return;
                     }
-                    if connection.alpn() == crate::net::protocol::CONTROL_ALPN {
+                    if connection.alpn() == crate::network::protocol::CONTROL_ALPN {
                         let mut epoch = node.membership_epoch.subscribe();
                         let hello = match node.control_hello(&remote).await {
                             Ok(hello) => hello,
@@ -1362,7 +1362,7 @@ impl Node {
                                 return;
                             }
                         };
-                        match crate::net::network::accept_peer_connection(
+                        match crate::network::network::accept_peer_connection(
                             connection,
                             &hello,
                             &node.control_peers,
@@ -1376,7 +1376,7 @@ impl Node {
                                         info!(peer = %remote, "mesh membership changed; closing control session");
                                         return;
                                     }
-                                    reason = crate::net::network::maintain_peer_session(
+                                    reason = crate::network::network::maintain_peer_session(
                                         &session, &id, &node.control_peers, Self::control_options(),
                                     ) => reason,
                                 };
@@ -1440,7 +1440,7 @@ impl Node {
             result
         })
         .await
-        .context("Device unavailable. Check your Internet connection and keep both apps open.")?
+        .context("Device unavailable. Check your Internetwork connection and keep both apps open.")?
     }
 }
 

@@ -1,4 +1,4 @@
-package org.meshthing.mobile
+package org.meshmellow.mobile
 
 import android.app.Application
 import android.content.Context
@@ -13,7 +13,7 @@ import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
 object EnrollmentNative {
-    init { System.loadLibrary("meshthing_enrollment") }
+    init { System.loadLibrary("meshmellow_enrollment") }
     @JvmStatic external fun initialize(context: Context)
     @JvmStatic external fun command(input: String): String
 }

@@ -10,12 +10,12 @@ import { requireCoreBinary, runtimeReady, stopChild } from './runtime-process.mj
 
 test('fresh web mesh creates signed invites, approves a real peer, and persists membership', { timeout: 120000 }, async () => {
   const binary = await requireCoreBinary();
-  const directory = await mkdtemp(join(tmpdir(), 'layercake-web-mesh-'));
+  const directory = await mkdtemp(join(tmpdir(), 'meshmellow-web-mesh-'));
   const origin = 'http://127.0.0.1:3227';
   let web, peer;
   const start = async () => {
     web = spawn(binary, ['ui','--no-open','--assets',resolve('build'),'--port','3227','--state-dir',join(directory,'web')], { stdio: ['ignore','pipe','pipe'] });
-    await runtimeReady(web, /Layercake: (http:\/\/127\.0\.0\.1:\d+)/);
+    await runtimeReady(web, /Meshmellow: (http:\/\/127\.0\.0\.1:\d+)/);
   };
   const stop = async () => { await stopChild(web); };
   const get = async () => { const r = await fetch(origin+'/api/enrollment'); assert.equal(r.status,200); return r.json(); };
@@ -30,7 +30,7 @@ test('fresh web mesh creates signed invites, approves a real peer, and persists 
     assert.equal((await fetch(origin+'/api/enrollment',{method:'POST',headers:{Origin:origin,'Content-Type':'application/json'},body:'{"op":"discover","peers":[]}'})).status,400);
     const created = await post({op:'create',name:'QR integration',device_name:'Web'});
     const invitation = (await post({op:'invite'})).invite.ticket;
-    assert.ok(invitation.startsWith('layercake://join/'));
+    assert.ok(invitation.startsWith('meshmellow://join/'));
     peer = spawn(binary,['mesh','--state-dir',join(directory,'peer')],{stdio:['pipe','pipe','ignore']});
     await once(peer, 'spawn');
     const lines = createInterface({ input:peer.stdout });

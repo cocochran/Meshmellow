@@ -1,4 +1,4 @@
-package org.meshthing.mobile
+package org.meshmellow.mobile
 
 import android.app.Application
 import androidx.compose.runtime.getValue
@@ -14,9 +14,9 @@ import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 
 class MeshStore(app: Application) : AndroidViewModel(app) {
-    val runtime = (app as LayercakeApplication).meshRuntime
+    val runtime = (app as MeshmellowApplication).meshRuntime
     val enrollment = runtime.enrollment
-    private val preferences = app.getSharedPreferences("meshthing", 0)
+    private val preferences = app.getSharedPreferences("meshmellow", 0)
     var endpoint by mutableStateOf(preferences.getString("dashboard", "")!!); private set
     var deviceName by mutableStateOf(preferences.getString("deviceName", "My device")!!); private set
     var budgetMiB by mutableStateOf(preferences.getInt("budget", 1024)); private set

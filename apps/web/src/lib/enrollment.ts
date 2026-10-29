@@ -36,4 +36,4 @@ export interface EnrollmentState {
   pending: { id: string; applicant: string; name: string; issuer: string; expires: number }[];
   notice: string;
 }
-export const isInvitation = (text: string) => text.length <= 4096 && text.trim().startsWith('layercake://join/');
+export const isInvitation = (text: string) => text.length <= 4096 && text.trim().startsWith('meshmellow://join/');

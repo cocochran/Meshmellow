@@ -23,7 +23,7 @@ struct CakeInvitationQR: View {
             if let qr {
                 Image(uiImage: qr).interpolation(.none).resizable().scaledToFit()
                     .padding(18).background(.white)
-                    .accessibilityLabel("Invitation QR code. Scan with Layercake on another device.")
+                    .accessibilityLabel("Invitation QR code. Scan with Meshmellow on another device.")
                     .accessibilityIdentifier("invitation-qr")
             } else { Text("Use Copy invitation below.").foregroundStyle(.black).padding().background(.white) }
             Rectangle().fill(Color(red: 0.74, green: 0.50, blue: 0.34)).frame(height: 18)
@@ -92,7 +92,7 @@ private struct NativeInvitationScanner: UIViewControllerRepresentable {
             guard !delivered else { return }
             for item in items {
                 if case .barcode(let barcode) = item, let text = barcode.payloadStringValue {
-                    guard text.utf8.count <= 4096 && text.hasPrefix("layercake://join/") else { onError("That QR is not a Layercake invitation."); continue }
+                    guard text.utf8.count <= 4096 && text.hasPrefix("meshmellow://join/") else { onError("That QR is not a Meshmellow invitation."); continue }
                     delivered = true; scanner.stopScanning(); onScan(text); return
                 }
             }

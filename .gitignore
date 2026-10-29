@@ -1,7 +1,7 @@
 # Rust build output (OS-specific; never commit)
 /target
 
-# Iroh node identities (secret keys created by `llm-cluster --key`, default meshthing.key)
+# Iroh node identities (secret keys created by `llm-cluster --key`, default meshmellow.key)
 *.key
 
 # Agent run state (plan, coordination log, change log, outbox)

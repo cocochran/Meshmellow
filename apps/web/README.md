@@ -1,4 +1,4 @@
-# Layercake web UI
+# Meshmellow web UI
 
 The Rust runtime owns membership, heartbeats, the queued OpenAI-compatible API,
 and this SvelteKit + Tailwind dashboard in one process. Node/npm are build tools;
@@ -16,7 +16,7 @@ cargo build --bin llm-cluster
 The runtime opens `http://127.0.0.1:3210`. Use `--no-open` to skip opening the
 browser, `--port 0` for a free port, and `--state-dir PATH` for an isolated mesh.
 Ctrl+C stops the runtime and its UI. A fresh profile shows Create / Join.
-`mesh-ui` execs `llm-cluster ui`; the packaged `meshthing` executable calls the
+`mesh-ui` execs `llm-cluster ui`; the packaged `meshmellow` executable calls the
 same Rust library directly.
 
 ## API and inference status
@@ -45,12 +45,12 @@ directly; membership, connection status and inference readiness are distinct.
 ## Membership and QR
 
 Core-owned create, signed full invitations, camera scanning, trusted approval,
-and Leave mesh work over Iroh without a Layercake lookup server. QR decorations
+and Leave mesh work over Iroh without a Meshmellow lookup server. QR decorations
 stay outside the actual code and quiet zone. Scanning fills the invitation for
 review; the user requests to join and a trusted member approves.
 
 Membership, private identity and preferences live under
-`~/.local/state/layercake/mesh` (`--state-dir` or `LAYERCAKE_MESH_STATE_DIR`).
+`~/.local/state/meshmellow/mesh` (`--state-dir` or `MESHMELLOW_MESH_STATE_DIR`).
 Leaving disconnects this node and clears its saved membership, retaining device
 identity. Other nodes retain their signed trust history. Rejoining needs a new
 invitation and approval. Use one runtime per state directory.
@@ -76,4 +76,4 @@ and `/v1` to a runtime on port 3210. For the complete app, use `./mesh-ui`.
 
 The static build follows [SvelteKit's static adapter](https://svelte.dev/docs/kit/adapter-static).
 The [Cake JE4 render](https://minecraft.wiki/images/Cake_JE4.png?7c59e) was supplied
-for Layercake branding.
+for Meshmellow branding.

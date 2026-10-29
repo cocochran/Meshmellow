@@ -33,7 +33,7 @@ pub const EXPORT_FORMAT_VERSION: u32 = 1;
 pub const SNAPSHOT_EVERY: Seq = 100;
 
 /// Data directory used by the CLI when `--data-dir` is not given.
-pub const DEFAULT_DATA_DIR: &str = "meshthing-data";
+pub const DEFAULT_DATA_DIR: &str = "meshmellow-data";
 
 const META_FILE: &str = "meta.json";
 const SNAPSHOT_FILE: &str = "snapshot.json";

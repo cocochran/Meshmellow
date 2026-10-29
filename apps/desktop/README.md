@@ -1,4 +1,4 @@
-# Layercake desktop executables
+# Meshmellow desktop executables
 
 The Windows, Linux and macOS executable runs the Rust mesh runtime and serves
 its browser dashboard in the same process. Ctrl+C stops both. The core library
@@ -16,13 +16,13 @@ python3 apps/desktop/scripts/package-executable.py \
 python3 apps/desktop/scripts/smoke-packaged-ui.py --target aarch64-apple-darwin
 ```
 
-Use the target matching your host. Packaging includes the `meshthing` launcher,
+Use the target matching your host. Packaging includes the `meshmellow` launcher,
 `llm-cluster` core CLI, static web output, licenses and checksums. Extract
-the full archive before running `meshthing`; its `web/` folder
+the full archive before running `meshmellow`; its `web/` folder
 must remain beside the executable. Use `--no-open` to print the URL without
 opening a browser.
 
-The root Cargo manifest explicitly maps the `meshthing` target to this folder,
+The root Cargo manifest explicitly maps the `meshmellow` target to this folder,
 preserving existing build commands. The four-platform workflow remains in
 `.github/workflows/build-executables.yml`; packaging and extracted-archive smoke
 tests are in `scripts/` here. See [downloads](../../docs/downloads.md) for artifacts

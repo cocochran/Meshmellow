@@ -1,4 +1,4 @@
-package org.meshthing.mobile
+package org.meshmellow.mobile
 
 import android.app.Application
 import androidx.compose.runtime.getValue
@@ -8,7 +8,7 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.collectLatest
 
-open class LayercakeApplication : Application() {
+open class MeshmellowApplication : Application() {
     open val meshRuntime by lazy { MeshRuntime(this) }
 }
 

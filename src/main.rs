@@ -1,4 +1,4 @@
-//! MeshThing command-line entry point: plan, run a worker or the leader, send prompts, or debug
+//! Meshmellow command-line entry point: plan, run a worker or the leader, send prompts, or debug
 //! the mesh with the lower-level node and bridge commands.
 
 use std::net::SocketAddr;
@@ -67,20 +67,20 @@ const SECONDS_PER_MINUTE: u64 = 60;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "meshthing",
+    name = "meshmellow",
     about = "Peer-to-peer mesh for splitting one LLM across devices"
 )]
 struct Cli {
-    /// Enable detailed MeshThing diagnostics on stderr (also works with RUST_LOG).
+    /// Enable detailed Meshmellow diagnostics on stderr (also works with RUST_LOG).
     #[arg(long, global = true)]
     debug: bool,
 
     /// File holding this node's secret key; created on first run.
-    #[arg(long, global = true, default_value = "meshthing.key")]
+    #[arg(long, global = true, default_value = "meshmellow.key")]
     key: PathBuf,
 
     /// Cluster ID announced in hellos; peers from other clusters are rejected.
-    #[arg(long, global = true, default_value = "meshthing")]
+    #[arg(long, global = true, default_value = "meshmellow")]
     cluster: String,
 
     #[command(subcommand)]
@@ -213,7 +213,7 @@ enum Command {
         #[command(flatten)]
         profiles: WorkerProfileArgs,
     },
-    /// EXPERIMENTAL: serve one layer range as a `meshthing/shard-ring/1` worker that forwards
+    /// EXPERIMENTAL: serve one layer range as a `meshmellow/shard-ring/1` worker that forwards
     /// activations straight to the next worker. Without `--next` this worker is the terminal
     /// and returns tokens directly to the origin.
     ShardRingWorker {

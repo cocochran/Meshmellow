@@ -3,16 +3,16 @@
 <plist version="1.0"><dict>
   <key>CFBundleExecutable</key><string>$(EXECUTABLE_NAME)</string>
   <key>CFBundleIdentifier</key><string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
-  <key>CFBundleName</key><string>Layercake</string>
-  <key>CFBundleDisplayName</key><string>Layercake</string>
+  <key>CFBundleName</key><string>Meshmellow</string>
+  <key>CFBundleDisplayName</key><string>Meshmellow</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
   <key>CFBundleVersion</key><string>1</string>
   <key>UILaunchScreen</key><dict/>
   <key>LSRequiresIPhoneOS</key><true/>
   <key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string><string>UIInterfaceOrientationPortraitUpsideDown</string><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
-  <key>NSCameraUsageDescription</key><string>Scan a Layercake cake QR to join a mesh. Camera images stay on this device.</string>
-  <key>NSLocalNetworkUsageDescription</key><string>Connect directly to Layercake peers when they are on your network. Internet pairing also works through Iroh.</string>
+  <key>NSCameraUsageDescription</key><string>Scan a Meshmellow QR to join a mesh. Camera images stay on this device.</string>
+  <key>NSLocalNetworkUsageDescription</key><string>Connect directly to Meshmellow peers when they are on your network. Internet pairing also works through Iroh.</string>
   <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
   <key>UISupportsDocumentBrowser</key><false/>
   <key>LSSupportsOpeningDocumentsInPlace</key><true/>

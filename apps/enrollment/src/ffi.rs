@@ -93,7 +93,7 @@ mod android {
     static CONTEXT: OnceLock<GlobalRef> = OnceLock::new();
 
     #[unsafe(no_mangle)]
-    pub extern "system" fn Java_org_meshthing_mobile_EnrollmentNative_initialize(
+    pub extern "system" fn Java_org_meshmellow_mobile_EnrollmentNative_initialize(
         env: JNIEnv,
         _class: JClass,
         context: JObject,
@@ -117,7 +117,7 @@ mod android {
     }
 
     #[unsafe(no_mangle)]
-    pub extern "system" fn Java_org_meshthing_mobile_EnrollmentNative_command(
+    pub extern "system" fn Java_org_meshmellow_mobile_EnrollmentNative_command(
         mut env: JNIEnv,
         _class: JClass,
         input: JString,

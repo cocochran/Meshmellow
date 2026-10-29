@@ -11,7 +11,7 @@
   });
 </script>
 <div class="cake-qr">
-  <div class="cake-top" aria-hidden="true"><span></span><span></span><img src="/layercake-logo.png" alt="" width="48" height="48"/><span></span><span></span></div>
+  <div class="cake-top" aria-hidden="true"><span></span><span></span><img src="/meshmellow-logo.png" alt="" width="48" height="48"/><span></span><span></span></div>
   <svg viewBox={`0 0 ${qr.modules.size + 8} ${qr.modules.size + 8}`} role="img" aria-label="Scan this invitation to join the mesh" shape-rendering="crispEdges"><rect width="100%" height="100%" fill="white"/><path d={path} fill="#35221d"/></svg>
   <div class="cake-layers" aria-hidden="true"></div>
   <p>A slice of your mesh.</p>

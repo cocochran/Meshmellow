@@ -36,7 +36,7 @@ struct RootView: View {
         VStack(alignment: .leading, spacing: 36) {
             HStack(spacing: 9) {
                 Image("BrandCake").resizable().interpolation(.none).scaledToFit().frame(width: 38, height: 38).accessibilityHidden(true)
-                Text("layercake").font(.custom("Georgia-Bold", size: 20))
+                Text("meshmellow").font(.custom("Georgia-Bold", size: 20))
             }.padding(.top, 24).accessibilityElement(children: .combine)
             VStack(alignment: .leading, spacing: 6) {
                 Eyebrow(text: "Workspace").padding(.leading, 12).padding(.bottom, 9)

@@ -37,8 +37,8 @@ use tracing::{debug, info, warn};
 
 use crate::runtime::admission::AdmittedChild as Child;
 
-use crate::net::protocol::RPC_BRIDGE_ALPN;
-use crate::net::rpc_bridge::path_kind;
+use crate::network::protocol::RPC_BRIDGE_ALPN;
+use crate::network::rpc_bridge::path_kind;
 use crate::shard::manifest::same_sha256;
 use crate::shard::ring_origin::{RingLink, check_origin_stage};
 use crate::shard::wire::{self, MAX_BATCH_TOKENS, StageInput, StageMetadata, StepReply};

@@ -159,14 +159,14 @@ pub async fn run(options: Options) -> Result<()> {
     }
     let directory = options
         .state_dir
-        .or_else(|| std::env::var_os("LAYERCAKE_MESH_STATE_DIR").map(PathBuf::from))
+        .or_else(|| std::env::var_os("MESHMELLOW_MESH_STATE_DIR").map(PathBuf::from))
         .unwrap_or_else(|| {
             PathBuf::from(
                 std::env::var_os("HOME")
                     .or_else(|| std::env::var_os("USERPROFILE"))
                     .unwrap_or_else(|| ".".into()),
             )
-            .join(".local/state/layercake/mesh")
+            .join(".local/state/meshmellow/mesh")
         });
     let assets = options.assets.unwrap_or_else(|| {
         let bundled = std::env::current_exe()
@@ -258,7 +258,7 @@ pub async fn run(options: Options) -> Result<()> {
         })
     };
     println!(
-        "Layercake: {}\nOpenAI API: {}/v1 (on this device)\nPress Ctrl+C to stop this runtime and its UI.",
+        "Meshmellow: {}\nOpenAI API: {}/v1 (on this device)\nPress Ctrl+C to stop this runtime and its UI.",
         app.origin, app.origin
     );
     if !options.no_open {

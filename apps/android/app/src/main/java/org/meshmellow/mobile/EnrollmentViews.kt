@@ -1,4 +1,4 @@
-package org.meshthing.mobile
+package org.meshmellow.mobile
 
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -142,7 +142,7 @@ import java.util.Date
                         }
                         context.startActivity(Intent.createChooser(send, "Share invitation"))
                     }) { Text("Share invitation") }
-                    OutlinedButton(onClick = { (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("Layercake invitation", state.ticket)) }) { Text("Copy invitation") }
+                    OutlinedButton(onClick = { (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("Meshmellow invitation", state.ticket)) }) { Text("Copy invitation") }
                 }
                 Button(onClick = { scope.launch { enrollment.perform("invite") } }, enabled = !enrollment.busy && state.pending.isEmpty()) { Text(if (state.ticket.isEmpty()) "Create invitation" else "Replace invitation") }
                 Text("Invitations expire after ten minutes. A trusted member must approve each new device.", style = MaterialTheme.typography.bodySmall)

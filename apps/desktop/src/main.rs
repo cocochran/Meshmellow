@@ -1,7 +1,7 @@
 //! The packaged executable runs the core and its dashboard in one process.
 use clap::Parser;
 #[derive(Parser)]
-#[command(about = "Run the Layercake mesh, OpenAI API, and browser dashboard")]
+#[command(about = "Run the Meshmellow mesh, OpenAI API, and browser dashboard")]
 struct Cli {
     #[command(flatten)]
     options: llm_cluster::service::ui::Options,

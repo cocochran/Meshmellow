@@ -1,4 +1,4 @@
-package org.meshthing.mobile
+package org.meshmellow.mobile
 
 import android.app.*
 import android.content.Intent
@@ -13,7 +13,7 @@ import kotlinx.coroutines.*
 /** User-started peer connectivity, never a camera or an automatically restarted worker. */
 class MeshBackgroundService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private val runtime get() = (application as LayercakeApplication).meshRuntime
+    private val runtime get() = (application as MeshmellowApplication).meshRuntime
     private var awake: PowerManager.WakeLock? = null
     private var monitor: Job? = null
 
@@ -23,13 +23,13 @@ class MeshBackgroundService : Service() {
         try {
             val notifications = getSystemService(NotificationManager::class.java)
             notifications.createNotificationChannel(NotificationChannel(CHANNEL, "Active mesh", NotificationManager.IMPORTANCE_LOW).apply {
-                description = "Keeps your peer connected when Layercake is in the background."
+                description = "Keeps your peer connected when Meshmellow is in the background."
             })
             val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
             val stop = PendingIntent.getService(this, 1, Intent(this, MeshBackgroundService::class.java).setAction(STOP), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
             val notification = NotificationCompat.Builder(this, CHANNEL)
-                .setSmallIcon(R.drawable.ic_mesh).setContentTitle("Layercake mesh is active")
-                .setContentText("Keeping your peer connected. Tap to open Layercake.")
+                .setSmallIcon(R.drawable.ic_mesh).setContentTitle("Meshmellow mesh is active")
+                .setContentText("Keeping your peer connected. Tap to open Meshmellow.")
                 .setContentIntent(open).setOngoing(true).setOnlyAlertOnce(true)
                 .setCategory(NotificationCompat.CATEGORY_SERVICE)
                 .addAction(0, "Stop background usage", stop).build()
@@ -38,7 +38,7 @@ class MeshBackgroundService : Service() {
             if (runtime.enrollment.state?.meshName == null) { stopSelf(); return START_NOT_STICKY }
             runtime.background(true)
             if (monitor == null) {
-                awake = getSystemService(PowerManager::class.java).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Layercake:MeshConnection").apply { setReferenceCounted(false) }
+                awake = getSystemService(PowerManager::class.java).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Meshmellow:MeshConnection").apply { setReferenceCounted(false) }
                 monitor = scope.launch {
                     var nextRenewal = 0L
                     while (isActive) {
@@ -70,7 +70,7 @@ class MeshBackgroundService : Service() {
     }
     override fun onTimeout(startId: Int, fgsType: Int) { stopSelf() }
     companion object {
-        const val STOP = "org.meshthing.mobile.STOP_BACKGROUND"
+        const val STOP = "org.meshmellow.mobile.STOP_BACKGROUND"
         private const val CHANNEL = "mesh-background"
     }
 }

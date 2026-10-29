@@ -1,11 +1,11 @@
-package org.meshthing.mobile
+package org.meshmellow.mobile
 import org.junit.Assert.*
 import org.junit.Test
 
 class ContractsTest {
     @Test fun parsesFullInvitationWithoutLegacyFields() {
-        val state = EnrollmentState.parse(org.json.JSONObject("""{"id":"device","port":0,"mesh":{"id":"mesh","name":"Our mesh"},"members":[],"pending":[],"invite":{"id":"invite","expires":123,"ticket":"layercake://join/test"},"joining":null,"notice":""}"""))
-        assertEquals("layercake://join/test", state.ticket)
+        val state = EnrollmentState.parse(org.json.JSONObject("""{"id":"device","port":0,"mesh":{"id":"mesh","name":"Our mesh"},"members":[],"pending":[],"invite":{"id":"invite","expires":123,"ticket":"meshmellow://join/test"},"joining":null,"notice":""}"""))
+        assertEquals("meshmellow://join/test", state.ticket)
     }
     @Test fun validatesDashboardOrigins() {
         assertEquals("/api/mesh", Validation.dashboardURL("http://127.0.0.1:3210").path)

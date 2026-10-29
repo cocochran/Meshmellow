@@ -1100,7 +1100,7 @@ mod tests {
         let launch = fixture_launch();
         let config = EvidenceConfig {
             path: std::env::temp_dir()
-                .join(format!("meshthing-no-evidence-{}", uuid::Uuid::new_v4())),
+                .join(format!("meshmellow-no-evidence-{}", uuid::Uuid::new_v4())),
             wait: Duration::ZERO,
         };
 

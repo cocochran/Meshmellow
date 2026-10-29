@@ -64,7 +64,7 @@ pub struct MemberStatus {
 impl MemberStatus {
     fn payload(&self) -> impl Serialize + '_ {
         (
-            "meshthing/member-status/1",
+            "meshmellow/member-status/1",
             &self.mesh,
             &self.member,
             self.revision,
@@ -94,7 +94,7 @@ fn verify(signer: &str, signature: &str, message: impl Serialize) -> Result<()> 
 impl Genesis {
     fn payload(&self) -> impl Serialize + '_ {
         (
-            "meshthing/genesis/1",
+            "meshmellow/genesis/1",
             self.version,
             &self.root,
             &self.name,
@@ -110,7 +110,7 @@ impl Genesis {
 impl Grant {
     fn payload(&self) -> impl Serialize + '_ {
         (
-            "meshthing/grant/1",
+            "meshmellow/grant/1",
             &self.mesh,
             &self.issuer,
             &self.member,

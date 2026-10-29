@@ -1,6 +1,6 @@
 import SwiftUI
 
-@main struct MeshThingApp: App {
+@main struct MeshmellowApp: App {
     @StateObject private var store = MeshStore()
     @StateObject private var enrollment = EnrollmentStore()
     @Environment(\.scenePhase) private var phase

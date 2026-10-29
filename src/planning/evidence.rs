@@ -150,7 +150,7 @@ mod tests {
     }
 
     fn temp_config() -> EvidenceConfig {
-        let name = format!("meshthing-evidence-{}.json", uuid::Uuid::new_v4());
+        let name = format!("meshmellow-evidence-{}.json", uuid::Uuid::new_v4());
         EvidenceConfig {
             path: std::env::temp_dir().join(name),
             wait: SHORT_WAIT,

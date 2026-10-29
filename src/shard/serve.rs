@@ -33,13 +33,13 @@ use tracing::{debug, error, info, warn};
 
 use crate::runtime::admission::AdmittedChild as Child;
 
-use crate::net::protocol::RPC_BRIDGE_ALPN;
-use crate::net::rpc_bridge::{PEER_NOT_APPROVED, PEER_NOT_APPROVED_REASON, PeerAllowlist};
+use crate::network::protocol::RPC_BRIDGE_ALPN;
+use crate::network::rpc_bridge::{PEER_NOT_APPROVED, PEER_NOT_APPROVED_REASON, PeerAllowlist};
 use crate::shard::wire::{self, MAX_CONTEXT, StageMetadata};
 
 /// Prompt passed to every runner. A relayed stage receives token IDs or hidden rows from the
 /// leader, so the runner's own tokenization of its prompt argument is never used.
-pub const PLACEHOLDER_PROMPT: &str = "MeshThing";
+pub const PLACEHOLDER_PROMPT: &str = "Meshmellow";
 
 /// `RETURN_LOGITS` argument: the protocol's final stage returns the greedy token, not logits.
 const RETURN_LOGITS_OFF: &str = "0";

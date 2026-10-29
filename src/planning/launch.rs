@@ -172,7 +172,7 @@ mod tests {
 
     #[test]
     fn unreadable_and_invalid_files_are_named() {
-        let dir = std::env::temp_dir().join(format!("meshthing-launch-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("meshmellow-launch-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let missing = dir.join("missing.json");
         let garbage = dir.join("garbage.json");

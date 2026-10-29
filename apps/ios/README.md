@@ -1,4 +1,4 @@
-# Layercake for iPhone and iPad
+# Meshmellow for iPhone and iPad
 
 ## Build the enrollment core first
 
@@ -20,7 +20,7 @@ Mesh, with runtime observations on Model. Light and dark palettes share semantic
 colors, and invitations have copy and share actions.
 
 Requires Xcode, CMake 3.28+ and
-the iOS SDK. No model or private key is bundled. Full signed invitations work without a lookup service. No Layercake server needs to be hosted.
+the iOS SDK. No model or private key is bundled. Full signed invitations work without a lookup service. No Meshmellow server needs to be hosted.
 See [core membership](../../docs/mesh-membership.md).
 
 From this directory, generate the Xcode project and build for Simulator:
@@ -29,18 +29,18 @@ From this directory, generate the Xcode project and build for Simulator:
 cmake -S . -B build/simulator -G Xcode \
   -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphonesimulator \
   -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0
-xcodebuild -project build/simulator/MeshThing.xcodeproj -scheme MeshThing \
+xcodebuild -project build/simulator/Meshmellow.xcodeproj -scheme Meshmellow \
   -sdk iphonesimulator -configuration Debug CODE_SIGNING_ALLOWED=NO build
 swift test
 ```
 
-The app is `build/simulator/Debug-iphonesimulator/MeshThing.app`. Open the generated
+The app is `build/simulator/Debug-iphonesimulator/Meshmellow.app`. Open the generated
 project in Xcode to choose an iPhone or iPad simulator. To run from the terminal
 after booting a simulator:
 
 ```sh
-xcrun simctl install booted build/simulator/Debug-iphonesimulator/MeshThing.app
-xcrun simctl launch booted org.meshthing.mobile
+xcrun simctl install booted build/simulator/Debug-iphonesimulator/Meshmellow.app
+xcrun simctl launch booted org.meshmellow.mobile
 ```
 
 For live development, start the web UI on the Mac and save
@@ -77,21 +77,21 @@ cmake -S apps/ios -B apps/ios/build/ipad-signed -G Xcode \
   -DMESH_APP_TEAM=BYXSG896MK
 
 # 4. Build/sign the SwiftUI app, linking the Rust library.
-xcodebuild -project apps/ios/build/ipad-signed/MeshThing.xcodeproj \
-  -scheme MeshThing -configuration Debug \
+xcodebuild -project apps/ios/build/ipad-signed/Meshmellow.xcodeproj \
+  -scheme Meshmellow -configuration Debug \
   -destination 'generic/platform=iOS' \
   -allowProvisioningUpdates build
 
 # 5. Update the existing app on PearPad.
 xcrun devicectl device install app \
   --device 00008132-001438EC0E39001C \
-  apps/ios/build/ipad-signed/Debug-iphoneos/MeshThing.app \
+  apps/ios/build/ipad-signed/Debug-iphoneos/Meshmellow.app \
   --timeout 60
 
 # 6. Unlock the iPad, then launch the installed bundle.
 xcrun devicectl device process launch \
   --device 00008132-001438EC0E39001C \
-  --terminate-existing org.meshthing.mobile \
+  --terminate-existing org.meshmellow.mobile \
   --timeout 30
 ```
 
@@ -100,17 +100,17 @@ Apple account or device, select its signing team and UDID instead.
 
 Common failures:
 
-- **Missing `libmeshthing_enrollment.a`:** run step 2 first. Expected path is
-  `apps/enrollment/target/aarch64-apple-ios/debug/libmeshthing_enrollment.a`.
+- **Missing `libmeshmellow_enrollment.a`:** run step 2 first. Expected path is
+  `apps/enrollment/target/aarch64-apple-ios/debug/libmeshmellow_enrollment.a`.
   An inherited `CARGO_TARGET_DIR` can redirect Cargo output; use the default
   location or set `-DMESH_ENROLLMENT_LIB=/absolute/path/to/the/library.a` in CMake.
 - **Wrong platform/architecture:** `ios` / `aarch64-apple-ios` / `iphoneos`
   must agree. The device bundle is under `Debug-iphoneos`; simulator builds
   cannot be installed on this physical iPad.
 - **Signing/profile error:** open Xcode → Settings → Accounts and verify the
-  account/team, then open `apps/ios/build/ipad-signed/MeshThing.xcodeproj` and
+  account/team, then open `apps/ios/build/ipad-signed/Meshmellow.xcodeproj` and
   inspect Signing & Capabilities. Keep automatic signing and the existing
-  `org.meshthing.mobile` bundle ID. Do not use `CODE_SIGNING_ALLOWED=NO` for a
+  `org.meshmellow.mobile` bundle ID. Do not use `CODE_SIGNING_ALLOWED=NO` for a
   device build.
 - **Install succeeds, launch fails because locked:** unlock PearPad and repeat
   step 6. Rebuilding or deleting the app is unnecessary.
@@ -121,9 +121,9 @@ Common failures:
   existing project and its signing settings instead of deleting unrelated files.
 
 For a launch diagnostic, add `--console` to step 6. Add
-`--json-output /tmp/layercake-ipad-launch.json` for a structured error report.
-The installed app is branded Layercake; the build target is still `MeshThing`
-and its bundle identifier is `org.meshthing.mobile`.
+`--json-output /tmp/meshmellow-ipad-launch.json` for a structured error report.
+The installed app is branded Meshmellow; the build target is still `Meshmellow`
+and its bundle identifier is `org.meshmellow.mobile`.
 
 See [mobile capabilities and core integration](../README.md) for the precise
 scope. The app now runs an Iroh enrollment peer while in the foreground.

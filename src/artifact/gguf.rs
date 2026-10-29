@@ -97,14 +97,14 @@ pub(super) fn check_export(path: &Path, m: &Manifest, report: &ExportReport) -> 
             field_names.insert(key.clone()),
             "duplicate GGUF metadata key"
         );
-        if ["general.architecture", "meshthing.source_sha256"].contains(&key.as_str()) {
+        if ["general.architecture", "meshmellow.source_sha256"].contains(&key.as_str()) {
             ensure!(kind == 8, "incorrect GGUF string metadata type");
             strings.insert(key, h.string()?);
         } else if [
             architecture_key.as_str(),
             mtp_key.as_str(),
-            "meshthing.shard_begin",
-            "meshthing.shard_end",
+            "meshmellow.shard_begin",
+            "meshmellow.shard_end",
         ]
         .contains(&key.as_str())
         {
@@ -120,12 +120,12 @@ pub(super) fn check_export(path: &Path, m: &Manifest, report: &ExportReport) -> 
     }
     ensure!(
         strings.get("general.architecture") == Some(&m.model.architecture)
-            && strings.get("meshthing.source_sha256") == Some(&m.model.source_sha256),
+            && strings.get("meshmellow.source_sha256") == Some(&m.model.source_sha256),
         "GGUF source/architecture mismatch"
     );
     ensure!(
-        numbers.get("meshthing.shard_begin") == Some(&(m.begin as u64))
-            && numbers.get("meshthing.shard_end") == Some(&(m.end as u64)),
+        numbers.get("meshmellow.shard_begin") == Some(&(m.begin as u64))
+            && numbers.get("meshmellow.shard_end") == Some(&(m.end as u64)),
         "GGUF embedded range mismatch"
     );
     let blocks = *numbers

@@ -22,7 +22,7 @@ with tempfile.TemporaryDirectory(prefix="mesh-ui-peer-") as directory:
         while time.monotonic() < deadline:
             clipboard = subprocess.run(["xcrun", "simctl", "pbpaste", sys.argv[1]], capture_output=True, text=True)
             ticket = clipboard.stdout.strip()
-            if ticket.startswith("layercake://join/"):
+            if ticket.startswith("meshmellow://join/"):
                 command("join", invitation=ticket, device_name="Validation peer")
                 print("Join submitted from a shared invitation through the core + Iroh", flush=True)
                 break

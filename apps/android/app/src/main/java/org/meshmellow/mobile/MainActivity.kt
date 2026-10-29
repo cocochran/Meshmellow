@@ -1,4 +1,4 @@
-package org.meshthing.mobile
+package org.meshmellow.mobile
 
 import android.app.ActivityManager
 import android.os.Build
@@ -43,7 +43,7 @@ private val Moss: Color @Composable get() = MaterialTheme.colorScheme.primary
 private val Sage: Color @Composable get() = MaterialTheme.colorScheme.secondaryContainer
 private val Canvas: Color @Composable get() = MaterialTheme.colorScheme.background
 
-@Composable private fun LayercakeTheme(content: @Composable () -> Unit) {
+@Composable private fun MeshmellowTheme(content: @Composable () -> Unit) {
     val colors = if (isSystemInDarkTheme()) darkColorScheme(
         primary = Color(0xFFEDB7A7), onPrimary = Color(0xFF35201C),
         secondaryContainer = Color(0xFF3B2C28), onSecondaryContainer = Color(0xFFFFF3E7),
@@ -73,7 +73,7 @@ private val Canvas: Color @Composable get() = MaterialTheme.colorScheme.backgrou
 private fun bytes(value: Double?) = value?.let { "%.1f GiB".format(it / 1_073_741_824) } ?: "Not reported"
 
 class MainActivity : ComponentActivity() {
-    private val runtime get() = (application as LayercakeApplication).meshRuntime
+    private val runtime get() = (application as MeshmellowApplication).meshRuntime
     override fun onStart() { super.onStart(); runtime.visible(this, true) }
     override fun onStop() { runtime.visible(this, false); super.onStop() }
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -82,7 +82,7 @@ class MainActivity : ComponentActivity() {
             window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         }
         val store = ViewModelProvider(this)[MeshStore::class.java]
-        setContent { LayercakeTheme { MeshApp(store) } }
+        setContent { MeshmellowTheme { MeshApp(store) } }
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 while (isActive) { store.refresh(); delay(3000) }
@@ -100,7 +100,7 @@ class MainActivity : ComponentActivity() {
     val titles = listOf("Mesh", "This device", "Model", "Settings")
     val icons = listOf(Icons.Default.Home, Icons.Default.Person, Icons.Default.Star, Icons.Default.Settings)
     Scaffold(
-        topBar = { TopAppBar(title = { Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) { if (tab == 0) Image(painterResource(R.drawable.layercake), contentDescription = null, modifier = Modifier.size(38.dp)); Text(if (tab == 0) "layercake" else titles[tab], fontFamily = FontFamily.Serif, fontWeight = FontWeight.Bold) } }) },
+        topBar = { TopAppBar(title = { Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) { if (tab == 0) Image(painterResource(R.drawable.meshmellow), contentDescription = null, modifier = Modifier.size(38.dp)); Text(if (tab == 0) "meshmellow" else titles[tab], fontFamily = FontFamily.Serif, fontWeight = FontWeight.Bold) } }) },
         bottomBar = { NavigationBar(containerColor = Canvas) { titles.forEachIndexed { index, title -> NavigationBarItem(selected = tab == index, onClick = { tab = index }, icon = { Icon(icons[index], contentDescription = null) }, label = { Text(title) }) } } }
     ) { padding ->
         Column(Modifier.padding(padding).fillMaxSize().background(Canvas).verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {

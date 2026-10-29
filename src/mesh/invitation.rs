@@ -20,7 +20,7 @@ pub struct Invitation {
 impl Invitation {
     fn payload(&self) -> Vec<u8> {
         serde_json::to_vec(&(
-            "layercake/invitation/1",
+            "meshmellow/invitation/1",
             &self.issuer,
             &self.invite,
             self.expires,
@@ -59,7 +59,7 @@ impl Invitation {
     /// Self-contained signed bootstrap; no directory lookup is needed.
     pub fn ticket(&self) -> String {
         format!(
-            "layercake://join/{}",
+            "meshmellow://join/{}",
             URL_SAFE_NO_PAD.encode(serde_json::to_vec(self).unwrap())
         )
     }
@@ -68,8 +68,8 @@ impl Invitation {
         ensure!(ticket.len() <= MAX_MESSAGE, "Invitation is too large.");
         let encoded = ticket
             .trim()
-            .strip_prefix("layercake://join/")
-            .context("Invalid Layercake invitation.")?;
+            .strip_prefix("meshmellow://join/")
+            .context("Invalid Meshmellow invitation.")?;
         let locator: Self = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?;
         locator.validate()?;
         Ok(locator)

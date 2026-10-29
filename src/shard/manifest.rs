@@ -4,7 +4,7 @@
 //!
 //! ```json
 //! {
-//!   "runner": "/opt/meshthing/shard_runner",
+//!   "runner": "/opt/meshmellow/shard_runner",
 //!   "model_sha256": "<64 hex digits: the original model's SHA-256>",
 //!   "layers": 64,
 //!   "context": 4096,
@@ -29,7 +29,7 @@
 //!
 //! - `"execution": "pipeline"` (the default, M-25 v1): a single local whole-model stage, or one
 //!   remote prefix followed by a local final stage.
-//! - `"execution": "ring"` (EXPERIMENTAL, `meshthing/shard-ring/1`): a local stage `0..k` that
+//! - `"execution": "ring"` (EXPERIMENTAL, `meshmellow/shard-ring/1`): a local stage `0..k` that
 //!   tokenizes, then one or more remote ring workers covering `k..layers` in order. The last
 //!   remote stage is the terminal, which returns tokens straight to the leader.
 
@@ -100,7 +100,7 @@ pub enum Execution {
     /// M-25 v1: the leader exchanges hidden rows with every stage in turn.
     #[default]
     Pipeline,
-    /// EXPERIMENTAL `meshthing/shard-ring/1`: the leader runs stage 0 and sends its rows to the
+    /// EXPERIMENTAL `meshmellow/shard-ring/1`: the leader runs stage 0 and sends its rows to the
     /// first ring worker; workers forward activations peer to peer and the terminal returns
     /// tokens straight to the leader. Pending david-codex's production sign-off.
     Ring,

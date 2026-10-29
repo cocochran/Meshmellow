@@ -1,4 +1,4 @@
-//! The origin (leader) side of `meshthing/shard-ring/1`. EXPERIMENTAL, pending david-codex's
+//! The origin (leader) side of `meshmellow/shard-ring/1`. EXPERIMENTAL, pending david-codex's
 //! production sign-off.
 //!
 //! In a ring manifest the leader runs stage 0 itself and every later stage is a
@@ -36,7 +36,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{timeout, timeout_at};
 use tracing::{debug, info, warn};
 
-use crate::net::rpc_bridge::{PEER_NOT_APPROVED, PEER_NOT_APPROVED_REASON, path_kind};
+use crate::network::rpc_bridge::{PEER_NOT_APPROVED, PEER_NOT_APPROVED_REASON, path_kind};
 use crate::shard::manifest::{ShardManifest, StageLocation, same_sha256};
 use crate::shard::ring::{
     ExecuteFrame, NATIVE_STEP_TIMEOUT, RingMessage, RingResult, RingStageInfo,

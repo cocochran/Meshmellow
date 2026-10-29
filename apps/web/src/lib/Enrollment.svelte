@@ -58,10 +58,10 @@
   }
 </script>
 {#if !loaded}
-  <section class="panel welcome"><h2>Opening Layercake…</h2><p>Checking saved membership on this computer.</p></section>
+  <section class="panel welcome"><h2>Opening Meshmellow…</h2><p>Checking saved membership on this computer.</p></section>
 {:else if !meshState?.mesh && !meshState?.joining}
   <section class="panel welcome">
-    <img src="/layercake-logo.png" alt="Minecraft cake" width="80" height="80"/>
+    <img src="/meshmellow-logo.png" alt="Minecraft cake" width="80" height="80"/>
     <span class="eyebrow">A FRESH SLICE</span><h2>Your mesh starts here.</h2>
     <p>Create a home for your devices, or join someone’s mesh with an invitation.</p>
     <div class="setup-tabs"><button class="button" class:primary={mode === 'create'} onclick={() => { mode = 'create'; scanning = false; }}>Create a mesh</button><button class="button" class:primary={mode === 'join'} onclick={() => mode = 'join'}>Join a mesh</button></div>
@@ -72,7 +72,7 @@
       {:else}
         <button type="button" class="button secondary" onclick={() => scanning = true}>Scan cake QR</button>
         {#if scanning}<QRScanner onscan={text => { invitation = text; note = 'Invitation scanned. Request to join when you’re ready.'; }} onclose={() => scanning = false}/>{/if}
-        <label for="join-invitation">Or paste an invitation</label><textarea id="join-invitation" bind:value={invitation} maxlength="4096" rows="3" required placeholder="layercake://join/…"></textarea>
+        <label for="join-invitation">Or paste an invitation</label><textarea id="join-invitation" bind:value={invitation} maxlength="4096" rows="3" required placeholder="meshmellow://join/…"></textarea>
       {/if}
       <button class="button primary" disabled={busy || !meshState}>{busy ? 'Working…' : mode === 'create' ? 'Create mesh' : 'Request to join'}</button>
     </form>

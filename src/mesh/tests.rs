@@ -335,9 +335,9 @@ async fn core_ticket_join_establishes_trusted_heartbeats_without_lookup() {
         let locator = invitation::Invitation::from_ticket(ticket).unwrap();
         // Knowing the cluster ID is not admission to the core control plane.
         let hello =
-            crate::net::network::local_hello(&b.endpoint, state["mesh"]["id"].as_str().unwrap(), 0);
+            crate::network::network::local_hello(&b.endpoint, state["mesh"]["id"].as_str().unwrap(), 0);
         assert!(
-            crate::net::network::dial_peer(
+            crate::network::network::dial_peer(
                 &b.endpoint,
                 locator.peer().addr().unwrap(),
                 &hello,
@@ -434,7 +434,7 @@ fn self_contained_invitation_rejects_tampering_and_oversize_input() {
     }
     assert!(invitation::Invitation::from_ticket("😀 😎 🥳 🤖 👻 👽 🐶 🐱").is_err());
     assert!(
-        invitation::Invitation::from_ticket(&ticket.replace("layercake://", "https://")).is_err()
+        invitation::Invitation::from_ticket(&ticket.replace("meshmellow://", "https://")).is_err()
     );
     locator.invite = uuid::Uuid::new_v4().to_string();
     assert!(invitation::Invitation::from_ticket(&locator.ticket()).is_err());

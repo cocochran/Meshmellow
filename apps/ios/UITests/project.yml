@@ -9,7 +9,7 @@ settings:
     ARCHS: arm64
     ONLY_ACTIVE_ARCH: YES
 targets:
-  MeshThing:
+  Meshmellow:
     type: application
     platform: iOS
     sources:
@@ -18,7 +18,7 @@ targets:
       - ../Resources
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: org.meshthing.mobile
+        PRODUCT_BUNDLE_IDENTIFIER: org.meshmellow.mobile
         INFOPLIST_FILE: ../../Info.plist
         SWIFT_OBJC_BRIDGING_HEADER: ../../Sources/EnrollmentBridge.h
         TARGETED_DEVICE_FAMILY: '1,2'
@@ -26,7 +26,7 @@ targets:
         OTHER_LDFLAGS: ['-liconv', '-lresolv']
         LIBRARY_SEARCH_PATHS: '$(SRCROOT)/../../../enrollment/target/aarch64-apple-ios-sim/debug'
     dependencies:
-      - framework: ../../../enrollment/target/aarch64-apple-ios-sim/debug/libmeshthing_enrollment.a
+      - framework: ../../../enrollment/target/aarch64-apple-ios-sim/debug/libmeshmellow_enrollment.a
         embed: false
       - sdk: Security.framework
       - sdk: SystemConfiguration.framework
@@ -39,15 +39,15 @@ targets:
         excludes: [project.yml]
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: org.meshthing.enrollment-tests
+        PRODUCT_BUNDLE_IDENTIFIER: org.meshmellow.enrollment-tests
         GENERATE_INFOPLIST_FILE: YES
     dependencies:
-      - target: MeshThing
+      - target: Meshmellow
 schemes:
   EnrollmentValidation:
     build:
       targets:
-        MeshThing: all
+        Meshmellow: all
         EnrollmentUITests: [test]
     test:
       targets: [EnrollmentUITests]

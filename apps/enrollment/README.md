@@ -1,6 +1,6 @@
 # Native mesh adapter
 
-This crate exports the C/JNI bridge used by Layercake's SwiftUI and Compose apps.
+This crate exports the C/JNI bridge used by Meshmellow's SwiftUI and Compose apps.
 All identity, membership, invitation and connection logic lives in the existing
 core at `src/mesh`, exposed as `llm_cluster::mesh::Node`.
 
@@ -24,7 +24,7 @@ It does not adopt diagnostic worker keys, change inference allowlists, or start 
 execution. Full invitations work through Iroh without a separate lookup service.
 
 For compatibility, `cargo build --locked --features cli --bins` also builds the
-`meshthing-enrollment` JSON-lines wrapper.
+`meshmellow-enrollment` JSON-lines wrapper.
 The primary core CLI is now `llm-cluster mesh --state-dir PRIVATE_DIRECTORY`.
 Run protocol tests from the repository root: `cargo test --lib mesh::`, or add
 `-- --include-ignored` to exercise public Iroh relay paths.

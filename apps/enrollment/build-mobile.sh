@@ -21,9 +21,9 @@ case "${1:-}" in
     export AR_aarch64_linux_android="$ndk_bin/llvm-ar"
     cargo build --locked --target aarch64-linux-android
     mkdir -p ../android/app/src/main/jniLibs/arm64-v8a
-    cp target/aarch64-linux-android/debug/libmeshthing_enrollment.so ../android/app/src/main/jniLibs/arm64-v8a/
+    cp target/aarch64-linux-android/debug/libmeshmellow_enrollment.so ../android/app/src/main/jniLibs/arm64-v8a/
     # Keep full symbols in target/ for debugging, not in the distributable APK.
-    "$ndk_bin/llvm-strip" --strip-unneeded ../android/app/src/main/jniLibs/arm64-v8a/libmeshthing_enrollment.so
+    "$ndk_bin/llvm-strip" --strip-unneeded ../android/app/src/main/jniLibs/arm64-v8a/libmeshmellow_enrollment.so
     ;;
   *) echo 'Usage: build-mobile.sh ios|ios-sim|android' >&2; exit 1 ;;
 esac
