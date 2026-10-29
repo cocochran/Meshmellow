@@ -1,7 +1,7 @@
 //! OpenAI-shaped HTTP frontend that serves completions from a sharded model.
 //!
 //! [`serve_frontend`] listens on a loopback address and answers like llama-server, so the
-//! leader's job API ([`crate::api`]) can sit in front of it unchanged:
+//! leader's job API ([`crate::service::api`]) can sit in front of it unchanged:
 //!
 //! - `GET /health` answers 200.
 //! - `POST /v1/chat/completions` renders the messages with the manifest's chat template, opens
@@ -44,7 +44,7 @@ use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use crate::api::CHAT_COMPLETIONS_PATH;
+use crate::service::api::CHAT_COMPLETIONS_PATH;
 use crate::shard::manifest::{ShardManifest, StageLocation, StageSpec};
 use crate::shard::manifest::{same_sha256, sha256_file};
 use crate::shard::pipeline::{

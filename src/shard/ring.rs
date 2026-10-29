@@ -29,7 +29,7 @@ use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::admission::AdmittedChild as Child;
+use crate::runtime::admission::AdmittedChild as Child;
 use anyhow::{Context, bail, ensure};
 use iroh::endpoint::{Connection, Incoming, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointId};
@@ -44,7 +44,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{timeout, timeout_at};
 use tracing::{debug, info, warn};
 
-use crate::rpc_bridge::{PEER_NOT_APPROVED, PEER_NOT_APPROVED_REASON};
+use crate::net::rpc_bridge::{PEER_NOT_APPROVED, PEER_NOT_APPROVED_REASON};
 use crate::shard::serve::{
     RUNNER_STARTUP_TIMEOUT, SESSION_ABORTED, STDERR_DRAIN_TIMEOUT, Shard, ShardServeConfig,
     forward_stderr, log_task_panic, reap,

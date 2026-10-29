@@ -36,7 +36,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{timeout, timeout_at};
 use tracing::{debug, info, warn};
 
-use crate::rpc_bridge::{PEER_NOT_APPROVED, PEER_NOT_APPROVED_REASON, path_kind};
+use crate::net::rpc_bridge::{PEER_NOT_APPROVED, PEER_NOT_APPROVED_REASON, path_kind};
 use crate::shard::manifest::{ShardManifest, StageLocation, same_sha256};
 use crate::shard::ring::{
     ExecuteFrame, NATIVE_STEP_TIMEOUT, RingMessage, RingResult, RingStageInfo,

@@ -170,7 +170,7 @@ pub struct Node {
     compute_hardware: Arc<Mutex<Vec<(String, compute::ComputeOffer)>>>,
     compute_route: Arc<Mutex<Option<(String, crate::shard::manifest::ShardManifest)>>>,
     membership_epoch: tokio::sync::watch::Sender<u64>,
-    control_peers: crate::network::SharedPeerTable,
+    control_peers: crate::net::network::SharedPeerTable,
     control_tasks: Arc<Mutex<BTreeMap<String, tokio::task::JoinHandle<()>>>>,
     /// Native model verification; kept apart from per-member control links,
     /// which membership maintenance prunes.
@@ -223,11 +223,11 @@ impl Node {
             );
         }
         let endpoint = if internet {
-            let builder = crate::network::endpoint_builder_with_key(
+            let builder = crate::net::network::endpoint_builder_with_key(
                 key.clone(),
                 vec![
                     ALPN.to_vec(),
-                    crate::protocol::CONTROL_ALPN.to_vec(),
+                    crate::net::protocol::CONTROL_ALPN.to_vec(),
                     crate::artifact::transport::ALPN.to_vec(),
                     crate::shard::ring::RING_ALPN.to_vec(),
                 ],
@@ -242,7 +242,7 @@ impl Node {
                 .secret_key(key.clone())
                 .alpns(vec![
                     ALPN.to_vec(),
-                    crate::protocol::CONTROL_ALPN.to_vec(),
+                    crate::net::protocol::CONTROL_ALPN.to_vec(),
                     crate::artifact::transport::ALPN.to_vec(),
                     crate::shard::ring::RING_ALPN.to_vec(),
                 ])
@@ -335,7 +335,7 @@ impl Node {
     }
 
     /// Shared authenticated control connections for the embedded read-only API.
-    pub fn control_peer_table(&self) -> crate::network::SharedPeerTable {
+    pub fn control_peer_table(&self) -> crate::net::network::SharedPeerTable {
         self.control_peers.clone()
     }
 
@@ -1122,7 +1122,7 @@ impl Node {
     }
 
     /// Snapshot the authoritative mesh identity and admit only signed members.
-    async fn control_hello(&self, remote: &str) -> Result<crate::protocol::Hello> {
+    async fn control_hello(&self, remote: &str) -> Result<crate::net::protocol::Hello> {
         let record = self.record.lock().await;
         let ledger = record
             .ledger
@@ -1136,17 +1136,17 @@ impl Node {
             ledger.members()?.contains_key(remote),
             "This device is not a trusted member."
         );
-        Ok(crate::network::local_hello(
+        Ok(crate::net::network::local_hello(
             &self.endpoint,
             &ledger.genesis.id(),
             0,
         ))
     }
 
-    fn control_options() -> crate::network::ControlOptions {
-        crate::network::ControlOptions {
-            heartbeat_interval: Some(crate::leader::DEFAULT_HEARTBEAT_INTERVAL),
-            heartbeat_timeout: Some(crate::leader::DEFAULT_HEARTBEAT_TIMEOUT),
+    fn control_options() -> crate::net::network::ControlOptions {
+        crate::net::network::ControlOptions {
+            heartbeat_interval: Some(crate::roles::leader::DEFAULT_HEARTBEAT_INTERVAL),
+            heartbeat_timeout: Some(crate::roles::leader::DEFAULT_HEARTBEAT_TIMEOUT),
         }
     }
 
@@ -1224,7 +1224,7 @@ impl Node {
                                             continue;
                                         }
                                     };
-                                    let dial = crate::network::dial_peer(
+                                    let dial = crate::net::network::dial_peer(
                                         &client.endpoint,
                                         address,
                                         &hello,
@@ -1243,7 +1243,7 @@ impl Node {
                                             }
                                             tokio::select! {
                                             _ = epoch.changed() => { session.connection().close(1u32.into(), b"membership changed"); },
-                                            _ = crate::network::maintain_peer_session(
+                                            _ = crate::net::network::maintain_peer_session(
                                                 &session,
                                                 &client_id,
                                                 &client.control_peers,
@@ -1352,7 +1352,7 @@ impl Node {
                         }
                         return;
                     }
-                    if connection.alpn() == crate::protocol::CONTROL_ALPN {
+                    if connection.alpn() == crate::net::protocol::CONTROL_ALPN {
                         let mut epoch = node.membership_epoch.subscribe();
                         let hello = match node.control_hello(&remote).await {
                             Ok(hello) => hello,
@@ -1362,7 +1362,7 @@ impl Node {
                                 return;
                             }
                         };
-                        match crate::network::accept_peer_connection(
+                        match crate::net::network::accept_peer_connection(
                             connection,
                             &hello,
                             &node.control_peers,
@@ -1376,7 +1376,7 @@ impl Node {
                                         info!(peer = %remote, "mesh membership changed; closing control session");
                                         return;
                                     }
-                                    reason = crate::network::maintain_peer_session(
+                                    reason = crate::net::network::maintain_peer_session(
                                         &session, &id, &node.control_peers, Self::control_options(),
                                     ) => reason,
                                 };

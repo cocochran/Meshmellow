@@ -1,5 +1,0 @@
-C:/Users/ccoch/Projects/Meshmellow/build/cpp/CMakeFiles/mesh_core.dir
-C:/Users/ccoch/Projects/Meshmellow/build/cpp/CMakeFiles/node_test.dir
-C:/Users/ccoch/Projects/Meshmellow/build/cpp/CMakeFiles/test.dir
-C:/Users/ccoch/Projects/Meshmellow/build/cpp/CMakeFiles/edit_cache.dir
-C:/Users/ccoch/Projects/Meshmellow/build/cpp/CMakeFiles/rebuild_cache.dir

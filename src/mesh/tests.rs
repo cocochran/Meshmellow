@@ -335,9 +335,9 @@ async fn core_ticket_join_establishes_trusted_heartbeats_without_lookup() {
         let locator = invitation::Invitation::from_ticket(ticket).unwrap();
         // Knowing the cluster ID is not admission to the core control plane.
         let hello =
-            crate::network::local_hello(&b.endpoint, state["mesh"]["id"].as_str().unwrap(), 0);
+            crate::net::network::local_hello(&b.endpoint, state["mesh"]["id"].as_str().unwrap(), 0);
         assert!(
-            crate::network::dial_peer(
+            crate::net::network::dial_peer(
                 &b.endpoint,
                 locator.peer().addr().unwrap(),
                 &hello,

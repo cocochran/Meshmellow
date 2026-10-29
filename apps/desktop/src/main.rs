@@ -4,9 +4,9 @@ use clap::Parser;
 #[command(about = "Run the Layercake mesh, OpenAI API, and browser dashboard")]
 struct Cli {
     #[command(flatten)]
-    options: llm_cluster::ui::Options,
+    options: llm_cluster::service::ui::Options,
 }
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    llm_cluster::ui::run(Cli::parse().options).await
+    llm_cluster::service::ui::run(Cli::parse().options).await
 }

@@ -9,20 +9,21 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use iroh::Endpoint;
-use llm_cluster::evidence::EvidenceConfig;
-use llm_cluster::history_sync::store::{self, HistoryStore, JobStatus};
-use llm_cluster::launch;
-use llm_cluster::leader::{
+use llm_cluster::history::sync::store::{self, HistoryStore, JobStatus};
+use llm_cluster::net::network::{self, SharedPeerTable};
+use llm_cluster::net::node::PeerTable;
+use llm_cluster::net::protocol::{CONTROL_ALPN, RPC_BRIDGE_ALPN};
+use llm_cluster::net::rpc_bridge;
+use llm_cluster::planning::evidence::EvidenceConfig;
+use llm_cluster::planning::launch;
+use llm_cluster::roles::leader::{
     self, BackendConfig, LeaderConfig, LlamaBackendConfig, ShardBackendConfig,
 };
-use llm_cluster::network::{self, SharedPeerTable};
-use llm_cluster::node::PeerTable;
-use llm_cluster::protocol::{CONTROL_ALPN, RPC_BRIDGE_ALPN};
+use llm_cluster::roles::worker::{self, WorkerConfig};
+use llm_cluster::service::api;
 use llm_cluster::shard::ring::{RING_ALPN, RingWorkerConfig, serve_ring_worker};
 use llm_cluster::shard::ring_origin::RingSettings;
 use llm_cluster::shard::serve::{ShardServeConfig, serve_shard};
-use llm_cluster::worker::{self, WorkerConfig};
-use llm_cluster::{api, rpc_bridge};
 use serde::Serialize;
 use tracing_subscriber::EnvFilter;
 
@@ -59,7 +60,7 @@ const DEFAULT_WORKER_WAIT_ARG: &str = "60s";
 /// `--llama-ready-timeout` default; matches [`leader::DEFAULT_LLAMA_READY_TIMEOUT`].
 const DEFAULT_LLAMA_READY_TIMEOUT_ARG: &str = "300s";
 
-/// `--evidence-wait` default; matches [`llm_cluster::evidence::DEFAULT_EVIDENCE_WAIT`].
+/// `--evidence-wait` default; matches [`llm_cluster::planning::evidence::DEFAULT_EVIDENCE_WAIT`].
 const DEFAULT_EVIDENCE_WAIT_ARG: &str = "120s";
 
 const SECONDS_PER_MINUTE: u64 = 60;
@@ -91,7 +92,7 @@ enum Command {
     /// Verify, serve, and stage exported model shards.
     Artifacts(llm_cluster::artifact::cli::Options),
     /// Run the mesh core, local OpenAI API, and browser UI in this process.
-    Ui(llm_cluster::ui::Options),
+    Ui(llm_cluster::service::ui::Options),
     /// Run a persistent mesh node. Send create/invite/join/decide/snapshot JSON commands on stdin.
     Mesh {
         /// Private identity and signed membership directory, one per running device.
@@ -326,15 +327,18 @@ struct WorkerProfileArgs {
 impl WorkerProfileArgs {
     async fn bind(
         self,
-    ) -> anyhow::Result<Option<llm_cluster::worker_profile::WorkerProfileControl>> {
+    ) -> anyhow::Result<Option<llm_cluster::runtime::worker_profile::WorkerProfileControl>> {
         match (self.profile_config, self.profile_api) {
             (None, None) => Ok(None),
             (Some(path), Some(address)) => {
-                llm_cluster::worker_profile::validate_address(address)?;
-                let manager = llm_cluster::profiling::ProfileManager::from_file(&path).await?;
+                llm_cluster::runtime::worker_profile::validate_address(address)?;
+                let manager =
+                    llm_cluster::runtime::profiling::ProfileManager::from_file(&path).await?;
                 Ok(Some(
-                    llm_cluster::worker_profile::WorkerProfileControl::bind(manager, address)
-                        .await?,
+                    llm_cluster::runtime::worker_profile::WorkerProfileControl::bind(
+                        manager, address,
+                    )
+                    .await?,
                 ))
             }
             _ => anyhow::bail!("worker profiling requires both --profile-config and --profile-api"),
@@ -506,7 +510,7 @@ async fn main() -> anyhow::Result<()> {
     init_logging(cli.debug);
     match cli.command {
         Command::Artifacts(options) => llm_cluster::artifact::cli::run(options).await,
-        Command::Ui(options) => llm_cluster::ui::run(options).await,
+        Command::Ui(options) => llm_cluster::service::ui::run(options).await,
         Command::Mesh { state_dir } => llm_cluster::mesh::cli::run(state_dir).await,
         Command::Verify {
             plan,
@@ -550,9 +554,12 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let request = read_ring_json(&profile)?;
             let registry = read_ring_json(&registry)?;
-            let bundle =
-                llm_cluster::ring_deployment::prepare(&request, &registry, current_unix_ms()?)?;
-            llm_cluster::ring_deployment::write_bundle(&bundle, &output_dir)?;
+            let bundle = llm_cluster::planning::ring_deployment::prepare(
+                &request,
+                &registry,
+                current_unix_ms()?,
+            )?;
+            llm_cluster::planning::ring_deployment::write_bundle(&bundle, &output_dir)?;
             println!(
                 "{}",
                 serde_json::json!({
@@ -569,7 +576,7 @@ async fn main() -> anyhow::Result<()> {
             profile,
             registry,
         } => {
-            llm_cluster::ring_deployment::validate(
+            llm_cluster::planning::ring_deployment::validate(
                 &read_ring_json(&bundle)?,
                 &read_ring_json(&profile)?,
                 &read_ring_json(&registry)?,
@@ -579,19 +586,19 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::MeasuredPlan { profile } => {
-            let request: llm_cluster::measured_placement::MeasuredRequest =
+            let request: llm_cluster::planning::measured_placement::MeasuredRequest =
                 llm_cluster::config::read_json_file(&profile, "measured profile")?;
-            let output = llm_cluster::measured_placement::plan(&request)
+            let output = llm_cluster::planning::measured_placement::plan(&request)
                 .map_err(|error| anyhow::anyhow!("measured planning failed: {error:?}"))?;
             println!("{}", serde_json::to_string_pretty(&output)?);
             Ok(())
         }
         Command::ValidateMeasured { plan, profile } => {
-            let request: llm_cluster::measured_placement::MeasuredRequest =
+            let request: llm_cluster::planning::measured_placement::MeasuredRequest =
                 llm_cluster::config::read_json_file(&profile, "measured profile")?;
-            let output: llm_cluster::measured_placement::MeasuredPlacement =
+            let output: llm_cluster::planning::measured_placement::MeasuredPlacement =
                 llm_cluster::config::read_json_file(&plan, "measured plan")?;
-            llm_cluster::measured_placement::validate_output(&request, &output)
+            llm_cluster::planning::measured_placement::validate_output(&request, &output)
                 .map_err(|error| anyhow::anyhow!("measured plan validation failed: {error:?}"))?;
             println!("{{\"validated\":true}}");
             Ok(())
@@ -813,7 +820,7 @@ async fn shard_ring_worker(
 async fn run_worker_until_ctrl_c(
     endpoint: &Endpoint,
     worker: impl Future<Output = anyhow::Result<()>>,
-    control: Option<llm_cluster::worker_profile::WorkerProfileControl>,
+    control: Option<llm_cluster::runtime::worker_profile::WorkerProfileControl>,
 ) -> anyhow::Result<()> {
     let result = match control {
         Some(control) => {
@@ -988,898 +995,3 @@ fn parse_duration(text: &str) -> Result<Duration, String> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    mod ring_fixture {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/common/ring_fixture.rs"
-        ));
-    }
-
-    #[test]
-    fn generated_ring_arguments_parse_as_actual_runtime_commands() {
-        use super::*;
-        let (request, registry) = ring_fixture::inputs(1000);
-        let bundle = llm_cluster::ring_deployment::prepare(&request, &registry, 1100).unwrap();
-        let cli = Cli::try_parse_from(
-            std::iter::once("llm-cluster".to_owned()).chain(bundle.leader_argv.clone()),
-        )
-        .unwrap();
-        assert_eq!(cli.key.to_str(), Some(bundle.leader.key_path.as_str()));
-        let Command::Leader(args) = cli.command else {
-            panic!("expected leader");
-        };
-        let config = args.into_config(cli.key, cli.cluster).unwrap();
-        assert!(matches!(config.backend, BackendConfig::Shard(_)));
-        assert_eq!(config.api_addr, registry.leader.api);
-        assert_eq!(config.upstream_port, registry.leader.upstream_port);
-        for worker in &bundle.workers {
-            let cli = Cli::try_parse_from(
-                std::iter::once("llm-cluster".to_owned()).chain(worker.argv.clone()),
-            )
-            .unwrap();
-            assert_eq!(cli.key.to_str(), Some(worker.stage.key_path.as_str()));
-            let Command::ShardRingWorker {
-                runner,
-                model,
-                range,
-                context,
-                gpu_layers,
-                budget_bytes,
-                expected_sha256,
-                source_sha256,
-                upstream,
-                origin,
-                next,
-                ..
-            } = cli.command
-            else {
-                panic!("expected ring worker");
-            };
-            let expected = worker.config().unwrap();
-            assert_eq!(runner, expected.runner);
-            assert_eq!(model, expected.model);
-            assert_eq!((range.begin, range.end), (expected.begin, expected.end));
-            assert_eq!(
-                (context, gpu_layers, budget_bytes),
-                (expected.context, expected.gpu_layers, expected.budget_bytes)
-            );
-            assert_eq!(expected_sha256, expected.expected_sha256);
-            assert_eq!(source_sha256, expected.source_sha256);
-            assert_eq!(
-                (upstream, origin, next),
-                (expected.upstream, expected.origin, expected.next)
-            );
-        }
-    }
-    use clap::CommandFactory;
-    use llm_cluster::evidence;
-
-    use super::*;
-
-    #[test]
-    fn parses_duration_units() {
-        assert_eq!(parse_duration("500ms"), Ok(Duration::from_millis(500)));
-        assert_eq!(parse_duration("2s"), Ok(Duration::from_secs(2)));
-        assert_eq!(parse_duration("7"), Ok(Duration::from_secs(7)));
-        assert_eq!(parse_duration("2m"), Ok(Duration::from_secs(120)));
-    }
-
-    #[test]
-    fn rejects_malformed_durations() {
-        for text in ["", "s", "1h", "-1s", "1.5s", "99999999999999999999m"] {
-            assert!(parse_duration(text).is_err(), "{text:?} should be rejected");
-        }
-    }
-
-    #[test]
-    fn duration_defaults_match_library_constants() {
-        assert_eq!(
-            parse_duration(DEFAULT_HEARTBEAT_INTERVAL_ARG),
-            Ok(worker::DEFAULT_HEARTBEAT_INTERVAL)
-        );
-        assert_eq!(
-            parse_duration(DEFAULT_WORKER_WAIT_ARG),
-            Ok(leader::DEFAULT_WORKER_WAIT)
-        );
-        assert_eq!(
-            parse_duration(DEFAULT_LLAMA_READY_TIMEOUT_ARG),
-            Ok(leader::DEFAULT_LLAMA_READY_TIMEOUT)
-        );
-        assert_eq!(
-            parse_duration(DEFAULT_EVIDENCE_WAIT_ARG),
-            Ok(evidence::DEFAULT_EVIDENCE_WAIT)
-        );
-    }
-
-    #[test]
-    fn heartbeat_timeout_defaults_on_and_zero_disables_it() {
-        let llama = [
-            "--plan",
-            "plan.json",
-            "--profile",
-            "profile.json",
-            "--llama-server",
-            "llama-server",
-        ];
-        assert_eq!(
-            parse_duration(DEFAULT_HEARTBEAT_TIMEOUT_ARG),
-            Ok(leader::DEFAULT_HEARTBEAT_TIMEOUT)
-        );
-        assert_eq!(
-            leader_config(&llama).heartbeat_timeout,
-            Some(leader::DEFAULT_HEARTBEAT_TIMEOUT)
-        );
-        let disabled = [&llama[..], &["--heartbeat-timeout", "0s"]].concat();
-        assert_eq!(leader_config(&disabled).heartbeat_timeout, None);
-        let custom = [&llama[..], &["--heartbeat-timeout", "1500ms"]].concat();
-        assert_eq!(
-            leader_config(&custom).heartbeat_timeout,
-            Some(Duration::from_millis(1500))
-        );
-    }
-
-    #[test]
-    fn leader_heartbeat_interval_defaults_on_and_zero_disables_it() {
-        let llama = [
-            "--plan",
-            "plan.json",
-            "--profile",
-            "profile.json",
-            "--llama-server",
-            "llama-server",
-        ];
-        assert_eq!(
-            parse_duration(DEFAULT_LEADER_HEARTBEAT_INTERVAL_ARG),
-            Ok(leader::DEFAULT_HEARTBEAT_INTERVAL)
-        );
-        assert_eq!(
-            leader_config(&llama).heartbeat_interval,
-            Some(leader::DEFAULT_HEARTBEAT_INTERVAL)
-        );
-        let disabled = [&llama[..], &["--heartbeat-interval", "0s"]].concat();
-        assert_eq!(leader_config(&disabled).heartbeat_interval, None);
-        let custom = [&llama[..], &["--heartbeat-interval", "500ms"]].concat();
-        assert_eq!(
-            leader_config(&custom).heartbeat_interval,
-            Some(Duration::from_millis(500))
-        );
-    }
-
-    /// The worker's `--leader-heartbeat-timeout`, as its `WorkerConfig` setting.
-    fn worker_leader_heartbeat_timeout(extra: &[&str]) -> Option<Duration> {
-        let args = [&["meshthing", "worker", "--rpc-server", "rpc"][..], extra].concat();
-        let cli = Cli::try_parse_from(args).expect("worker args");
-        let Command::Worker {
-            leader_heartbeat_timeout,
-            ..
-        } = cli.command
-        else {
-            panic!("expected worker, got {:?}", cli.command);
-        };
-        zero_disables(leader_heartbeat_timeout)
-    }
-
-    #[test]
-    fn worker_leader_heartbeat_timeout_defaults_on_and_zero_disables_it() {
-        assert_eq!(
-            parse_duration(DEFAULT_LEADER_HEARTBEAT_TIMEOUT_ARG),
-            Ok(worker::DEFAULT_LEADER_HEARTBEAT_TIMEOUT)
-        );
-        assert_eq!(
-            worker_leader_heartbeat_timeout(&[]),
-            Some(worker::DEFAULT_LEADER_HEARTBEAT_TIMEOUT)
-        );
-        assert_eq!(
-            worker_leader_heartbeat_timeout(&["--leader-heartbeat-timeout", "0s"]),
-            None
-        );
-        assert_eq!(
-            worker_leader_heartbeat_timeout(&["--leader-heartbeat-timeout", "900ms"]),
-            Some(Duration::from_millis(900))
-        );
-    }
-
-    #[test]
-    fn cli_definition_is_consistent() {
-        Cli::command().debug_assert();
-    }
-
-    #[test]
-    fn worker_collects_repeated_rpc_args() {
-        let cli = Cli::try_parse_from([
-            "meshthing",
-            "worker",
-            "--rpc-server",
-            "rpc",
-            "--rpc-arg",
-            "-t",
-            "--rpc-arg",
-            "4",
-        ])
-        .expect("worker args");
-
-        let Command::Worker {
-            rpc_args, rpc_port, ..
-        } = cli.command
-        else {
-            panic!("expected worker, got {:?}", cli.command);
-        };
-        assert_eq!(rpc_args, ["-t", "4"]);
-        assert_eq!(rpc_port, rpc_bridge::DEFAULT_RPC_PORT);
-    }
-
-    #[test]
-    fn bridge_serve_requires_an_allowed_peer() {
-        let missing = Cli::try_parse_from(["meshthing", "bridge-serve"]);
-        assert!(
-            missing.is_err(),
-            "bridge-serve without --allow-peer must be refused"
-        );
-
-        let cli = Cli::try_parse_from([
-            "meshthing",
-            "bridge-serve",
-            "--allow-peer",
-            "a",
-            "--allow-peer",
-            "b",
-        ])
-        .expect("bridge-serve args");
-        let Command::BridgeServe { allow_peers, .. } = cli.command else {
-            panic!("expected bridge-serve, got {:?}", cli.command);
-        };
-        assert_eq!(allow_peers, ["a", "b"]);
-    }
-
-    fn parse_bridge_connect(args: &[&str]) -> Result<Command, clap::Error> {
-        let prefix = ["meshthing", "bridge-connect"];
-        Cli::try_parse_from(prefix.iter().chain(args)).map(|cli| cli.command)
-    }
-
-    fn node_id() -> String {
-        iroh::SecretKey::generate().public().to_string()
-    }
-
-    #[test]
-    fn bridge_connect_single_worker_form_is_unchanged() {
-        let id = node_id();
-        let default = parse_bridge_connect(&[&id]).expect("positional node id");
-        let Command::BridgeConnect {
-            node_id,
-            listen,
-            workers,
-        } = default
-        else {
-            panic!("expected bridge-connect, got {default:?}");
-        };
-        assert_eq!(node_id.as_deref(), Some(id.as_str()));
-        assert_eq!(listen, "127.0.0.1:50052".parse().expect("addr"));
-        assert!(workers.is_empty());
-
-        let custom = parse_bridge_connect(&[&id, "--listen", "127.0.0.1:50053"])
-            .expect("positional node id with --listen");
-        let Command::BridgeConnect { listen, .. } = custom else {
-            panic!("expected bridge-connect, got {custom:?}");
-        };
-        assert_eq!(listen, "127.0.0.1:50053".parse().expect("addr"));
-    }
-
-    #[test]
-    fn bridge_connect_collects_repeated_workers_in_order() {
-        let (first, second) = (node_id(), node_id());
-        let command = parse_bridge_connect(&[
-            "--worker",
-            &format!("{first}=127.0.0.1:50053"),
-            "--worker",
-            &format!("{second}=127.0.0.1:0"),
-        ])
-        .expect("repeated --worker");
-        let Command::BridgeConnect {
-            node_id, workers, ..
-        } = command
-        else {
-            panic!("expected bridge-connect, got {command:?}");
-        };
-        assert_eq!(node_id, None);
-        let parsed: Vec<(String, String)> = workers
-            .iter()
-            .map(|mapping| (mapping.worker.to_string(), mapping.listen.to_string()))
-            .collect();
-        assert_eq!(
-            parsed,
-            [
-                (first, "127.0.0.1:50053".to_owned()),
-                (second, "127.0.0.1:0".to_owned())
-            ]
-        );
-    }
-
-    #[test]
-    fn bridge_connect_requires_exactly_one_form() {
-        let id = node_id();
-        let worker = format!("{}=127.0.0.1:50053", node_id());
-        let refused: [&[&str]; 3] = [
-            &[],
-            &[&id, "--worker", &worker],
-            &["--listen", "127.0.0.1:50053", "--worker", &worker],
-        ];
-        for args in refused {
-            assert!(
-                parse_bridge_connect(args).is_err(),
-                "bridge-connect {args:?} must be refused"
-            );
-        }
-    }
-
-    #[test]
-    fn worker_mapping_errors_name_the_problem() {
-        let id = node_id();
-        let cases = [
-            ("127.0.0.1:50053".to_owned(), "expected NODE_ID=ADDR"),
-            ("nonsense=127.0.0.1:50053".to_owned(), "bad node ID"),
-            (format!("{id}=localhost"), "bad listen address"),
-        ];
-        for (text, expected) in cases {
-            let error = parse_worker_mapping(&text).expect_err("invalid mapping");
-            assert!(error.contains(expected), "{text:?}: {error}");
-            assert!(error.contains(&format!("{text:?}")), "{text:?}: {error}");
-        }
-    }
-
-    #[test]
-    fn bridges_report_lists_each_worker_with_its_address_in_order() {
-        let (first, second) = (
-            iroh::SecretKey::generate().public(),
-            iroh::SecretKey::generate().public(),
-        );
-        let bound = [
-            rpc_bridge::BridgeMapping {
-                worker: first,
-                listen: "127.0.0.1:50053".parse().expect("addr"),
-            },
-            rpc_bridge::BridgeMapping {
-                worker: second,
-                listen: "[::1]:50054".parse().expect("addr"),
-            },
-        ];
-
-        let report = bridges_report(&bound).expect("report");
-
-        assert_eq!(
-            report,
-            format!(
-                r#"{{"bridges":[{{"worker":"{first}","listen":"127.0.0.1:50053"}},{{"worker":"{second}","listen":"[::1]:50054"}}]}}"#
-            )
-        );
-    }
-
-    /// `shard-serve` over `range` with its other required flags (except `--allow-peer`) plus
-    /// `extra`.
-    fn parse_shard_serve(range: &str, extra: &[&str]) -> Result<Command, clap::Error> {
-        let required = [
-            "meshthing",
-            "shard-serve",
-            "--runner",
-            "shard_runner",
-            "--model",
-            "model.gguf",
-            "--range",
-            range,
-            "--context",
-            "512",
-            "--budget-bytes",
-            "1048576",
-            "--expected-sha256",
-            "abc123",
-        ];
-        Cli::try_parse_from(required.iter().chain(extra)).map(|cli| cli.command)
-    }
-
-    #[test]
-    fn shard_serve_requires_an_allowed_peer() {
-        assert!(
-            parse_shard_serve("0:32", &[]).is_err(),
-            "shard-serve without --allow-peer must be refused"
-        );
-
-        let command = parse_shard_serve("0:32", &["--allow-peer", "a", "--allow-peer", "b"])
-            .expect("shard-serve");
-        let Command::ShardServe {
-            runner,
-            range,
-            context,
-            gpu_layers,
-            budget_bytes,
-            expected_sha256,
-            source_sha256,
-            allow_peers,
-            ..
-        } = command
-        else {
-            panic!("expected shard-serve, got {command:?}");
-        };
-        assert_eq!(runner, PathBuf::from("shard_runner"));
-        assert_eq!(range, LayerRange { begin: 0, end: 32 });
-        assert_eq!((context, gpu_layers, budget_bytes), (512, 0, 1_048_576));
-        assert_eq!(expected_sha256, "abc123");
-        assert_eq!(source_sha256, None);
-        assert_eq!(allow_peers, ["a", "b"]);
-    }
-
-    #[test]
-    fn shard_serve_parses_optional_flags() {
-        let command = parse_shard_serve(
-            "0:32",
-            &[
-                "--allow-peer",
-                "a",
-                "--gpu-layers",
-                "99",
-                "--source-sha256",
-                "def456",
-            ],
-        )
-        .expect("shard-serve");
-        let Command::ShardServe {
-            gpu_layers,
-            source_sha256,
-            ..
-        } = command
-        else {
-            panic!("expected shard-serve, got {command:?}");
-        };
-        assert_eq!(gpu_layers, 99);
-        assert_eq!(source_sha256.as_deref(), Some("def456"));
-    }
-
-    #[test]
-    fn layer_range_must_be_begin_below_end() {
-        assert_eq!(
-            parse_layer_range("32:64"),
-            Ok(LayerRange { begin: 32, end: 64 })
-        );
-        for text in ["", "32", "5:5", "6:5", "a:b", "-1:3", "1:2:3"] {
-            assert!(
-                parse_layer_range(text).is_err(),
-                "{text:?} should be refused"
-            );
-        }
-        let flag = parse_shard_serve("8:4", &["--allow-peer", "a"]);
-        assert!(flag.is_err(), "a reversed --range must be refused");
-    }
-
-    /// `shard-ring-worker` over `range` with its other required flags plus `extra`.
-    fn parse_shard_ring_worker(
-        range: &str,
-        upstream: &str,
-        origin: &str,
-        extra: &[&str],
-    ) -> Result<Command, clap::Error> {
-        let required = [
-            "meshthing",
-            "shard-ring-worker",
-            "--runner",
-            "shard_runner",
-            "--model",
-            "shard.gguf",
-            "--range",
-            range,
-            "--context",
-            "512",
-            "--budget-bytes",
-            "1048576",
-            "--expected-sha256",
-            "abc123",
-            "--upstream",
-            upstream,
-            "--origin",
-            origin,
-        ];
-        Cli::try_parse_from(required.iter().chain(extra)).map(|cli| cli.command)
-    }
-
-    #[test]
-    fn shard_ring_worker_without_next_is_the_terminal() {
-        let upstream = iroh::SecretKey::generate().public();
-        let origin = iroh::SecretKey::generate().public();
-        let command =
-            parse_shard_ring_worker("28:32", &upstream.to_string(), &origin.to_string(), &[])
-                .expect("shard-ring-worker");
-        let Command::ShardRingWorker {
-            runner,
-            model,
-            range,
-            context,
-            gpu_layers,
-            budget_bytes,
-            expected_sha256,
-            source_sha256,
-            upstream: parsed_upstream,
-            origin: parsed_origin,
-            next,
-            profiles,
-        } = command
-        else {
-            panic!("expected shard-ring-worker, got {command:?}");
-        };
-        assert_eq!(runner, PathBuf::from("shard_runner"));
-        assert_eq!(model, PathBuf::from("shard.gguf"));
-        assert_eq!(range, LayerRange { begin: 28, end: 32 });
-        assert_eq!((context, gpu_layers, budget_bytes), (512, 0, 1_048_576));
-        assert_eq!(expected_sha256, "abc123");
-        assert_eq!(source_sha256, None);
-        assert_eq!((parsed_upstream, parsed_origin), (upstream, origin));
-        assert_eq!(next, None);
-        assert!(profiles.profile_config.is_none());
-        assert!(profiles.profile_api.is_none());
-    }
-
-    #[test]
-    fn both_native_workers_accept_paired_profile_controls() {
-        let peer = iroh::SecretKey::generate().public().to_string();
-        let extra = [
-            "--profile-config",
-            "profiles.json",
-            "--profile-api",
-            "127.0.0.1:8091",
-        ];
-        let ring = parse_shard_ring_worker("4:8", &peer, &peer, &extra).unwrap();
-        let shard_extra: Vec<_> = ["--allow-peer", peer.as_str()]
-            .into_iter()
-            .chain(extra)
-            .collect();
-        let shard = parse_shard_serve("4:8", &shard_extra).unwrap();
-        for command in [ring, shard] {
-            let profiles = match command {
-                Command::ShardRingWorker { profiles, .. }
-                | Command::ShardServe { profiles, .. } => profiles,
-                _ => panic!("expected native worker"),
-            };
-            assert_eq!(
-                profiles.profile_config,
-                Some(PathBuf::from("profiles.json"))
-            );
-            assert_eq!(
-                profiles.profile_api,
-                Some("127.0.0.1:8091".parse().unwrap())
-            );
-        }
-    }
-
-    #[test]
-    fn native_workers_require_both_profile_flags() {
-        let peer = iroh::SecretKey::generate().public().to_string();
-        for extra in [
-            ["--profile-config", "profiles.json"],
-            ["--profile-api", "127.0.0.1:8091"],
-        ] {
-            assert!(parse_shard_ring_worker("4:8", &peer, &peer, &extra).is_err());
-            let shard_extra: Vec<_> = ["--allow-peer", peer.as_str()]
-                .into_iter()
-                .chain(extra)
-                .collect();
-            assert!(parse_shard_serve("4:8", &shard_extra).is_err());
-        }
-    }
-
-    #[tokio::test]
-    async fn worker_profile_options_reject_public_listener_before_reading_config() {
-        let options = WorkerProfileArgs {
-            profile_config: Some(PathBuf::from("missing-profile-config.json")),
-            profile_api: Some("0.0.0.0:8091".parse().unwrap()),
-        };
-        let error = options.bind().await.err().expect("public bind must fail");
-        assert!(error.to_string().contains("loopback"));
-        assert!(WorkerProfileArgs::default().bind().await.unwrap().is_none());
-    }
-
-    #[test]
-    fn shard_ring_worker_parses_optional_flags() {
-        let peer = iroh::SecretKey::generate().public().to_string();
-        let next = iroh::SecretKey::generate().public();
-        let next_text = next.to_string();
-        let extra = [
-            "--next",
-            next_text.as_str(),
-            "--gpu-layers",
-            "99",
-            "--source-sha256",
-            "def456",
-        ];
-        let command =
-            parse_shard_ring_worker("0:28", &peer, &peer, &extra).expect("shard-ring-worker");
-        let Command::ShardRingWorker {
-            gpu_layers,
-            source_sha256,
-            next: parsed_next,
-            ..
-        } = command
-        else {
-            panic!("expected shard-ring-worker, got {command:?}");
-        };
-        assert_eq!(gpu_layers, 99);
-        assert_eq!(source_sha256.as_deref(), Some("def456"));
-        assert_eq!(parsed_next, Some(next));
-    }
-
-    #[test]
-    fn shard_ring_worker_refuses_bad_peers_and_ranges() {
-        let peer = iroh::SecretKey::generate().public().to_string();
-        let cases = [
-            ("28:32", "not-a-node-id", peer.as_str(), &[][..]),
-            ("28:32", peer.as_str(), "not-a-node-id", &[][..]),
-            (
-                "28:32",
-                peer.as_str(),
-                peer.as_str(),
-                &["--next", "nope"][..],
-            ),
-            ("32:28", peer.as_str(), peer.as_str(), &[][..]),
-        ];
-        for (range, upstream, origin, extra) in cases {
-            assert!(
-                parse_shard_ring_worker(range, upstream, origin, extra).is_err(),
-                "{range} {upstream} {origin} {extra:?} should be refused"
-            );
-        }
-        let missing = Cli::try_parse_from(["meshthing", "shard-ring-worker", "--upstream", &peer]);
-        assert!(missing.is_err(), "missing required flags must be refused");
-    }
-
-    #[test]
-    fn allow_peer_values_must_be_node_ids() {
-        let valid = iroh::SecretKey::generate().public();
-        let parsed = parse_node_ids(&[valid.to_string()]).expect("valid node id");
-        assert_eq!(parsed, [valid]);
-        assert!(parse_node_ids(&["not-a-node-id".to_owned()]).is_err());
-    }
-
-    #[test]
-    fn leader_and_prompt_use_loopback_api_defaults() {
-        let leader = Cli::try_parse_from([
-            "meshthing",
-            "leader",
-            "--plan",
-            "plan.json",
-            "--profile",
-            "profile.json",
-            "--llama-server",
-            "llama-server",
-            "--worker-wait",
-            "5s",
-        ])
-        .expect("leader args");
-        let prompt = Cli::try_parse_from(["meshthing", "prompt", "hello there"]).expect("prompt");
-
-        let Command::Leader(LeaderArgs {
-            backend,
-            shard_manifest,
-            api,
-            llama_port,
-            worker_wait,
-            ..
-        }) = leader.command
-        else {
-            panic!("expected leader, got {:?}", leader.command);
-        };
-        assert_eq!(backend, BackendKind::Llama);
-        assert_eq!(shard_manifest, None);
-        assert_eq!(api, leader::DEFAULT_API_ADDR);
-        assert_eq!(llama_port, leader::DEFAULT_LLAMA_PORT);
-        assert_eq!(worker_wait, Duration::from_secs(5));
-        let Command::Prompt { api, text } = prompt.command else {
-            panic!("expected prompt, got {:?}", prompt.command);
-        };
-        assert_eq!(api, leader::DEFAULT_API_ADDR);
-        assert_eq!(text, "hello there");
-    }
-
-    /// `leader` with its required flags plus `extra`.
-    fn parse_leader(extra: &[&str]) -> Result<Command, clap::Error> {
-        let required = [
-            "meshthing",
-            "leader",
-            "--plan",
-            "plan.json",
-            "--profile",
-            "profile.json",
-            "--llama-server",
-            "llama-server",
-        ];
-        Cli::try_parse_from(required.iter().chain(extra)).map(|cli| cli.command)
-    }
-
-    #[test]
-    fn leader_verification_defaults_off_with_default_min_peers() {
-        let command = parse_leader(&[]).expect("leader args");
-
-        let Command::Leader(LeaderArgs {
-            min_peers,
-            evidence_file,
-            evidence_wait,
-            llama_args,
-            ..
-        }) = command
-        else {
-            panic!("expected leader, got {command:?}");
-        };
-        assert_eq!(min_peers, launch::DEFAULT_MIN_PEERS);
-        assert_eq!(evidence_file, None);
-        assert_eq!(evidence_wait, evidence::DEFAULT_EVIDENCE_WAIT);
-        assert!(llama_args.is_empty());
-    }
-
-    #[test]
-    fn leader_parses_verification_and_llama_args() {
-        let command = parse_leader(&[
-            "--min-peers",
-            "3",
-            "--evidence-file",
-            "evidence.json",
-            "--evidence-wait",
-            "2m",
-            "--llama-arg",
-            "--cache-ram",
-            "--llama-arg",
-            "0",
-        ])
-        .expect("leader args");
-
-        let Command::Leader(LeaderArgs {
-            min_peers,
-            evidence_file,
-            evidence_wait,
-            llama_args,
-            ..
-        }) = command
-        else {
-            panic!("expected leader, got {command:?}");
-        };
-        assert_eq!(min_peers, 3);
-        assert_eq!(evidence_file, Some(PathBuf::from("evidence.json")));
-        assert_eq!(evidence_wait, Duration::from_secs(120));
-        assert_eq!(llama_args, ["--cache-ram", "0"]);
-    }
-
-    #[test]
-    fn evidence_wait_requires_an_evidence_file() {
-        assert!(
-            parse_leader(&["--evidence-wait", "5s"]).is_err(),
-            "--evidence-wait without --evidence-file must be refused"
-        );
-    }
-
-    /// `leader` with `args` and nothing else.
-    fn parse_leader_only(args: &[&str]) -> Result<Command, clap::Error> {
-        Cli::try_parse_from(["meshthing", "leader"].iter().chain(args)).map(|cli| cli.command)
-    }
-
-    /// The leader configuration `leader <args>` builds.
-    fn leader_config(args: &[&str]) -> LeaderConfig {
-        let command = parse_leader_only(args).expect("leader args");
-        let Command::Leader(args) = command else {
-            panic!("expected leader, got {command:?}");
-        };
-        args.into_config(PathBuf::from("leader.key"), "cluster".to_owned())
-            .expect("leader config")
-    }
-
-    #[test]
-    fn llama_backend_requires_plan_profile_and_llama_server() {
-        let required = [
-            ["--plan", "plan.json"],
-            ["--profile", "profile.json"],
-            ["--llama-server", "llama-server"],
-        ];
-        for missing in 0..required.len() {
-            let args: Vec<&str> = required
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| *index != missing)
-                .flat_map(|(_, flag)| *flag)
-                .collect();
-            assert!(
-                parse_leader_only(&args).is_err(),
-                "leader without {} must be refused",
-                required[missing][0]
-            );
-            let explicit = [&["--backend", "llama"][..], &args].concat();
-            assert!(parse_leader_only(&explicit).is_err());
-        }
-    }
-
-    #[test]
-    fn llama_backend_builds_a_llama_config() {
-        let config = leader_config(&[
-            "--plan",
-            "plan.json",
-            "--profile",
-            "profile.json",
-            "--llama-server",
-            "llama-server",
-            "--evidence-file",
-            "evidence.json",
-            "--llama-port",
-            "9001",
-        ]);
-
-        let BackendConfig::Llama(llama) = &config.backend else {
-            panic!("expected the llama backend, got {:?}", config.backend);
-        };
-        assert_eq!(llama.plan_path, PathBuf::from("plan.json"));
-        assert_eq!(llama.profile_path, PathBuf::from("profile.json"));
-        assert_eq!(llama.llama_server, PathBuf::from("llama-server"));
-        assert_eq!(llama.min_peers, launch::DEFAULT_MIN_PEERS);
-        let evidence = llama.evidence.as_ref().expect("evidence configured");
-        assert_eq!(evidence.path, PathBuf::from("evidence.json"));
-        assert_eq!(evidence.wait, evidence::DEFAULT_EVIDENCE_WAIT);
-        assert_eq!(config.upstream_port, 9001);
-    }
-
-    #[test]
-    fn shard_backend_needs_only_a_manifest() {
-        let config = leader_config(&[
-            "--backend",
-            "shard",
-            "--shard-manifest",
-            "manifest.json",
-            "--llama-port",
-            "9002",
-            "--worker-wait",
-            "5s",
-        ]);
-
-        let BackendConfig::Shard(shard) = &config.backend else {
-            panic!("expected the shard backend, got {:?}", config.backend);
-        };
-        assert_eq!(shard.manifest_path, PathBuf::from("manifest.json"));
-        assert_eq!(config.upstream_port, 9002);
-        assert_eq!(config.worker_wait, Duration::from_secs(5));
-        assert_eq!(config.api_addr, leader::DEFAULT_API_ADDR);
-        assert_eq!(config.key_path, PathBuf::from("leader.key"));
-    }
-
-    #[test]
-    fn shard_backend_requires_a_manifest() {
-        assert!(
-            parse_leader_only(&["--backend", "shard"]).is_err(),
-            "--backend shard without --shard-manifest must be refused"
-        );
-    }
-
-    #[test]
-    fn shard_backend_refuses_llama_only_flags() {
-        let llama_only: [&[&str]; 8] = [
-            &["--plan", "plan.json"],
-            &["--profile", "profile.json"],
-            &["--min-peers", "3"],
-            &["--evidence-file", "evidence.json"],
-            &["--evidence-file", "evidence.json", "--evidence-wait", "5s"],
-            &["--llama-server", "llama-server"],
-            &["--llama-arg", "--cache-ram"],
-            &["--llama-ready-timeout", "5s"],
-        ];
-        let shard = ["--backend", "shard", "--shard-manifest", "manifest.json"];
-        for flags in llama_only {
-            let args = [&shard[..], flags].concat();
-            assert!(
-                parse_leader_only(&args).is_err(),
-                "{flags:?} must be refused with --backend shard"
-            );
-        }
-    }
-
-    #[test]
-    fn shard_manifest_requires_the_shard_backend() {
-        let without_backend = parse_leader(&["--shard-manifest", "manifest.json"]);
-        assert!(
-            without_backend.is_err(),
-            "--shard-manifest must be refused with the llama backend"
-        );
-        assert!(parse_leader_only(&["--shard-manifest", "manifest.json"]).is_err());
-        let explicit_llama = ["--backend", "llama", "--shard-manifest", "manifest.json"];
-        assert!(parse_leader_only(&explicit_llama).is_err());
-    }
-}

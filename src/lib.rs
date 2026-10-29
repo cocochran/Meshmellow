@@ -1,30 +1,12 @@
 //! MeshThing: a peer-to-peer mesh that splits one LLM across devices.
 
-pub mod admission;
-pub mod api;
 pub mod artifact;
 pub mod config;
-pub mod evidence;
 pub mod history;
-pub mod history_sync;
-pub mod jobs;
-pub mod launch;
-pub mod leader;
-pub mod measured_placement;
 pub mod mesh;
-pub mod network;
-pub mod node;
-pub mod placement;
+pub mod net;
 pub mod planning;
-pub mod process;
-pub mod profiling;
-pub mod protocol;
-pub mod ring_deployment;
-pub mod rpc_bridge;
-pub mod rpc_plan;
+pub mod roles;
+pub mod runtime;
+pub mod service;
 pub mod shard;
-pub mod verification;
-pub mod worker;
-pub mod worker_profile;
-
-pub mod ui;

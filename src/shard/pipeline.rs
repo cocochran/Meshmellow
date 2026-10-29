@@ -35,10 +35,10 @@ use tokio::sync::oneshot;
 use tokio::time::{timeout, timeout_at};
 use tracing::{debug, info, warn};
 
-use crate::admission::AdmittedChild as Child;
+use crate::runtime::admission::AdmittedChild as Child;
 
-use crate::protocol::RPC_BRIDGE_ALPN;
-use crate::rpc_bridge::path_kind;
+use crate::net::protocol::RPC_BRIDGE_ALPN;
+use crate::net::rpc_bridge::path_kind;
 use crate::shard::manifest::same_sha256;
 use crate::shard::ring_origin::{RingLink, check_origin_stage};
 use crate::shard::wire::{self, MAX_BATCH_TOKENS, StageInput, StageMetadata, StepReply};

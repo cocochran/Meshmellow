@@ -31,10 +31,10 @@ use tokio::task::{JoinError, JoinSet};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
-use crate::admission::AdmittedChild as Child;
+use crate::runtime::admission::AdmittedChild as Child;
 
-use crate::protocol::RPC_BRIDGE_ALPN;
-use crate::rpc_bridge::{PEER_NOT_APPROVED, PEER_NOT_APPROVED_REASON, PeerAllowlist};
+use crate::net::protocol::RPC_BRIDGE_ALPN;
+use crate::net::rpc_bridge::{PEER_NOT_APPROVED, PEER_NOT_APPROVED_REASON, PeerAllowlist};
 use crate::shard::wire::{self, MAX_CONTEXT, StageMetadata};
 
 /// Prompt passed to every runner. A relayed stage receives token IDs or hidden rows from the
